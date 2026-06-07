@@ -177,6 +177,9 @@ async def grok_stream(
     model: str = "grok-build",
     effort: str | None = None,
     resume_session_id: str | None = None,
+    best_of_n: int | None = None,
+    check_loop: bool = False,
+    memory_mode: str | None = None,
 ) -> AsyncIterator[dict]:
     grok_bin = shutil.which("grok")
     if not grok_bin:
@@ -198,6 +201,14 @@ async def grok_stream(
         cmd += ["--effort", effort]
     if resume_session_id:
         cmd += ["--resume", resume_session_id]
+    if best_of_n and best_of_n > 1:
+        cmd += ["--best-of-n", str(int(best_of_n))]
+    if check_loop:
+        cmd += ["--check"]
+    if memory_mode == "on":
+        cmd += ["--experimental-memory"]
+    elif memory_mode == "off":
+        cmd += ["--no-memory"]
     if system_prompt:
         cmd += ["--system-prompt-override", system_prompt]
     # `-p / --single` takes the prompt as its value; put it last so all flags parse cleanly.

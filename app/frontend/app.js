@@ -780,6 +780,15 @@ function bindChatWindow(w) {
   input.addEventListener("input", () => maybeShowCommandMenu(w, input.value));
 
   input.addEventListener("keydown", (e) => {
+    // IME composition guard. Vietnamese Telex/VNI (and Chinese/Japanese IMEs)
+    // fire keydown with key="Enter" while the IME is still composing, BEFORE
+    // the user actually wants to submit. If we treat that as submit, the real
+    // Enter that follows hits the now-streaming state and aborts the request.
+    // The keyCode 229 fallback covers older browsers that don't expose
+    // isComposing.
+    const composing = e.isComposing || e.keyCode === 229;
+    if (composing) return;
+
     // command menu navigation
     if (w.commandMenu) {
       if (e.key === "ArrowDown") {
@@ -807,7 +816,6 @@ function bindChatWindow(w) {
         e.preventDefault();
         const items = w.commandMenu.items;
         const m = items[w.commandMenu.selectedIdx];
-        // if only command typed (no space yet), insert; else submit
         if (!input.value.includes(" ")) {
           pickCommand(w, m.cmd);
         } else {
@@ -837,22 +845,47 @@ function stopChat(w) {
 
 // ---------- Slash commands ----------
 
+// adapter: "*" = both, "claude" / "grok" = adapter-specific
 const CHAT_COMMANDS = [
-  { cmd: "/help",     hint: "",                       desc: "danh sách commands",                              exec: cmdHelp },
-  { cmd: "/clear",    hint: "",                       desc: "tạo session mới (history cũ vẫn lưu trong db)",   exec: cmdClear },
-  { cmd: "/model",    hint: "<opus-4-8|opus-4-7|sonnet|haiku>", desc: "đổi model agent này",                   exec: cmdModel },
-  { cmd: "/effort",   hint: "<default|low|medium|high|max>",    desc: "đổi effort agent này",                  exec: cmdEffort },
-  { cmd: "/focus",    hint: "<AGENT_ID>",             desc: "mở chat agent khác trong project",                exec: cmdFocus },
-  { cmd: "/dispatch", hint: "<AGENT_ID> <task>",      desc: "mở chat agent đích và gửi task ngay",             exec: cmdDispatch },
-  { cmd: "/stop",     hint: "",                       desc: "dừng stream hiện tại",                            exec: cmdStop },
-  { cmd: "/status",   hint: "",                       desc: "trạng thái session, model, effort",               exec: cmdStatus },
+  { cmd: "/help",     adapter: "*",     hint: "",                                    desc: "danh sách commands",                                exec: cmdHelp },
+  { cmd: "/clear",    adapter: "*",     hint: "",                                    desc: "tạo session mới (history cũ vẫn lưu trong db)",     exec: cmdClear },
+  { cmd: "/model",    adapter: "*",     hint: "<...>",                               desc: "đổi model agent này",                              exec: cmdModel },
+  { cmd: "/effort",   adapter: "*",     hint: "<default|low|medium|high|max>",       desc: "đổi effort agent này",                             exec: cmdEffort },
+  { cmd: "/focus",    adapter: "*",     hint: "<AGENT_ID>",                          desc: "mở chat agent khác trong project",                 exec: cmdFocus },
+  { cmd: "/dispatch", adapter: "*",     hint: "<AGENT_ID> <task>",                   desc: "mở chat agent đích và gửi task ngay",              exec: cmdDispatch },
+  { cmd: "/stop",     adapter: "*",     hint: "",                                    desc: "dừng stream hiện tại",                             exec: cmdStop },
+  { cmd: "/status",   adapter: "*",     hint: "",                                    desc: "trạng thái session, model, effort, next-options",  exec: cmdStatus },
+  // grok-only one-shot modifiers (consumed by next message)
+  { cmd: "/best-of",  adapter: "grok",  hint: "<2..5>",                              desc: "lượt KẾ: chạy N attempts song song, pick best",    exec: cmdBestOf },
+  { cmd: "/check",    adapter: "grok",  hint: "",                                    desc: "lượt KẾ: thêm self-verification loop",             exec: cmdCheck },
+  { cmd: "/memory",   adapter: "grok",  hint: "<on|off>",                            desc: "lượt KẾ: bật/tắt cross-session memory",            exec: cmdMemory },
+  { cmd: "/reset-next", adapter: "*",   hint: "",                                    desc: "huỷ next-options đã set (best-of, check, memory)",  exec: cmdResetNext },
 ];
+
+function _agentAdapter(w) {
+  const proj = state.projectCache[w.projectSlug];
+  const a = proj?.agents.find((x) => x.id === w.agentId);
+  return a?.model || "claude";
+}
+
+function _hintForCmd(c, adapter) {
+  if (c.cmd === "/model") {
+    return adapter === "grok"
+      ? "<grok-build|grok-composer>"
+      : "<opus-4-8|opus-4-7|sonnet|haiku>";
+  }
+  return c.hint;
+}
 
 function maybeShowCommandMenu(w, text) {
   if (!text.startsWith("/")) { hideCommandMenu(w); return; }
   const space = text.indexOf(" ");
   const head = space === -1 ? text.toLowerCase() : text.slice(0, space).toLowerCase();
-  const matches = CHAT_COMMANDS.filter((c) => c.cmd.startsWith(head));
+  const adapter = _agentAdapter(w);
+  const matches = CHAT_COMMANDS
+    .filter((c) => c.adapter === "*" || c.adapter === adapter)
+    .filter((c) => c.cmd.startsWith(head))
+    .map((c) => ({ ...c, hint: _hintForCmd(c, adapter) }));
   if (!matches.length) { hideCommandMenu(w); return; }
   showCommandMenu(w, matches);
 }
@@ -926,9 +959,12 @@ function addSystemBubble(w, markdown) {
 }
 
 async function cmdHelp(w) {
-  const lines = ["**Slash commands**", ""];
+  const adapter = _agentAdapter(w);
+  const lines = [`**Slash commands** (adapter: \`${adapter}\`)`, ""];
   for (const c of CHAT_COMMANDS) {
-    const sig = c.hint ? `\`${c.cmd}\` \`${c.hint}\`` : `\`${c.cmd}\``;
+    if (c.adapter !== "*" && c.adapter !== adapter) continue;
+    const hint = _hintForCmd(c, adapter);
+    const sig = hint ? `\`${c.cmd}\` \`${hint}\`` : `\`${c.cmd}\``;
     lines.push(`- ${sig} — ${c.desc}`);
   }
   lines.push("", "Phím tắt trong input: Tab chọn lệnh, ↑↓ duyệt, Esc đóng menu / dừng stream.");
@@ -1438,7 +1474,51 @@ async function cmdStatus(w) {
     `**Status**: ${proj.statuses[agent.id] || "idle"}`,
     `**Streaming**: ${w.streaming ? "yes" : "no"}`,
   ];
+  if (isGrok && w.nextOptions) {
+    const opts = [];
+    if (w.nextOptions.best_of_n) opts.push(`best-of ${w.nextOptions.best_of_n}`);
+    if (w.nextOptions.check_loop) opts.push("check");
+    if (w.nextOptions.memory_mode) opts.push(`memory ${w.nextOptions.memory_mode}`);
+    if (opts.length) lines.push(`**Next-options**: ${opts.join(", ")}`);
+  }
   addSystemBubble(w, lines.join("\n"));
+}
+
+async function cmdBestOf(w, arg) {
+  const n = parseInt(arg, 10);
+  if (!n || n < 2 || n > 5) {
+    addSystemBubble(w, "Cú pháp: `/best-of <2..5>`");
+    return;
+  }
+  w.nextOptions = w.nextOptions || {};
+  w.nextOptions.best_of_n = n;
+  addSystemBubble(w, `✓ lượt KẾ sẽ chạy \`best-of ${n}\` (consumed sau khi gửi)`);
+}
+
+async function cmdCheck(w) {
+  w.nextOptions = w.nextOptions || {};
+  w.nextOptions.check_loop = true;
+  addSystemBubble(w, "✓ lượt KẾ sẽ thêm self-verification loop (consumed sau khi gửi)");
+}
+
+async function cmdMemory(w, arg) {
+  const v = (arg || "").trim().toLowerCase();
+  if (v !== "on" && v !== "off") {
+    addSystemBubble(w, "Cú pháp: `/memory <on|off>`");
+    return;
+  }
+  w.nextOptions = w.nextOptions || {};
+  w.nextOptions.memory_mode = v;
+  addSystemBubble(w, `✓ lượt KẾ memory \`${v}\` (consumed sau khi gửi)`);
+}
+
+async function cmdResetNext(w) {
+  if (!w.nextOptions) {
+    addSystemBubble(w, "không có next-options nào để huỷ.");
+    return;
+  }
+  w.nextOptions = null;
+  addSystemBubble(w, "✓ đã huỷ next-options.");
 }
 
 function setSendBtn(w, mode) {
@@ -1485,9 +1565,15 @@ async function sendMessageInWindow(w, text) {
 
   try {
     w.abortController = new AbortController();
+    const nextOpts = w.nextOptions || {};
+    w.nextOptions = null;  // consume one-shot
+    const reqBody = { message: text };
+    if (nextOpts.best_of_n) reqBody.best_of_n = nextOpts.best_of_n;
+    if (nextOpts.check_loop) reqBody.check_loop = true;
+    if (nextOpts.memory_mode) reqBody.memory_mode = nextOpts.memory_mode;
     const resp = await fetch(`/api/projects/${slug}/agents/${rootAgent}/chat`, {
       method: "POST", headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ message: text }),
+      body: JSON.stringify(reqBody),
       signal: w.abortController.signal,
     });
     if (!resp.ok || !resp.body) {
@@ -1568,6 +1654,15 @@ function handleEventInWindow(w, slug, evt, bubbleFor, rootAgent) {
     case "agent_status": {
       proj.statuses[agent] = evt.status;
       rerenderGraphsForSlug(slug);
+      // Show a placeholder in the bubble immediately so user knows the agent
+      // is alive even before any thought/text token arrives. Grok can sit in
+      // internal thinking for 30-60s without emitting anything to stdout.
+      if (evt.status === "running") {
+        const b = bubbleFor(agent);
+        if (b.thinkEl.dataset.done !== "1" && !b.thinkEl.textContent) {
+          b.thinkEl.textContent = "đang chờ phản hồi…";
+        }
+      }
       break;
     }
     case "agent_done": {

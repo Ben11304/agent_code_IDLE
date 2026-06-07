@@ -352,6 +352,10 @@ def api_session(slug: str, agent_id: str):
 
 class ChatBody(BaseModel):
     message: str
+    # grok-only one-shot options consumed by the next turn
+    best_of_n: Optional[int] = None
+    check_loop: Optional[bool] = None
+    memory_mode: Optional[str] = None  # "on" | "off" | None
 
 
 def _get_children(project_data: dict, agent_id: str) -> list[str]:
@@ -400,6 +404,7 @@ async def _run_agent(
     emit,
     tracker: list,
     chain: tuple = (),
+    grok_options: Optional[dict] = None,
 ) -> str:
     """Run a single agent chat turn. Emit events via callback.
 
@@ -447,6 +452,7 @@ async def _run_agent(
             resume_session_id=resume_sid,
         )
     elif model == "grok":
+        gopts = grok_options or {}
         agen = stream_fn(
             message=message,
             system_prompt=system_prompt,
@@ -454,6 +460,9 @@ async def _run_agent(
             model=override.get("grok_model") or agent.get("grok_model") or "grok-build",
             effort=effort,
             resume_session_id=resume_sid,
+            best_of_n=gopts.get("best_of_n"),
+            check_loop=bool(gopts.get("check_loop")),
+            memory_mode=gopts.get("memory_mode"),
         )
     else:
         agen = stream_fn(message=message, system_prompt=system_prompt, cwd=cwd)
@@ -564,9 +573,16 @@ async def api_chat(slug: str, agent_id: str, body: ChatBody):
 
     tracker: list = []
 
+    grok_options = {
+        "best_of_n": body.best_of_n,
+        "check_loop": body.check_loop,
+        "memory_mode": body.memory_mode,
+    } if (body.best_of_n or body.check_loop or body.memory_mode) else None
+
     async def driver():
         try:
-            await _run_agent(slug, agent_id, body.message, emit, tracker)
+            await _run_agent(slug, agent_id, body.message, emit, tracker,
+                             grok_options=grok_options)
             if tracker:
                 await asyncio.gather(*tracker, return_exceptions=True)
         except asyncio.CancelledError:
