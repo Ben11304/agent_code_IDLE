@@ -170,9 +170,13 @@ function renderTaskbar() {
 
 function windowTitle(w) {
   const proj = state.projectCache[w.projectSlug];
-  const projName = proj ? proj.name : w.projectSlug;
+  const projName = proj ? proj.name : (w.projectSlug || "");
   if (w.type === "graph") return `${projName} • graph`;
   if (w.type === "chat") return `${projName} • ${w.agentId}`;
+  if (w.type === "file") {
+    const name = (w.rel_path || "").split("/").pop() || w.rel_path || "file";
+    return name;
+  }
   return w.id;
 }
 
@@ -286,6 +290,23 @@ function renderWindowContent(w) {
       </div>`;
     bindGraphWindow(w);
     renderGraphInWindow(w);
+  } else if (w.type === "file") {
+    c.innerHTML = `
+      <div class="file-header">
+        <span class="file-path" title=""></span>
+        <span class="file-info"></span>
+        <button class="toolbar-btn file-reload" title="reload">⟳</button>
+        <button class="toolbar-btn file-copy" title="copy abs path">⌘</button>
+      </div>
+      <div class="file-body">đang tải…</div>`;
+    c.querySelector(".file-path").textContent = w.rel_path || "";
+    c.querySelector(".file-path").title = w.abs_path || "";
+    c.querySelector(".file-reload").onclick = () => loadFileContent(w);
+    c.querySelector(".file-copy").onclick = async () => {
+      try { await navigator.clipboard.writeText(w.abs_path); flashHint("copied: " + w.abs_path); }
+      catch { flashHint(w.abs_path); }
+    };
+    loadFileContent(w);
   } else if (w.type === "chat") {
     c.innerHTML = `
       <div class="chat-header"></div>
@@ -466,6 +487,58 @@ function statusColor(s) {
     case "running": return "#f8c450";
     case "cancelled": return "#8a91a3";
     default: return "#5a6173";
+  }
+}
+
+// ---------- File viewer window ----------
+
+function openFileViewer(absPath, relPath) {
+  const id = `file:${absPath}`;
+  let w = state.windows.find((x) => x.id === id);
+  if (w) {
+    if (w.hidden) showWindow(w);
+    else focusWindow(w);
+    return w;
+  }
+  const offset = state.windows.filter((x) => x.type === "file").length * 28;
+  w = {
+    id, projectSlug: state.activeTab || "", type: "file",
+    abs_path: absPath, rel_path: relPath,
+    x: 220 + offset, y: 80 + offset, w: 640, h: 520,
+    z: nextZ(), hidden: false,
+  };
+  state.windows.push(w);
+  createWindowDom(w);
+  return w;
+}
+
+async function loadFileContent(w) {
+  const body = w.contentEl.querySelector(".file-body");
+  const info = w.contentEl.querySelector(".file-info");
+  body.textContent = "đang tải…";
+  try {
+    const r = await fetch(`/api/workspace/file?path=${encodeURIComponent(w.rel_path)}`);
+    const j = await r.json();
+    if (!r.ok) {
+      body.textContent = `lỗi ${r.status}: ${j.detail || ""}`;
+      if (info) info.textContent = "";
+      return;
+    }
+    const ext = (w.rel_path.split(".").pop() || "").toLowerCase();
+    if (info) info.textContent = `${j.size}c • .${ext}`;
+    if (j.is_binary) {
+      body.innerHTML = `<div class="file-binary">${escapeHtml(j.content)}</div>`;
+      return;
+    }
+    if (ext === "md" || ext === "markdown") {
+      body.innerHTML = `<div class="file-md content"></div>`;
+      setContent(body.querySelector(".file-md"), j.content);
+    } else {
+      body.innerHTML = `<pre class="file-code"></pre>`;
+      body.querySelector("pre").textContent = j.content;
+    }
+  } catch (err) {
+    body.textContent = "network error: " + err.message;
   }
 }
 
@@ -1856,8 +1929,12 @@ function renderTree() {
 async function onTreeNodeClick(item) {
   const t = _treeState();
   t.selectedAbs = item.abs_path;
-  if (item.type === "folder") await onTreeToggle(item);
-  else renderTree();
+  if (item.type === "folder") {
+    await onTreeToggle(item);
+  } else {
+    openFileViewer(item.abs_path, item.rel_path);
+    renderTree();
+  }
 }
 
 async function onTreeToggle(item) {

@@ -346,6 +346,42 @@ def api_workspace_info():
     }
 
 
+_MAX_FILE_BYTES = 5_000_000
+
+
+@app.get("/api/workspace/file")
+def api_workspace_file(path: str):
+    root = projects.get_workspace_root()
+    if not root:
+        raise HTTPException(404, "no workspace root configured")
+    target = (root / path).resolve()
+    try:
+        target.relative_to(root)
+    except ValueError:
+        raise HTTPException(400, "path escapes workspace root")
+    if not target.exists() or not target.is_file():
+        raise HTTPException(404, "file not found")
+    try:
+        size = target.stat().st_size
+    except OSError as e:
+        raise HTTPException(500, f"stat failed: {e}")
+    if size > _MAX_FILE_BYTES:
+        raise HTTPException(413, f"file too large: {size} bytes (max {_MAX_FILE_BYTES})")
+    try:
+        content = target.read_text(encoding="utf-8")
+        is_binary = False
+    except UnicodeDecodeError:
+        content = "(binary file — preview not available)"
+        is_binary = True
+    return {
+        "rel_path": path,
+        "abs_path": str(target),
+        "content": content,
+        "size": size,
+        "is_binary": is_binary,
+    }
+
+
 @app.get("/api/workspace/tree")
 def api_workspace_tree(path: str = ""):
     root = projects.get_workspace_root()
