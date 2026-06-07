@@ -8,7 +8,7 @@ from typing import Optional
 
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import StreamingResponse
+from fastapi.responses import StreamingResponse, FileResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
@@ -347,6 +347,31 @@ def api_workspace_info():
 
 
 _MAX_FILE_BYTES = 5_000_000
+
+
+def _resolve_workspace_file(path: str):
+    root = projects.get_workspace_root()
+    if not root:
+        raise HTTPException(404, "no workspace root configured")
+    target = (root / path).resolve()
+    try:
+        target.relative_to(root)
+    except ValueError:
+        raise HTTPException(400, "path escapes workspace root")
+    if not target.exists() or not target.is_file():
+        raise HTTPException(404, "file not found")
+    return target
+
+
+@app.get("/api/workspace/raw")
+def api_workspace_raw(path: str):
+    """Serve raw file bytes (for PDF, images, etc) with proper Content-Type."""
+    import mimetypes
+    target = _resolve_workspace_file(path)
+    mime, _ = mimetypes.guess_type(str(target))
+    if not mime:
+        mime = "application/octet-stream"
+    return FileResponse(target, media_type=mime)
 
 
 @app.get("/api/workspace/file")

@@ -512,9 +512,30 @@ function openFileViewer(absPath, relPath) {
   return w;
 }
 
+const _IMG_EXTS = new Set(["png", "jpg", "jpeg", "gif", "webp", "svg", "bmp", "ico"]);
+
 async function loadFileContent(w) {
   const body = w.contentEl.querySelector(".file-body");
   const info = w.contentEl.querySelector(".file-info");
+  const ext = (w.rel_path.split(".").pop() || "").toLowerCase();
+  const rawUrl = `/api/workspace/raw?path=${encodeURIComponent(w.rel_path)}`;
+
+  // PDF and images: render via browser, no need to fetch JSON wrapper
+  if (ext === "pdf") {
+    body.style.padding = "0";
+    body.innerHTML = `<embed class="file-pdf" src="${rawUrl}" type="application/pdf">`;
+    if (info) info.textContent = ".pdf";
+    return;
+  }
+  if (_IMG_EXTS.has(ext)) {
+    body.style.padding = "0";
+    body.innerHTML = `<div class="file-img-wrap"><img class="file-img" src="${rawUrl}" alt="${escapeHtml(w.rel_path)}"></div>`;
+    if (info) info.textContent = "." + ext;
+    return;
+  }
+  body.style.padding = "";
+
+  // Text / markdown: go through /file (UTF-8 decode + size cap)
   body.textContent = "đang tải…";
   try {
     const r = await fetch(`/api/workspace/file?path=${encodeURIComponent(w.rel_path)}`);
@@ -524,10 +545,12 @@ async function loadFileContent(w) {
       if (info) info.textContent = "";
       return;
     }
-    const ext = (w.rel_path.split(".").pop() || "").toLowerCase();
     if (info) info.textContent = `${j.size}c • .${ext}`;
     if (j.is_binary) {
-      body.innerHTML = `<div class="file-binary">${escapeHtml(j.content)}</div>`;
+      body.innerHTML = `<div class="file-binary">
+        ${escapeHtml(j.content)}<br>
+        <a href="${rawUrl}" target="_blank" rel="noopener">tải về raw</a>
+      </div>`;
       return;
     }
     if (ext === "md" || ext === "markdown") {
