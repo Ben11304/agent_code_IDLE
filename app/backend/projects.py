@@ -37,6 +37,40 @@ def _load_project_yaml(project_root: Path) -> dict[str, Any] | None:
     return data
 
 
+def get_workspace_root() -> Path | None:
+    """Workspace root for the unified folder tree.
+
+    Reads `workspace_root` from registry.yaml if set. Otherwise computes the
+    common parent directory of all registered project paths.
+    """
+    if not REGISTRY_PATH.exists():
+        return None
+    with REGISTRY_PATH.open() as f:
+        data = yaml.safe_load(f) or {}
+    explicit = data.get("workspace_root")
+    if explicit:
+        p = Path(explicit).expanduser()
+        if p.exists() and p.is_dir():
+            return p.resolve()
+    paths = [Path(p).expanduser().resolve() for p in data.get("projects", []) if Path(p).expanduser().exists()]
+    if not paths:
+        return None
+    # common ancestor of all project paths
+    common_parts = list(paths[0].parts)
+    for p in paths[1:]:
+        parts = p.parts
+        for i, (a, b) in enumerate(zip(common_parts, parts)):
+            if a != b:
+                common_parts = common_parts[:i]
+                break
+        else:
+            common_parts = common_parts[:min(len(common_parts), len(parts))]
+    if not common_parts:
+        return None
+    candidate = Path(*common_parts)
+    return candidate if candidate.is_dir() else candidate.parent
+
+
 def list_projects() -> list[dict[str, Any]]:
     out = []
     for root in _load_registry():

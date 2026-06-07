@@ -305,6 +305,55 @@ def api_set_agent_settings(slug: str, agent_id: str, body: AgentSettings):
     return {"ok": True}
 
 
+@app.get("/api/workspace/info")
+def api_workspace_info():
+    root = projects.get_workspace_root()
+    proj_roots = {str(Path(p["root"]).resolve()) for p in projects.list_projects()}
+    return {
+        "workspace_root": str(root) if root else None,
+        "project_roots": sorted(proj_roots),
+    }
+
+
+@app.get("/api/workspace/tree")
+def api_workspace_tree(path: str = ""):
+    root = projects.get_workspace_root()
+    if not root:
+        raise HTTPException(404, "no workspace root configured")
+    target = (root / path).resolve()
+    try:
+        target.relative_to(root)
+    except ValueError:
+        raise HTTPException(400, "path escapes workspace root")
+    if not target.exists() or not target.is_dir():
+        raise HTTPException(404, "directory not found")
+
+    project_roots = {Path(p["root"]).resolve() for p in projects.list_projects()}
+
+    items = []
+    try:
+        children = list(target.iterdir())
+    except PermissionError:
+        return {"items": [], "rel_path": path, "abs_path": str(target)}
+    children.sort(key=lambda p: (not p.is_dir(), p.name.lower()))
+    for child in children:
+        if child.name in TREE_EXCLUDE:
+            continue
+        is_dir = child.is_dir()
+        try:
+            resolved = child.resolve()
+        except OSError:
+            resolved = child
+        items.append({
+            "name": child.name,
+            "type": "folder" if is_dir else "file",
+            "rel_path": str(child.relative_to(root)),
+            "abs_path": str(child),
+            "is_project": is_dir and resolved in project_roots,
+        })
+    return {"items": items, "rel_path": path, "abs_path": str(target)}
+
+
 @app.get("/api/projects/{slug}/tree")
 def api_tree(slug: str, path: str = ""):
     project = projects.get_project(slug)

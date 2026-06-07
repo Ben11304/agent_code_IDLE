@@ -53,6 +53,8 @@ html, body { margin: 0; height: 100%; background: var(--bg); color: var(--text);
 .tree-node .icon { width: 14px; display: inline-block; text-align: center;
   color: var(--text-dim); }
 .tree-node.folder .icon { color: #c79c5b; }
+.tree-node.is-project .icon { color: var(--accent); }
+.tree-node.is-project .label { color: var(--accent); font-weight: 600; }
 .tree-node .label { flex: 1; min-width: 0; text-overflow: ellipsis; overflow: hidden; }
 .tree-loading { color: var(--text-dim); font-style: italic; padding: 4px 6px; font-size: 11px; }
 .tree-empty { color: var(--text-dim); padding: 4px 6px; font-size: 11px; }

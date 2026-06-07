@@ -26,6 +26,7 @@ async function init() {
   if (state.projects.length) await openProject(state.projects[0].slug);
   bindGlobalKeys();
   bindTreeKeys();
+  await initWorkspaceTree();
 }
 
 async function loadProjects() {
@@ -57,8 +58,6 @@ async function openProject(slug) {
   renderProjectList();
   ensureGraphWindow(slug);
   applyTabVisibility();
-  await loadTreeRoot(slug);
-  renderTree();
 }
 
 function closeTab(slug) {
@@ -1444,9 +1443,10 @@ function openAddAgentDialog(slug) {
       }
       state.projectCache[slug] = j.project || state.projectCache[slug];
       rerenderGraphsForSlug(slug);
-      const t = _treeState(slug);
+      // refresh workspace tree so the new folder shows up
+      const t = _treeState();
       t.cache = {};
-      await loadTreeRoot(slug);
+      await fetchTreeLevel("");
       renderTree();
       msg.textContent = "✓ đã tạo " + currentBody.id;
       msg.className = "modal-msg ok";
@@ -1715,30 +1715,50 @@ function mirrorDispatchedMessages(slug, agentId) {
 
 // ---------- Folder tree ----------
 
-function _treeState(slug) {
-  if (!state.tree[slug]) {
-    state.tree[slug] = { expanded: new Set([""]), cache: {}, selectedAbs: null, flat: [] };
+// Workspace-wide tree (was per-project before). Single state for all projects.
+const _TREE_KEY = "__workspace";
+
+function _treeState() {
+  if (!state.tree[_TREE_KEY]) {
+    state.tree[_TREE_KEY] = {
+      workspace_root: null,
+      expanded: new Set([""]),
+      cache: {},
+      selectedAbs: null,
+      flat: [],
+    };
   }
-  return state.tree[slug];
+  return state.tree[_TREE_KEY];
 }
 
-async function loadTreeRoot(slug) {
-  const t = _treeState(slug);
-  if (!t.cache[""]) await fetchTreeLevel(slug, "");
-}
-
-async function fetchTreeLevel(slug, relPath) {
-  const t = _treeState(slug);
+async function initWorkspaceTree() {
   try {
-    const r = await fetch(`/api/projects/${slug}/tree?path=${encodeURIComponent(relPath)}`);
+    const r = await fetch("/api/workspace/info");
+    const j = await r.json();
+    const t = _treeState();
+    t.workspace_root = j.workspace_root || null;
+    const titleEl = document.querySelector(".sidebar-title");
+    if (titleEl && t.workspace_root) {
+      titleEl.textContent = t.workspace_root.replace(/^\/Users\/[^/]+\//, "~/");
+      titleEl.title = t.workspace_root;
+    }
+  } catch {}
+  await fetchTreeLevel("");
+  renderTree();
+}
+
+async function fetchTreeLevel(relPath) {
+  const t = _treeState();
+  try {
+    const r = await fetch(`/api/workspace/tree?path=${encodeURIComponent(relPath)}`);
     if (!r.ok) { t.cache[relPath] = []; return; }
     const j = await r.json();
     t.cache[relPath] = j.items || [];
   } catch { t.cache[relPath] = []; }
 }
 
-function buildFlatTree(slug) {
-  const t = _treeState(slug);
+function buildFlatTree() {
+  const t = _treeState();
   const flat = [];
   function walk(relPath, depth) {
     const items = t.cache[relPath];
@@ -1757,55 +1777,52 @@ function renderTree() {
   const root = $("treeRoot");
   if (!root) return;
   root.innerHTML = "";
-  if (!state.activeTab) return;
-  const slug = state.activeTab;
-  const t = _treeState(slug);
-  buildFlatTree(slug);
+  const t = _treeState();
+  buildFlatTree();
   if (!t.flat.length) { root.innerHTML = '<div class="tree-empty">(trống)</div>'; return; }
   for (const item of t.flat) {
     const node = document.createElement("div");
     node.className = "tree-node " + item.type;
+    if (item.is_project) node.classList.add("is-project");
     if (t.selectedAbs === item.abs_path) node.classList.add("selected");
     node.style.paddingLeft = (6 + item.depth * 14) + "px";
     const arrow = item.type === "folder"
       ? (t.expanded.has(item.rel_path) ? "▾" : "▸") : "";
-    const icon = item.type === "folder" ? "▣" : "·";
+    const icon = item.is_project ? "◆" : (item.type === "folder" ? "▣" : "·");
     node.innerHTML = `<span class="arrow">${arrow}</span>` +
       `<span class="icon">${icon}</span>` +
       `<span class="label" title="${escapeHtml(item.abs_path)}">${escapeHtml(item.name)}</span>`;
-    node.onclick = () => onTreeNodeClick(slug, item);
-    node.ondblclick = () => { if (item.type === "folder") onTreeToggle(slug, item); };
+    node.onclick = () => onTreeNodeClick(item);
+    node.ondblclick = () => { if (item.type === "folder") onTreeToggle(item); };
     root.appendChild(node);
   }
 }
 
-async function onTreeNodeClick(slug, item) {
-  const t = _treeState(slug);
+async function onTreeNodeClick(item) {
+  const t = _treeState();
   t.selectedAbs = item.abs_path;
-  if (item.type === "folder") await onTreeToggle(slug, item);
+  if (item.type === "folder") await onTreeToggle(item);
   else renderTree();
 }
 
-async function onTreeToggle(slug, item) {
-  const t = _treeState(slug);
+async function onTreeToggle(item) {
+  const t = _treeState();
   if (t.expanded.has(item.rel_path)) t.expanded.delete(item.rel_path);
   else {
     t.expanded.add(item.rel_path);
-    if (!t.cache[item.rel_path]) await fetchTreeLevel(slug, item.rel_path);
+    if (!t.cache[item.rel_path]) await fetchTreeLevel(item.rel_path);
   }
   renderTree();
 }
 
-function selectedTreeItem(slug) {
-  const t = _treeState(slug);
+function selectedTreeItem() {
+  const t = _treeState();
   if (!t.selectedAbs) return null;
   return t.flat.find((it) => it.abs_path === t.selectedAbs) || null;
 }
 
 async function copySelectedPath() {
-  const slug = state.activeTab;
-  if (!slug) return;
-  const item = selectedTreeItem(slug);
+  const item = selectedTreeItem();
   if (!item) { flashHint("chưa chọn file/folder nào"); return; }
   try {
     await navigator.clipboard.writeText(item.abs_path);
@@ -1827,9 +1844,7 @@ function bindTreeKeys() {
   const root = $("treeRoot");
   if (!root) return;
   root.addEventListener("keydown", (e) => {
-    const slug = state.activeTab;
-    if (!slug) return;
-    const t = _treeState(slug);
+    const t = _treeState();
     if (!t.flat.length) return;
     const idx = t.flat.findIndex((it) => it.abs_path === t.selectedAbs);
     if (e.key === "ArrowDown") {
@@ -1843,11 +1858,11 @@ function bindTreeKeys() {
     } else if (e.key === "ArrowRight" || e.key === "Enter") {
       e.preventDefault();
       const cur = t.flat[idx];
-      if (cur && cur.type === "folder" && !t.expanded.has(cur.rel_path)) onTreeToggle(slug, cur);
+      if (cur && cur.type === "folder" && !t.expanded.has(cur.rel_path)) onTreeToggle(cur);
     } else if (e.key === "ArrowLeft") {
       e.preventDefault();
       const cur = t.flat[idx];
-      if (cur && cur.type === "folder" && t.expanded.has(cur.rel_path)) onTreeToggle(slug, cur);
+      if (cur && cur.type === "folder" && t.expanded.has(cur.rel_path)) onTreeToggle(cur);
     }
   });
 }
