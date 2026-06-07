@@ -59,9 +59,12 @@ def api_project(slug: str):
         statuses[a["id"]] = db.get_last_status(slug, a["id"]) or "idle"
         ov = overrides.get(a["id"]) or {}
         a["default_claude_model"] = a.get("claude_model") or "claude-sonnet-4-6"
+        a["default_grok_model"] = a.get("grok_model") or "grok-build"
         a["default_effort"] = a.get("effort")
         if ov.get("claude_model"):
             a["claude_model"] = ov["claude_model"]
+        if ov.get("grok_model"):
+            a["grok_model"] = ov["grok_model"]
         if "effort" in ov:
             a["effort"] = ov["effort"]
     out["statuses"] = statuses
@@ -70,6 +73,7 @@ def api_project(slug: str):
 
 class AgentSettings(BaseModel):
     claude_model: Optional[str] = None
+    grok_model: Optional[str] = None
     effort: Optional[str] = None
 
 
@@ -89,6 +93,7 @@ def api_set_agent_settings(slug: str, agent_id: str, body: AgentSettings):
         raise HTTPException(404, "agent not found")
     db.set_agent_override(slug, agent_id,
                           claude_model=body.claude_model,
+                          grok_model=body.grok_model,
                           effort=body.effort)
     return {"ok": True}
 
@@ -214,14 +219,33 @@ async def _run_agent(
     model = agent.get("model", "claude")
     stream_fn = get_stream(model)
     override = db.get_agent_override(slug, agent_id) or {}
+    effort = override.get("effort") if "effort" in override else agent.get("effort")
+
+    # Resume guard. Only continue a prior CLI session if its last turn ended
+    # cleanly. Sessions left in "running" (orphan from a uvicorn restart, swept
+    # to "cancelled" by the startup reaper), "cancelled" (user hit stop or
+    # browser disconnected mid-stream — claude server state may be torn), or
+    # "error" cannot be safely resumed: claude --resume into a half-finished
+    # state often returns empty or hangs silently. Better to start fresh.
+    resume_sid = sess.get("claude_session_id") if sess.get("last_status") == "ok" else None
+
     if model == "claude":
         agen = stream_fn(
             message=message,
             system_prompt=system_prompt,
             cwd=cwd,
             model=override.get("claude_model") or agent.get("claude_model") or "claude-sonnet-4-6",
-            effort=override.get("effort") if "effort" in override else agent.get("effort"),
-            resume_session_id=sess.get("claude_session_id"),
+            effort=effort,
+            resume_session_id=resume_sid,
+        )
+    elif model == "grok":
+        agen = stream_fn(
+            message=message,
+            system_prompt=system_prompt,
+            cwd=cwd,
+            model=override.get("grok_model") or agent.get("grok_model") or "grok-build",
+            effort=effort,
+            resume_session_id=resume_sid,
         )
     else:
         agen = stream_fn(message=message, system_prompt=system_prompt, cwd=cwd)
@@ -356,7 +380,17 @@ async def api_chat(slug: str, agent_id: str, body: ChatBody):
         task = asyncio.create_task(driver())
         try:
             while True:
-                evt = await queue.get()
+                try:
+                    # 15s timeout keeps the socket alive during long quiet
+                    # phases (Opus extended thinking can sit 10-30s without
+                    # emitting any byte). Without this, browsers + proxies
+                    # silently close the SSE and the chat appears to hang as
+                    # "đã dừng" with no response. The comment line is not a
+                    # data event, so the frontend ignores it.
+                    evt = await asyncio.wait_for(queue.get(), timeout=15.0)
+                except asyncio.TimeoutError:
+                    yield ": keepalive\n\n"
+                    continue
                 if evt is None:
                     break
                 yield _sse(evt)

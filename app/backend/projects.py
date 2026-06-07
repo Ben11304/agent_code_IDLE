@@ -68,6 +68,7 @@ def get_project(slug: str) -> dict[str, Any] | None:
                     "role": a.get("role", ""),
                     "model": a.get("model", "claude"),
                     "claude_model": a.get("claude_model", "claude-sonnet-4-6"),
+                    "grok_model": a.get("grok_model", "grok-build"),
                     "effort": a.get("effort"),
                     "cwd": a.get("cwd", "."),
                     "system_prompt_file": a.get("system_prompt_file", ""),

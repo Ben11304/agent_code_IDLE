@@ -451,7 +451,9 @@ function renderGraphInWindow(w) {
 }
 
 function modelLabel(a) {
-  if (a.model === "grok") return "grok";
+  if (a.model === "grok") {
+    return (a.grok_model || "grok-build");
+  }
   return (a.claude_model || "claude-sonnet-4-6").replace(/^claude-/, "");
 }
 
@@ -495,8 +497,8 @@ function bindGraphWindow(w) {
   w.el.querySelectorAll(".zoom-controls button").forEach((btn) => {
     btn.onclick = () => {
       const act = btn.dataset.z;
-      if (act === "in") zoomBy(w, 0.85);
-      else if (act === "out") zoomBy(w, 1.18);
+      if (act === "in") zoomBy(w, 0.9);
+      else if (act === "out") zoomBy(w, 1.111);
       else if (act === "fit") {
         delete state.viewBoxes[w.projectSlug];
         renderGraphInWindow(w);
@@ -528,13 +530,29 @@ function zoomBy(w, factor, px, py) {
 }
 
 function onGraphWheel(e, w) {
-  if (!state.viewBoxes[w.projectSlug]) return;
+  const vb = state.viewBoxes[w.projectSlug];
+  if (!vb) return;
   e.preventDefault();
   const svg = e.currentTarget;
   const rect = svg.getBoundingClientRect();
-  const px = (e.clientX - rect.left) / rect.width;
-  const py = (e.clientY - rect.top) / rect.height;
-  zoomBy(w, e.deltaY < 0 ? 0.88 : 1.12, px, py);
+
+  if (e.ctrlKey || e.metaKey) {
+    // Ctrl/Cmd + wheel: zoom anchored at cursor, gentle.
+    const px = (e.clientX - rect.left) / rect.width;
+    const py = (e.clientY - rect.top) / rect.height;
+    // Normalize wheel delta: trackpads send ~1-10, mice ~100 per notch.
+    // Cap so a fast scroll doesn't jump too far.
+    const norm = Math.max(-50, Math.min(50, e.deltaY));
+    const factor = 1 + (norm / 50) * 0.08;  // ±8% max per event
+    zoomBy(w, factor, px, py);
+  } else {
+    // Plain wheel: pan in viewBox space.
+    const sx = vb.w / rect.width;
+    const sy = vb.h / rect.height;
+    vb.x += e.deltaX * sx;
+    vb.y += e.deltaY * sy;
+    svg.setAttribute("viewBox", `${vb.x} ${vb.y} ${vb.w} ${vb.h}`);
+  }
 }
 
 let _pan = null;
@@ -613,7 +631,7 @@ function renderChatHeader(w) {
   if (!agent) { header.textContent = w.agentId; return; }
 
   const modelText = agent.model === "grok"
-    ? "grok (qua aas)"
+    ? (agent.grok_model || agent.default_grok_model || "grok-build")
     : (agent.claude_model || agent.default_claude_model || "claude-sonnet-4-6").replace(/^claude-/, "");
   const effortText = agent.effort ? `effort ${agent.effort}` : "";
 
@@ -630,7 +648,7 @@ function renderChatHeader(w) {
     </div>`;
 }
 
-async function updateAgentSettings(w, claudeModel, effort) {
+async function updateAgentSettings(w, claudeModel, grokModel, effort) {
   const slug = w.projectSlug;
   const agentId = w.agentId;
   const hint = w.el.querySelector(".save-hint");
@@ -639,15 +657,17 @@ async function updateAgentSettings(w, claudeModel, effort) {
     const r = await fetch(`/api/projects/${slug}/agents/${agentId}/settings`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ claude_model: claudeModel, effort: effort || null }),
+      body: JSON.stringify({
+        claude_model: claudeModel,
+        grok_model: grokModel,
+        effort: effort || null,
+      }),
     });
     if (!r.ok) throw new Error("save failed");
 
-    // refresh project cache so all graph windows + other chat windows reflect change
     const pr = await fetch(`/api/projects/${slug}`);
     state.projectCache[slug] = await pr.json();
     rerenderGraphsForSlug(slug);
-    // also refresh any other open chat windows for the same agent so their headers update
     state.windows
       .filter((x) => x.type === "chat" && x.projectSlug === slug && x.agentId === agentId)
       .forEach((x) => renderChatHeader(x));
@@ -921,7 +941,7 @@ async function cmdClear(w) {
   }
 }
 
-const _MODEL_ALIAS = {
+const _CLAUDE_MODEL_ALIAS = {
   "opus-4-8": "claude-opus-4-8",
   "opus-4-7": "claude-opus-4-7",
   "opus": "claude-opus-4-8",
@@ -930,34 +950,56 @@ const _MODEL_ALIAS = {
   "haiku": "claude-haiku-4-5",
   "haiku-4-5": "claude-haiku-4-5",
 };
+const _GROK_MODEL_ALIAS = {
+  "build": "grok-build",
+  "grok-build": "grok-build",
+  "composer": "grok-composer-2.5-fast",
+  "grok-composer": "grok-composer-2.5-fast",
+  "composer-2.5": "grok-composer-2.5-fast",
+  "fast": "grok-composer-2.5-fast",
+};
 
 async function cmdModel(w, arg) {
-  if (!arg) {
-    addSystemBubble(w, "Cú pháp: `/model <opus-4-8|opus-4-7|sonnet|haiku>`");
-    return;
-  }
-  const target = _MODEL_ALIAS[arg.toLowerCase()] || (arg.startsWith("claude-") ? arg : null);
-  if (!target) {
-    addSystemBubble(w, `model không hợp lệ: \`${arg}\``);
-    return;
-  }
   const proj = state.projectCache[w.projectSlug];
   const agent = proj.agents.find((a) => a.id === w.agentId);
+  const isGrok = agent.model === "grok";
+
+  if (!arg) {
+    addSystemBubble(w, isGrok
+      ? "Cú pháp: `/model <grok-build|grok-composer>`"
+      : "Cú pháp: `/model <opus-4-8|opus-4-7|sonnet|haiku>`");
+    return;
+  }
+
   const eff = agent.effort ?? "";
-  await updateAgentSettings(w, target, eff);
-  addSystemBubble(w, `✓ model → \`${target}\` (áp dụng lượt chat tiếp theo)`);
+  if (isGrok) {
+    const target = _GROK_MODEL_ALIAS[arg.toLowerCase()] || (arg.startsWith("grok-") ? arg : null);
+    if (!target) { addSystemBubble(w, `model grok không hợp lệ: \`${arg}\``); return; }
+    await updateAgentSettings(w, null, target, eff);
+    addSystemBubble(w, `✓ grok_model → \`${target}\` (áp dụng lượt chat tiếp theo)`);
+    return;
+  }
+
+  const target = _CLAUDE_MODEL_ALIAS[arg.toLowerCase()] || (arg.startsWith("claude-") ? arg : null);
+  if (!target) { addSystemBubble(w, `model claude không hợp lệ: \`${arg}\``); return; }
+  await updateAgentSettings(w, target, null, eff);
+  addSystemBubble(w, `✓ claude_model → \`${target}\` (áp dụng lượt chat tiếp theo)`);
 }
 
 async function cmdEffort(w, arg) {
-  const allowed = ["default", "low", "medium", "high", "max"];
+  const allowed = ["default", "low", "medium", "high", "xhigh", "max"];
   if (!arg || !allowed.includes(arg.toLowerCase())) {
-    addSystemBubble(w, "Cú pháp: `/effort default|low|medium|high|max`");
+    addSystemBubble(w, "Cú pháp: `/effort default|low|medium|high|xhigh|max`");
     return;
   }
   const eff = arg.toLowerCase() === "default" ? "" : arg.toLowerCase();
   const proj = state.projectCache[w.projectSlug];
   const agent = proj.agents.find((a) => a.id === w.agentId);
-  await updateAgentSettings(w, agent.claude_model || "claude-sonnet-4-6", eff);
+  if (agent.model === "grok") {
+    await updateAgentSettings(w, null, agent.grok_model || "grok-build", eff);
+  } else {
+    await updateAgentSettings(w, agent.claude_model || "claude-sonnet-4-6", null, eff);
+  }
   addSystemBubble(w, `✓ effort → \`${arg}\``);
 }
 
@@ -993,10 +1035,14 @@ async function cmdStop(w) {
 async function cmdStatus(w) {
   const proj = state.projectCache[w.projectSlug];
   const agent = proj.agents.find((a) => a.id === w.agentId);
+  const isGrok = agent.model === "grok";
+  const cur = isGrok ? (agent.grok_model || "grok-build") : (agent.claude_model || "claude-sonnet-4-6");
+  const def = isGrok ? (agent.default_grok_model || "grok-build") : (agent.default_claude_model || "claude-sonnet-4-6");
   const lines = [
     `**Agent**: \`${agent.id}\``,
     `**Project**: ${proj.name}`,
-    `**Model**: \`${agent.claude_model || "claude-sonnet-4-6"}\` (default: \`${agent.default_claude_model || "claude-sonnet-4-6"}\`)`,
+    `**Adapter**: ${isGrok ? "grok" : "claude"}`,
+    `**Model**: \`${cur}\` (default: \`${def}\`)`,
     `**Effort**: \`${agent.effort || "default"}\``,
     `**Status**: ${proj.statuses[agent.id] || "idle"}`,
     `**Streaming**: ${w.streaming ? "yes" : "no"}`,

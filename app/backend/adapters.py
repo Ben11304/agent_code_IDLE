@@ -174,42 +174,120 @@ async def grok_stream(
     message: str,
     system_prompt: str,
     cwd: str,
+    model: str = "grok-build",
+    effort: str | None = None,
+    resume_session_id: str | None = None,
 ) -> AsyncIterator[dict]:
-    if shutil.which("aas") is None:
-        yield {"type": "error", "message": "aas CLI not found on PATH"}
-        return
+    grok_bin = shutil.which("grok")
+    if not grok_bin:
+        candidate = os.path.expanduser("~/.grok/bin/grok")
+        if os.path.exists(candidate):
+            grok_bin = candidate
+        else:
+            yield {"type": "error", "message": "grok CLI not found on PATH or in ~/.grok/bin"}
+            return
 
-    prompt = message
+    cmd = [
+        grok_bin,
+        "--output-format", "streaming-json",
+        "--no-alt-screen",
+        "--permission-mode", "bypassPermissions",
+        "--model", model,
+    ]
+    if effort:
+        cmd += ["--effort", effort]
+    if resume_session_id:
+        cmd += ["--resume", resume_session_id]
     if system_prompt:
-        prompt = f"[ROLE]\n{system_prompt.strip()}\n\n[REQUEST]\n{message}"
+        cmd += ["--system-prompt-override", system_prompt]
+    # `-p / --single` takes the prompt as its value; put it last so all flags parse cleanly.
+    cmd += ["-p", message]
 
-    cmd = ["aas", "ask", prompt]
+    # PTY trick: same reason as claude_stream — defeat Node/Rust CLI block buffering.
+    master_fd, slave_fd = pty.openpty()
+    try:
+        attrs = termios.tcgetattr(slave_fd)
+        attrs[1] &= ~termios.OPOST
+        attrs[3] &= ~(termios.ECHO | termios.ICANON)
+        termios.tcsetattr(slave_fd, termios.TCSANOW, attrs)
+    except termios.error:
+        pass
+    flags = fcntl.fcntl(master_fd, fcntl.F_GETFL)
+    fcntl.fcntl(master_fd, fcntl.F_SETFL, flags | os.O_NONBLOCK)
+
     proc = await asyncio.create_subprocess_exec(
         *cmd,
-        stdout=asyncio.subprocess.PIPE,
+        stdout=slave_fd,
         stderr=asyncio.subprocess.PIPE,
         cwd=cwd,
-        env={**os.environ},
+        env={**os.environ, "FORCE_COLOR": "0", "NO_COLOR": "1", "TERM": "dumb"},
     )
-    assert proc.stdout is not None
+    os.close(slave_fd)
 
-    chunks: list[str] = []
+    loop = asyncio.get_event_loop()
+    reader = asyncio.StreamReader(limit=2 ** 20)
+    protocol = asyncio.StreamReaderProtocol(reader)
+    transport, _ = await loop.connect_read_pipe(
+        lambda: protocol, os.fdopen(master_fd, "rb", buffering=0)
+    )
+
+    assembled: list[str] = []
+    grok_session_id: str | None = None
+    in_text = False
+
     try:
-        async for raw_line in proc.stdout:
-            line = raw_line.decode("utf-8", errors="replace")
+        async for raw_line in reader:
+            line = raw_line.decode("utf-8", errors="replace").strip()
             if not line:
                 continue
-            chunks.append(line)
-            yield {"type": "delta", "text": line}
+            try:
+                evt = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            etype = evt.get("type")
+            if etype == "thought":
+                yield {"type": "thinking", "text": evt.get("data") or ""}
+            elif etype == "text":
+                if not in_text:
+                    yield {"type": "status", "status": "responding"}
+                    in_text = True
+                t = evt.get("data") or ""
+                if t:
+                    assembled.append(t)
+                    yield {"type": "delta", "text": t}
+            elif etype == "end":
+                grok_session_id = evt.get("sessionId")
+                # main.py persists session id via meta event using key claude_session_id
+                # (shared db column for both adapters)
+                if grok_session_id:
+                    yield {"type": "meta", "data": {"claude_session_id": grok_session_id}}
+                final = "".join(assembled)
+                yield {"type": "done", "text": final, "meta": {
+                    "claude_session_id": grok_session_id,
+                    "stop_reason": evt.get("stopReason"),
+                }}
+                return
     finally:
-        await proc.wait()
+        if proc.returncode is None:
+            try:
+                proc.terminate()
+            except ProcessLookupError:
+                pass
+        try:
+            await proc.wait()
+        except Exception:
+            pass
+        try:
+            transport.close()
+        except Exception:
+            pass
 
     if proc.returncode and proc.returncode != 0:
         stderr = (await proc.stderr.read()).decode("utf-8", errors="replace") if proc.stderr else ""
-        yield {"type": "error", "message": f"aas exited {proc.returncode}: {stderr[:500]}"}
+        yield {"type": "error", "message": f"grok exited {proc.returncode}: {stderr[:500]}"}
         return
 
-    yield {"type": "done", "text": "".join(chunks), "meta": {}}
+    yield {"type": "done", "text": "".join(assembled), "meta": {"claude_session_id": grok_session_id}}
 
 
 # ---------------------------------------------------------------------------
