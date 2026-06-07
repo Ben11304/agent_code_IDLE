@@ -1551,10 +1551,38 @@ async function sendMessageInWindow(w, text) {
     const b = addBubble(w, "assistant", "");
     b.querySelector(".role").textContent = "assistant • " + agentId;
     const contentEl = b.querySelector(".content");
-    const thinkEl = document.createElement("div");
-    thinkEl.className = "thinking";
-    b.insertBefore(thinkEl, contentEl);
-    bubbles[agentId] = { bubble: b, contentEl, thinkEl, assembled: "" };
+
+    const thinkBlock = document.createElement("div");
+    thinkBlock.className = "thinking-block collapsed";
+    thinkBlock.innerHTML = `
+      <div class="think-header">
+        <span class="think-toggle">▶</span>
+        <span class="think-label">đang chờ phản hồi…</span>
+        <span class="think-count"></span>
+      </div>
+      <div class="think-body"></div>`;
+    const thinkBody = thinkBlock.querySelector(".think-body");
+    thinkBlock.querySelector(".think-header").onclick = () => {
+      thinkBlock.classList.toggle("collapsed");
+      thinkBlock.querySelector(".think-toggle").textContent =
+        thinkBlock.classList.contains("collapsed") ? "▶" : "▼";
+      if (!thinkBlock.classList.contains("collapsed")) {
+        thinkBody.scrollTop = thinkBody.scrollHeight;
+      }
+    };
+    b.insertBefore(thinkBlock, contentEl);
+
+    bubbles[agentId] = {
+      bubble: b,
+      contentEl,
+      thinkBlock,
+      thinkBody,
+      thinkLabel: thinkBlock.querySelector(".think-label"),
+      thinkCount: thinkBlock.querySelector(".think-count"),
+      assembled: "",
+      thinkAccum: "",
+      streamingStarted: false,
+    };
     return bubbles[agentId];
   }
   w.streaming = true;
@@ -1625,10 +1653,19 @@ function handleEventInWindow(w, slug, evt, bubbleFor, rootAgent) {
     case "delta": {
       const b = bubbleFor(agent);
       b.assembled += evt.text;
-      setContent(b.contentEl, b.assembled);
-      if (b.thinkEl.dataset.done !== "1") {
-        b.thinkEl.style.display = "none";
-        b.thinkEl.dataset.done = "1";
+      // Plain text streaming during the turn — token-by-token smooth, no
+      // marked.parse cost per delta. We do the full markdown render at
+      // agent_done.
+      b.contentEl.textContent = b.assembled;
+      if (!b.streamingStarted) {
+        b.streamingStarted = true;
+        // collapse thinking label since we're now in response phase
+        if (b.thinkAccum) {
+          b.thinkLabel.textContent = `thinking xong (${b.thinkAccum.length}c) — click để xem`;
+        } else {
+          // no thinking at all — hide the block to save space
+          b.thinkBlock.style.display = "none";
+        }
       }
       const m = w.el.querySelector(".messages");
       m.scrollTop = m.scrollHeight;
@@ -1636,31 +1673,41 @@ function handleEventInWindow(w, slug, evt, bubbleFor, rootAgent) {
     }
     case "thinking": {
       const b = bubbleFor(agent);
-      b.thinkEl.textContent = "đang suy nghĩ… " + (evt.text || "").slice(-80);
+      const chunk = evt.text || "";
+      b.thinkAccum += chunk;
+      b.thinkBody.textContent = b.thinkAccum;
+      b.thinkCount.textContent = `${b.thinkAccum.length}c`;
+      if (!b.streamingStarted) {
+        b.thinkLabel.textContent = "đang suy nghĩ…";
+      }
+      if (!b.thinkBlock.classList.contains("collapsed")) {
+        b.thinkBody.scrollTop = b.thinkBody.scrollHeight;
+      }
       const m = w.el.querySelector(".messages");
       m.scrollTop = m.scrollHeight;
       break;
     }
     case "status": {
       const b = bubbleFor(agent);
-      if (evt.status === "thinking" && b.thinkEl.dataset.done !== "1") {
-        b.thinkEl.textContent = "đang suy nghĩ…";
+      if (evt.status === "thinking" && !b.streamingStarted) {
+        b.thinkLabel.textContent = "đang suy nghĩ…";
       } else if (evt.status === "responding") {
-        b.thinkEl.style.display = "none";
-        b.thinkEl.dataset.done = "1";
+        b.streamingStarted = true;
+        if (b.thinkAccum) {
+          b.thinkLabel.textContent = `thinking xong (${b.thinkAccum.length}c) — click để xem`;
+        } else {
+          b.thinkBlock.style.display = "none";
+        }
       }
       break;
     }
     case "agent_status": {
       proj.statuses[agent] = evt.status;
       rerenderGraphsForSlug(slug);
-      // Show a placeholder in the bubble immediately so user knows the agent
-      // is alive even before any thought/text token arrives. Grok can sit in
-      // internal thinking for 30-60s without emitting anything to stdout.
       if (evt.status === "running") {
         const b = bubbleFor(agent);
-        if (b.thinkEl.dataset.done !== "1" && !b.thinkEl.textContent) {
-          b.thinkEl.textContent = "đang chờ phản hồi…";
+        if (!b.streamingStarted && !b.thinkAccum) {
+          b.thinkLabel.textContent = "đang chờ phản hồi…";
         }
       }
       break;
@@ -1668,9 +1715,16 @@ function handleEventInWindow(w, slug, evt, bubbleFor, rootAgent) {
     case "agent_done": {
       proj.statuses[agent] = evt.status || "ok";
       const b = bubbleFor(agent);
-      b.thinkEl.style.display = "none";
+      // Final pass: render markdown over the full accumulated text.
+      const finalText = evt.text || b.assembled;
+      setContent(b.contentEl, finalText);
+      // freeze thinking label final
+      if (b.thinkAccum) {
+        b.thinkLabel.textContent = `thinking (${b.thinkAccum.length}c) — click để xem`;
+      } else {
+        b.thinkBlock.style.display = "none";
+      }
       rerenderGraphsForSlug(slug);
-      // mirror final to dispatched agent's window if open
       mirrorDispatchedMessages(slug, agent);
       break;
     }
@@ -1698,6 +1752,7 @@ function handleEventInWindow(w, slug, evt, bubbleFor, rootAgent) {
     case "error": {
       const b = bubbleFor(agent);
       setContent(b.contentEl, (b.assembled || "") + `\n\n> **[error]** ${evt.message || ""}`);
+      if (!b.thinkAccum) b.thinkBlock.style.display = "none";
       proj.statuses[agent] = "error";
       rerenderGraphsForSlug(slug);
       break;

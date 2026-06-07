@@ -202,6 +202,24 @@ html, body { margin: 0; height: 100%; background: var(--bg); color: var(--text);
   border-radius: 6px; max-height: 80px; overflow: hidden;
   font-family: var(--mono); white-space: pre-wrap; }
 
+.bubble .thinking-block { background: rgba(255,255,255,0.03);
+  border: 1px solid var(--border); border-radius: 6px; margin-bottom: 6px;
+  font-family: var(--mono); font-size: 11px; overflow: hidden; }
+.bubble .think-header { display: flex; gap: 6px; align-items: center;
+  padding: 4px 8px; cursor: pointer; color: var(--text-dim);
+  user-select: none; }
+.bubble .think-header:hover { background: rgba(255,255,255,0.04); }
+.bubble .think-toggle { width: 12px; display: inline-block; text-align: center;
+  font-size: 9px; }
+.bubble .think-label { flex: 1; font-style: italic; white-space: nowrap;
+  overflow: hidden; text-overflow: ellipsis; }
+.bubble .think-count { color: #5a6280; font-size: 10px; flex-shrink: 0; }
+.bubble .think-body { max-height: 240px; overflow-y: auto; padding: 6px 10px;
+  white-space: pre-wrap; word-break: break-word;
+  background: rgba(0,0,0,0.25); border-top: 1px solid var(--border);
+  font-size: 11.5px; line-height: 1.4; color: var(--text-dim); }
+.bubble .thinking-block.collapsed .think-body { display: none; }
+
 .dispatch-card { display: block; background: var(--accent-soft); border: 1px solid #4a3b8a;
   border-radius: 8px; padding: 8px 10px; margin: 6px 0; font-size: 12px; }
 .dispatch-card .arrow { color: var(--accent); font-weight: 600; }
