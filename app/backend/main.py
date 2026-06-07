@@ -77,6 +77,213 @@ class AgentSettings(BaseModel):
     effort: Optional[str] = None
 
 
+_AGENT_ID_RE = re.compile(r"^[A-Z][A-Z0-9_]*$")
+
+
+class NewAgent(BaseModel):
+    id: str
+    role: Optional[str] = ""
+    model: str = "claude"
+    claude_model: Optional[str] = None
+    grok_model: Optional[str] = None
+    effort: Optional[str] = None
+    system_prompt_file: Optional[str] = ""
+    cwd: Optional[str] = "."
+    parents: list = []
+    custom_files: Optional[list] = None  # [{path, content}] from parent-generated preview
+
+
+def _validate_new_agent(slug: str, body: "NewAgent") -> dict:
+    project = projects.get_project(slug)
+    if not project:
+        raise HTTPException(404, "project not found")
+    if not _AGENT_ID_RE.match(body.id):
+        raise HTTPException(400, "id must be uppercase letters/digits/underscore starting with a letter")
+    if body.model not in ("claude", "grok"):
+        raise HTTPException(400, "model must be 'claude' or 'grok'")
+    existing = {a["id"] for a in project["agents"]}
+    if body.id in existing:
+        raise HTTPException(409, f"agent id already exists: {body.id}")
+    for p in body.parents:
+        if p not in existing:
+            raise HTTPException(400, f"parent agent not found: {p}")
+    if body.id in body.parents:
+        raise HTTPException(400, "agent cannot be its own parent")
+    return project
+
+
+@app.post("/api/projects/{slug}/agents/preview")
+def api_preview_agent(slug: str, body: NewAgent):
+    _validate_new_agent(slug, body)
+    preview = projects.preview_agent(slug, body.model_dump())
+    if "error" in preview:
+        raise HTTPException(404, preview["error"])
+    return preview
+
+
+_FILE_BLOCK_RE = re.compile(
+    r'<file\s+path="([^"]+)"\s*>([\s\S]*?)</file>',
+    re.IGNORECASE,
+)
+
+
+def _bootstrap_prompt(slug: str, body: "NewAgent", parent_id: str) -> str:
+    proj = projects.get_project(slug)
+    others = [a["id"] for a in proj["agents"] if a["id"] != parent_id]
+    return (
+        "[CONTROL-PLANE BOOTSTRAP REQUEST — not a normal user task; do not dispatch]\n\n"
+        "A new child agent is being added under your orchestration. Generate the bootstrap "
+        "files for it based on your knowledge of this project — actual paths, conventions, "
+        "downstream consumers. Be specific, not generic.\n\n"
+        "## New agent\n"
+        f"- ID: `{body.id}`\n"
+        f"- Adapter: `{body.model}`\n"
+        f"- Role (user description): {body.role or '(unspecified — infer from ID)'}\n"
+        f"- Parents in graph: {', '.join(body.parents)}\n\n"
+        "## Project\n"
+        f"- Name: {proj['name']}\n"
+        f"- Other agents: {', '.join(others) or 'none'}\n\n"
+        "## Output format — STRICT\n"
+        "Emit ONLY the file blocks below, in this exact order, with NO prose before, between, or after. "
+        "Each block uses the verbatim envelope:\n\n"
+        f'<file path="{body.id}/RELATIVE_PATH">\n'
+        "...content...\n"
+        "</file>\n\n"
+        "Required files (5):\n"
+        f"1. `{body.id}/AGENT.md`\n"
+        f"2. `{body.id}/inputs/manifest.md`\n"
+        f"3. `{body.id}/outputs/manifest.md`\n"
+        f"4. `{body.id}/state/progress.md`\n"
+        f"5. `{body.id}/context/code_map.md`\n\n"
+        "## Content guidelines\n"
+        "- `AGENT.md` is the system prompt. Keep it under 80 lines. Sections only: Role, "
+        "Required reads (point at REAL files you know exist in this project, especially "
+        "`../shared/*` and any folders relevant to this agent's domain), Scope IN/OUT, "
+        "Pre-flight checklist, Output contract, Escalation triggers. NO routing tables, "
+        "NO worker lists, NO 'dispatch this' patterns — the control plane injects current "
+        "children at runtime.\n"
+        "- `inputs/manifest.md` and `outputs/manifest.md` start with YAML frontmatter "
+        "(`schema_version: 1`, `agent`, `direction`, `updated`) then a markdown table.\n"
+        "- `state/progress.md` is a short initial log with one bootstrap entry.\n"
+        "- `context/code_map.md` lists owned files + read-only references with REAL paths.\n\n"
+        "Reference actual folders that exist in this project (e.g. `paper/`, `documentation/`, "
+        "`data/`, `analyse/`, etc.) — do not invent fake paths. If you don't know which "
+        "artifact the new agent should produce, mark it `(TBD)` rather than guessing.\n"
+    )
+
+
+def _validate_bootstrap_files(files: list, agent_id: str) -> list[str]:
+    warnings: list[str] = []
+    paths = {f["path"] for f in files}
+    for required in [
+        f"{agent_id}/AGENT.md",
+        f"{agent_id}/inputs/manifest.md",
+        f"{agent_id}/outputs/manifest.md",
+        f"{agent_id}/state/progress.md",
+        f"{agent_id}/context/code_map.md",
+    ]:
+        if required not in paths:
+            warnings.append(f"Thiếu file `{required}` — parent không emit. Bạn có thể tạo sau.")
+    for f in files:
+        if not f["path"].startswith(f"{agent_id}/"):
+            warnings.append(f"`{f['path']}` không nằm trong folder `{agent_id}/` — bị từ chối lúc ghi.")
+    return warnings
+
+
+@app.post("/api/projects/{slug}/agents/preview-from-parent")
+async def api_preview_from_parent(slug: str, body: NewAgent):
+    _validate_new_agent(slug, body)
+    if not body.parents:
+        raise HTTPException(400, "Cần chọn ít nhất 1 parent để sinh từ parent. Hoặc dùng template preview.")
+    parent_id = body.parents[0]
+
+    queue: asyncio.Queue = asyncio.Queue()
+    tracker: list = []
+
+    async def emit(evt):
+        await queue.put(evt)
+
+    bootstrap_msg = _bootstrap_prompt(slug, body, parent_id)
+
+    async def driver():
+        try:
+            await _run_agent(slug, parent_id, bootstrap_msg, emit, tracker)
+            if tracker:
+                await asyncio.gather(*tracker, return_exceptions=True)
+        except asyncio.CancelledError:
+            for t in tracker:
+                if not t.done():
+                    t.cancel()
+            if tracker:
+                await asyncio.gather(*tracker, return_exceptions=True)
+            raise
+        except Exception as e:
+            await queue.put({"type": "error", "agent": parent_id, "message": str(e)})
+        finally:
+            await queue.put(None)
+
+    async def sse():
+        yield _sse({"type": "start", "parent": parent_id, "new_agent_id": body.id})
+        task = asyncio.create_task(driver())
+        assembled = ""
+        try:
+            while True:
+                try:
+                    evt = await asyncio.wait_for(queue.get(), timeout=15.0)
+                except asyncio.TimeoutError:
+                    yield ": keepalive\n\n"
+                    continue
+                if evt is None:
+                    break
+                if evt.get("type") == "delta" and evt.get("agent") == parent_id:
+                    assembled += evt.get("text", "")
+                yield _sse(evt)
+            files = [
+                {"path": m.group(1).strip(), "content": m.group(2).strip("\n")}
+                for m in _FILE_BLOCK_RE.finditer(assembled)
+            ]
+            # de-dupe by path, keep first occurrence
+            seen = set()
+            unique = []
+            for f in files:
+                if f["path"] in seen:
+                    continue
+                seen.add(f["path"])
+                unique.append(f)
+            warnings = _validate_bootstrap_files(unique, body.id)
+            root = projects._project_root_for_slug(slug)
+            target_folder = str(root / body.id) if root else body.id
+            yield _sse({
+                "type": "bootstrap_done",
+                "files": unique,
+                "warnings": warnings,
+                "target_folder": target_folder,
+            })
+        finally:
+            if not task.done():
+                task.cancel()
+
+    return StreamingResponse(
+        sse(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache, no-transform",
+            "X-Accel-Buffering": "no",
+            "Connection": "keep-alive",
+        },
+    )
+
+
+@app.post("/api/projects/{slug}/agents")
+def api_add_agent(slug: str, body: NewAgent):
+    _validate_new_agent(slug, body)
+    ok, msg = projects.create_agent(slug, body.model_dump())
+    if not ok:
+        raise HTTPException(500, msg)
+    refreshed = projects.get_project(slug)
+    return {"ok": True, "project": refreshed}
+
+
 @app.post("/api/projects/{slug}/agents/{agent_id}/clear")
 def api_clear_session(slug: str, agent_id: str):
     found = projects.get_agent(slug, agent_id)
@@ -154,7 +361,8 @@ def _get_children(project_data: dict, agent_id: str) -> list[str]:
 def _dispatch_instructions(children: list[str]) -> str:
     return (
         "\n\n## Dispatch protocol — MANDATORY (overrides any invoke pattern described in this file's main body)\n"
-        f"You orchestrate these workers: {', '.join(children)}.\n\n"
+        "**Current direct workers, from the live project graph** (may differ from any static list in the main body of this file; "
+        f"workers can be added or removed via the control plane at any time): {', '.join(children)}.\n\n"
         "**You MUST dispatch to a worker for ANY task involving reading their scope (code, data, files, configs, manifests), "
         "answering questions about their domain, running their pipelines, or producing artifacts. "
         "Reading source files yourself is a violation of your role.** Self-justifying excuses NOT accepted: "

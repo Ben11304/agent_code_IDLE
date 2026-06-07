@@ -276,8 +276,11 @@ function renderWindowContent(w) {
   const c = w.contentEl;
   if (w.type === "graph") {
     c.innerHTML = `<svg class="graph-svg" xmlns="http://www.w3.org/2000/svg"></svg>
+      <div class="graph-toolbar">
+        <button class="toolbar-btn add-agent-btn" title="thêm agent vào project">+ agent</button>
+      </div>
       <div class="zoom-controls">
-        <button data-z="in" title="zoom in">+</button>
+        <button data-z="in" title="zoom in (Ctrl/Cmd+scroll)">+</button>
         <button data-z="out" title="zoom out">−</button>
         <button data-z="fit" title="fit">⌖</button>
         <span class="zoom-level"></span>
@@ -505,6 +508,8 @@ function bindGraphWindow(w) {
       }
     };
   });
+  const addBtn = w.el.querySelector(".add-agent-btn");
+  if (addBtn) addBtn.onclick = () => openAddAgentDialog(w.projectSlug);
 }
 
 function zoomBy(w, factor, px, py) {
@@ -1030,6 +1035,392 @@ async function cmdDispatch(w, arg) {
 async function cmdStop(w) {
   if (!w.streaming) { addSystemBubble(w, "không có stream nào đang chạy."); return; }
   stopChat(w);
+}
+
+// ---------- Add agent dialog ----------
+
+function openAddAgentDialog(slug) {
+  const proj = state.projectCache[slug];
+  if (!proj) return;
+  const existing = proj.agents.map((a) => a.id);
+
+  let overlay = document.getElementById("addAgentOverlay");
+  if (overlay) overlay.remove();
+  overlay = document.createElement("div");
+  overlay.id = "addAgentOverlay";
+  overlay.className = "modal-overlay";
+
+  const claudeOpts = CLAUDE_MODELS.map((o) =>
+    `<option value="${o.value}">${o.label}</option>`).join("");
+  const grokOpts = `<option value="grok-build">grok-build</option>
+    <option value="grok-composer-2.5-fast">grok-composer 2.5</option>`;
+  const parentOpts = existing.map((id) =>
+    `<option value="${escapeHtml(id)}">${escapeHtml(id)}</option>`).join("");
+
+  overlay.innerHTML = `
+    <div class="modal">
+      <div class="modal-header">
+        <span>Thêm agent vào <strong>${escapeHtml(proj.name)}</strong></span>
+        <button class="modal-close" title="đóng">×</button>
+      </div>
+      <form class="modal-body" id="addAgentForm">
+        <div class="form-row">
+          <label>ID
+            <input name="id" type="text" required pattern="[A-Z][A-Z0-9_]*"
+              placeholder="VD: REVIEWER" autocomplete="off" />
+          </label>
+          <label>Role (mô tả 1 dòng)
+            <input name="role" type="text"
+              placeholder="VD: Adversarial code reviewer." />
+          </label>
+        </div>
+
+        <div class="form-row">
+          <label>Adapter
+            <select name="model">
+              <option value="claude" selected>claude</option>
+              <option value="grok">grok</option>
+            </select>
+          </label>
+          <label data-for="claude">Claude model
+            <select name="claude_model">
+              <option value="">(default sonnet 4.6)</option>
+              ${claudeOpts}
+            </select>
+          </label>
+          <label data-for="grok" style="display:none">Grok model
+            <select name="grok_model">
+              <option value="">(default grok-build)</option>
+              ${grokOpts}
+            </select>
+          </label>
+          <label>Effort
+            <select name="effort">
+              <option value="">default</option>
+              <option value="low">low</option>
+              <option value="medium">medium</option>
+              <option value="high">high</option>
+              <option value="xhigh">xhigh</option>
+              <option value="max">max</option>
+            </select>
+          </label>
+        </div>
+
+        <div class="form-row">
+          <label>System prompt file (relative)
+            <input name="system_prompt_file" type="text"
+              placeholder="VD: REVIEWER/AGENT.md (có thể để trống)" />
+          </label>
+          <label>cwd (relative)
+            <input name="cwd" type="text" value="." />
+          </label>
+        </div>
+
+        <div class="form-row">
+          <label class="full">Parents (orchestrators có thể dispatch tới agent này)
+            <select name="parents" multiple size="${Math.min(6, Math.max(3, existing.length))}">
+              ${parentOpts}
+            </select>
+            <span class="hint">Ctrl/Cmd+click để chọn nhiều. Để trống nếu agent này là root.</span>
+          </label>
+        </div>
+
+        <div class="form-row">
+          <label class="full">Cách sinh file bootstrap
+            <div class="radio-group">
+              <label class="radio-inline"><input type="radio" name="bootstrap_mode" value="from_parent" checked>
+                <span>Để parent agent đầu tiên tự viết (dựa trên context project mà parent biết)</span></label>
+              <label class="radio-inline"><input type="radio" name="bootstrap_mode" value="template">
+                <span>Dùng template generic (nhanh, không tốn quota)</span></label>
+            </div>
+            <span class="hint">Parent sẽ stream output realtime; bạn duyệt rồi mới ghi đĩa.</span>
+          </label>
+        </div>
+
+        <div class="modal-msg" id="addAgentMsg"></div>
+        <div class="modal-actions">
+          <button type="button" class="btn-secondary" id="cancelAddAgent">Hủy</button>
+          <button type="submit" class="btn-primary">Tạo agent</button>
+        </div>
+      </form>
+    </div>`;
+
+  document.body.appendChild(overlay);
+
+  const form = overlay.querySelector("#addAgentForm");
+  const msg = overlay.querySelector("#addAgentMsg");
+  const modelSelect = form.querySelector('select[name="model"]');
+  const claudeWrap = form.querySelector('[data-for="claude"]');
+  const grokWrap = form.querySelector('[data-for="grok"]');
+
+  function syncAdapter() {
+    const isGrok = modelSelect.value === "grok";
+    claudeWrap.style.display = isGrok ? "none" : "";
+    grokWrap.style.display = isGrok ? "" : "none";
+  }
+  modelSelect.onchange = syncAdapter;
+  syncAdapter();
+
+  function close() { overlay.remove(); }
+  overlay.querySelector(".modal-close").onclick = close;
+  overlay.querySelector("#cancelAddAgent").onclick = close;
+  overlay.onclick = (e) => { if (e.target === overlay) close(); };
+  document.addEventListener("keydown", function esc(e) {
+    if (e.key === "Escape") { close(); document.removeEventListener("keydown", esc); }
+  });
+
+  let stage = "form";  // 'form' | 'generating' | 'preview'
+  let currentBody = null;
+  let previewFiles = null;  // [{path, content}] to send on create
+
+  function readForm() {
+    const fd = new FormData(form);
+    const parents = Array.from(form.querySelector('select[name="parents"]').selectedOptions)
+      .map((o) => o.value);
+    const isGrok = fd.get("model") === "grok";
+    return {
+      id: (fd.get("id") || "").trim().toUpperCase(),
+      role: (fd.get("role") || "").trim(),
+      model: fd.get("model"),
+      claude_model: isGrok ? null : ((fd.get("claude_model") || "").trim() || null),
+      grok_model: isGrok ? ((fd.get("grok_model") || "").trim() || null) : null,
+      effort: (fd.get("effort") || "").trim() || null,
+      system_prompt_file: (fd.get("system_prompt_file") || "").trim() || null,
+      cwd: (fd.get("cwd") || ".").trim() || ".",
+      parents,
+      bootstrap_mode: fd.get("bootstrap_mode") || "from_parent",
+    };
+  }
+
+  const submitBtn = form.querySelector('button[type="submit"]');
+
+  function showPreview(data) {
+    stage = "preview";
+    previewFiles = data.files || [];
+    submitBtn.textContent = "✓ Tạo agent";
+    submitBtn.disabled = false;
+    const cancelBtn = overlay.querySelector("#cancelAddAgent");
+    cancelBtn.textContent = "← Quay lại sửa";
+
+    form.querySelectorAll(".form-row").forEach((row) => row.style.display = "none");
+    const genPanel = form.querySelector(".gen-panel");
+    if (genPanel) genPanel.style.display = "none";
+
+    let preview = form.querySelector(".agent-preview");
+    if (!preview) {
+      preview = document.createElement("div");
+      preview.className = "agent-preview";
+      msg.parentNode.insertBefore(preview, msg);
+    }
+    const warnHtml = (data.warnings || []).length
+      ? `<div class="preview-warnings">${data.warnings.map(w => `<div class="warn-row">⚠ ${escapeHtml(w)}</div>`).join("")}</div>`
+      : "";
+    const fileHtml = (data.files || []).map((f) => `
+      <details class="preview-file" ${f.path.endsWith("AGENT.md") ? "open" : ""}>
+        <summary>${escapeHtml(f.path)} <span class="file-size">${f.content.length}c</span></summary>
+        <pre>${escapeHtml(f.content)}</pre>
+      </details>`).join("");
+    preview.innerHTML = `
+      <div class="preview-header">
+        <strong>Preview</strong>
+        <span class="preview-target">${escapeHtml(data.target_folder || "")}</span>
+      </div>
+      ${warnHtml}
+      <div class="preview-files">${fileHtml}</div>`;
+  }
+
+  function backToForm() {
+    stage = "form";
+    submitBtn.textContent = "Sinh / Xem trước →";
+    submitBtn.disabled = false;
+    const cancelBtn = overlay.querySelector("#cancelAddAgent");
+    cancelBtn.textContent = "Hủy";
+    form.querySelectorAll(".form-row").forEach((row) => row.style.display = "");
+    const preview = form.querySelector(".agent-preview");
+    if (preview) preview.remove();
+    const genPanel = form.querySelector(".gen-panel");
+    if (genPanel) genPanel.remove();
+    previewFiles = null;
+  }
+
+  let genStream = null;
+
+  function showGenerating(parentId) {
+    stage = "generating";
+    submitBtn.textContent = "đang sinh…";
+    submitBtn.disabled = true;
+    const cancelBtn = overlay.querySelector("#cancelAddAgent");
+    cancelBtn.textContent = "Dừng & quay lại";
+    form.querySelectorAll(".form-row").forEach((row) => row.style.display = "none");
+    let panel = form.querySelector(".gen-panel");
+    if (panel) panel.remove();
+    panel = document.createElement("div");
+    panel.className = "gen-panel";
+    panel.innerHTML = `
+      <div class="gen-header">
+        <strong>${escapeHtml(parentId)}</strong> đang sinh file bootstrap…
+      </div>
+      <pre class="gen-output"></pre>`;
+    msg.parentNode.insertBefore(panel, msg);
+  }
+
+  function abortGen() {
+    if (genStream) { try { genStream.abort(); } catch {} genStream = null; }
+  }
+
+  // Override cancel button to support back-from-preview
+  const cancelBtn = overlay.querySelector("#cancelAddAgent");
+  cancelBtn.textContent = "Hủy";
+  cancelBtn.onclick = () => {
+    if (stage === "preview") backToForm();
+    else if (stage === "generating") { abortGen(); backToForm(); }
+    else close();
+  };
+
+  // Initial submit label
+  submitBtn.textContent = "Sinh / Xem trước →";
+
+  async function streamFromParent(body) {
+    showGenerating(body.parents[0]);
+    const outEl = form.querySelector(".gen-output");
+    let assembled = "";
+    const ctrl = new AbortController();
+    genStream = ctrl;
+    try {
+      const resp = await fetch(`/api/projects/${slug}/agents/preview-from-parent`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(body),
+        signal: ctrl.signal,
+      });
+      if (!resp.ok || !resp.body) {
+        const t = await resp.text();
+        msg.textContent = "lỗi: " + (resp.status) + " " + t.slice(0, 200);
+        msg.className = "modal-msg error";
+        backToForm();
+        return;
+      }
+      const reader = resp.body.getReader();
+      const decoder = new TextDecoder();
+      let buf = "";
+      let done = null;
+      while (true) {
+        const { value, done: doneRead } = await reader.read();
+        if (doneRead) break;
+        buf += decoder.decode(value, { stream: true });
+        const parts = buf.split("\n\n");
+        buf = parts.pop() || "";
+        for (const chunk of parts) {
+          const line = chunk.trim();
+          if (!line.startsWith("data:")) continue;
+          const payload = line.slice(5).trim();
+          if (!payload) continue;
+          let evt;
+          try { evt = JSON.parse(payload); } catch { continue; }
+          if (evt.type === "delta" && evt.text) {
+            assembled += evt.text;
+            outEl.textContent = assembled.slice(-4000);
+            outEl.scrollTop = outEl.scrollHeight;
+          } else if (evt.type === "thinking") {
+            outEl.dataset.thinking = "1";
+          } else if (evt.type === "error") {
+            msg.textContent = "parent lỗi: " + (evt.message || "unknown");
+            msg.className = "modal-msg error";
+          } else if (evt.type === "bootstrap_done") {
+            done = evt;
+          }
+        }
+      }
+      if (done) {
+        msg.textContent = "";
+        if (!done.files || !done.files.length) {
+          msg.textContent = "parent không emit file block nào. Thử lại hoặc dùng template.";
+          msg.className = "modal-msg error";
+          backToForm();
+          return;
+        }
+        showPreview(done);
+      } else {
+        msg.textContent = "stream kết thúc nhưng không nhận bootstrap_done.";
+        msg.className = "modal-msg error";
+        backToForm();
+      }
+    } catch (err) {
+      if (err.name === "AbortError") return;
+      msg.textContent = "network error: " + err.message;
+      msg.className = "modal-msg error";
+      backToForm();
+    } finally {
+      genStream = null;
+    }
+  }
+
+  form.onsubmit = async (e) => {
+    e.preventDefault();
+    currentBody = readForm();
+    if (stage === "form") {
+      msg.textContent = "";
+      const useParent = currentBody.bootstrap_mode === "from_parent" && currentBody.parents.length > 0;
+      if (useParent) {
+        await streamFromParent(currentBody);
+      } else {
+        msg.textContent = "đang sinh template…";
+        msg.className = "modal-msg working";
+        try {
+          const r = await fetch(`/api/projects/${slug}/agents/preview`, {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify(currentBody),
+          });
+          const j = await r.json();
+          if (!r.ok) {
+            msg.textContent = "lỗi: " + (j.detail || r.statusText);
+            msg.className = "modal-msg error";
+            return;
+          }
+          msg.textContent = "";
+          showPreview(j);
+        } catch (err) {
+          msg.textContent = "network error: " + err.message;
+          msg.className = "modal-msg error";
+        }
+      }
+      return;
+    }
+    // stage === "preview" — actually create
+    msg.textContent = "đang ghi folder + yaml…";
+    msg.className = "modal-msg working";
+    submitBtn.disabled = true;
+    const payload = { ...currentBody, custom_files: previewFiles };
+    delete payload.bootstrap_mode;
+    try {
+      const r = await fetch(`/api/projects/${slug}/agents`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(payload),
+      });
+      const j = await r.json();
+      if (!r.ok) {
+        msg.textContent = "lỗi: " + (j.detail || r.statusText);
+        msg.className = "modal-msg error";
+        submitBtn.disabled = false;
+        return;
+      }
+      state.projectCache[slug] = j.project || state.projectCache[slug];
+      rerenderGraphsForSlug(slug);
+      const t = _treeState(slug);
+      t.cache = {};
+      await loadTreeRoot(slug);
+      renderTree();
+      msg.textContent = "✓ đã tạo " + currentBody.id;
+      msg.className = "modal-msg ok";
+      setTimeout(close, 700);
+    } catch (err) {
+      msg.textContent = "network error: " + err.message;
+      msg.className = "modal-msg error";
+      submitBtn.disabled = false;
+    }
+  };
 }
 
 async function cmdStatus(w) {

@@ -75,6 +75,36 @@ Port conflicts: `lsof -ti tcp:5174 | xargs kill -9`.
 - Input: Enter sends, Shift+Enter newlines, Esc stops streaming, gồm slash commands
 - "Gửi" button toggles to red "Stop" while streaming
 
+### Add agent (UI form + parent-generated bootstrap)
+
+Click `+ agent` on the graph window. The form collects:
+
+- `id` (uppercase, `[A-Z][A-Z0-9_]*`)
+- `role` (one-line description)
+- `model` (`claude` | `grok`)
+- `claude_model` / `grok_model` (filtered by adapter)
+- `effort` (optional)
+- `system_prompt_file` (relative; if blank → `<ID>/AGENT.md`)
+- `cwd` (relative; if blank → `<ID>`)
+- `parents` (multi-select from existing agents)
+- **Bootstrap mode** — radio:
+  - **Sinh từ parent** (default if a parent is selected): the system sends a `[CONTROL-PLANE BOOTSTRAP REQUEST]` to the first parent in the list (e.g. BOSS). The parent emits 5 `<file path="...">...</file>` blocks based on its project knowledge. The modal streams that output live; on `bootstrap_done` the parsed files become the preview.
+  - **Template generic**: render a static skeleton (used if no parent, or for fast iteration without burning quota).
+
+Both modes lead to the same **preview pane** — collapsible blocks of each file's content + warnings (missing required file, path outside agent folder, `shared/` absent in project, etc.). Click `← Quay lại sửa` to edit the form, or `✓ Tạo agent` to write.
+
+Writing is atomic: backend creates `<project_root>/<ID>/`, writes every file, then appends to `project.yaml` via ruamel.yaml (preserves comments). Any failure rolls back the folder. On success, the graph rerenders, the folder tree refreshes, and the new node is dispatchable from any orchestrator that lists it as a child.
+
+Required files generated per agent:
+
+- `<ID>/AGENT.md` — system prompt (Role, Required reads, Scope, Pre-flight, Output contract, Escalation triggers). Under ~80 lines. **No routing tables, no worker lists** — that information is injected at runtime by `_dispatch_instructions` from the live graph.
+- `<ID>/inputs/manifest.md` — YAML frontmatter + table of upstream artifacts (one row per parent).
+- `<ID>/outputs/manifest.md` — YAML frontmatter + table of produced artifacts.
+- `<ID>/state/progress.md` — initial bootstrap entry.
+- `<ID>/context/code_map.md` — owned files + read-only references.
+
+The parent-generated bootstrap is what makes the agent contextually correct: BOSS that knows `paper/` exists will reference it directly in `inputs/manifest.md`, instead of leaving `(TBD)` placeholders.
+
 ### Slash commands (in chat input)
 
 Type `/` to open the command menu. Tab to insert, ↑↓ to navigate, Esc to close.
@@ -101,7 +131,8 @@ agents:
     role: <one-line description>
     model: claude | grok          # adapter selector
     claude_model: claude-opus-4-8 | claude-opus-4-7 | claude-sonnet-4-6 | claude-haiku-4-5
-    effort: low | medium | high | max   # optional
+    grok_model: grok-build | grok-composer-2.5-fast       # only when model: grok
+    effort: low | medium | high | xhigh | max   # optional
     system_prompt_file: <relative path to AGENT.md>
     cwd: <relative working dir>
     parents: [<id>, ...]          # upstream nodes; determines graph layer + dispatch eligibility
@@ -152,6 +183,7 @@ When editing the dispatch prompt, remember the user verifies on the graph. Keep 
 | `agent_done` | `agent`, `text`, `status` | Final state for that agent. |
 | `error` | `agent`, `message` | Surface in bubble as quote. |
 | `complete` | — | Queue closed, all dispatches finished. |
+| `bootstrap_done` | `files`, `warnings`, `target_folder` | Emitted only by `/agents/preview-from-parent` at end of stream. Frontend uses this to build the preview pane. |
 
 If you add an event type, update both `_run_agent` / `_dispatched_run` (emit) and `handleEventInWindow` in `app.js` (consume).
 
@@ -174,6 +206,18 @@ Default `claude_model` is `claude-sonnet-4-6` — fast and cheap. Opus 4.7 / 4.8
 - ❌ Do not run the UI publicly. Subscription terms permit personal use; shared hosting against your login would be reselling. Use SSH tunnel for remote access (see `DEPLOY.md`).
 - ❌ Do not bind uvicorn to 0.0.0.0. Always `127.0.0.1`.
 
+## Add-agent endpoints
+
+| Endpoint | Method | Purpose |
+|---|---|---|
+| `/api/projects/{slug}/agents/preview` | POST | Render the static template for the form's values. Returns `{target_folder, files, warnings}` synchronously. |
+| `/api/projects/{slug}/agents/preview-from-parent` | POST (SSE) | Run the first parent as a bootstrap writer. Streams normal chat events (`delta`, `thinking`, `status`, etc) plus a final `bootstrap_done` with `files` and `warnings`. |
+| `/api/projects/{slug}/agents` | POST | Atomic create. Body is `NewAgent`. If `custom_files: [{path, content}]` is present (sent after preview-from-parent), those files are written verbatim; else the template is rendered. Each path must start with `<ID>/` and contain no `..`. Failure rolls back the directory. |
+
+The bootstrap-from-parent prompt (in `main.py:_bootstrap_prompt`) is a strict envelope: the parent must emit exactly the listed file blocks, each wrapped in `<file path="...">...</file>`, with no prose. The control plane parses with `_FILE_BLOCK_RE`. If the parent violates the format (no blocks, wrong paths), the modal surfaces it and the user is sent back to the form.
+
+Template generation lives in `projects.py:_AGENT_FILE_TEMPLATES` (5 templates) + `render_agent_files()`. Keep the AGENT.md template under ~80 lines and free of routing tables — the same rule we apply when prompting the parent.
+
 ## Adding a new project
 
 1. Create `.agentui/project.yaml` in the project root (schema above).
@@ -189,6 +233,9 @@ Default `claude_model` is `claude-sonnet-4-6` — fast and cheap. Opus 4.7 / 4.8
 - **No idle reaper**. Sessions live forever. Plan: idle timeout + startup reaping with pid groups.
 - **No compaction**. Long chats grow `--resume` context indefinitely. Plan: periodic summarise + new session ID. `/clear` is the manual escape hatch.
 - **Tab close cancels SSE**. Dispatched workers can be killed mid-turn if the browser disconnects (driver cascades cancel). On startup the orphan reaper marks any leftover `running` sessions as `cancelled` so the UI is never permanently stuck.
+- **Resume guard**. `--resume` is only used when `last_status == "ok"`. Any prior turn that was `running` / `cancelled` / `error` is treated as torn (claude server state may be mid-reply); next turn starts a fresh CLI session. This avoids the "agent silently returns nothing" failure mode after a stop / orphan.
+- **SSE heartbeat**. The chat stream emits `: keepalive` every 15s of quiet. Required because Opus extended thinking can sit 10–30s without bytes — without the heartbeat, browsers and proxies close the SSE and the UI shows "đã dừng" with no response.
+- **Add-agent is creation-only**. Edit and delete (with archive) are Sprint 1. To remove an agent today: stop the server, delete the folder + remove the yaml entry by hand, restart.
 
 If you implement any of these, update this section.
 

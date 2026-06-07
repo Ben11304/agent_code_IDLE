@@ -124,6 +124,14 @@ html, body { margin: 0; height: 100%; background: var(--bg); color: var(--text);
   50% { stroke: var(--run); stroke-width: 4; filter: drop-shadow(0 0 6px var(--run)); }
 }
 
+.graph-toolbar { position: absolute; top: 8px; left: 8px; display: flex;
+  gap: 4px; background: rgba(20,24,34,0.85); border: 1px solid var(--border);
+  border-radius: 8px; padding: 4px; backdrop-filter: blur(4px); z-index: 5; }
+.toolbar-btn { background: var(--bg-card); color: var(--text);
+  border: 1px solid var(--border); border-radius: 6px; padding: 4px 10px;
+  font-size: 12px; line-height: 1; cursor: pointer; font-family: var(--mono); }
+.toolbar-btn:hover { border-color: var(--accent); color: var(--accent); }
+
 .zoom-controls { position: absolute; bottom: 8px; right: 8px; display: flex;
   gap: 4px; align-items: center; background: rgba(20,24,34,0.85);
   border: 1px solid var(--border); border-radius: 8px; padding: 4px; backdrop-filter: blur(4px);
@@ -241,6 +249,77 @@ html, body { margin: 0; height: 100%; background: var(--bg); color: var(--text);
 .chat-send.stop:hover { background: #ff5050; }
 .chat-status { font-size: 11px; color: var(--text-dim); margin-top: 6px; min-height: 14px;
   font-family: var(--mono); }
+
+/* Add agent modal */
+.modal-overlay { position: fixed; inset: 0; background: rgba(0,0,0,0.6);
+  display: flex; align-items: center; justify-content: center; z-index: 1000;
+  backdrop-filter: blur(2px); }
+.modal { background: var(--bg-card); border: 1px solid var(--border);
+  border-radius: 12px; width: 640px; max-width: 92vw; max-height: 90vh;
+  display: flex; flex-direction: column; box-shadow: 0 16px 48px rgba(0,0,0,0.5); }
+.modal-header { display: flex; justify-content: space-between; align-items: center;
+  padding: 12px 16px; border-bottom: 1px solid var(--border); font-size: 14px; }
+.modal-close { background: transparent; color: var(--text-dim); border: none;
+  font-size: 20px; line-height: 1; cursor: pointer; padding: 0 4px; }
+.modal-close:hover { color: var(--err); }
+.modal-body { padding: 14px 16px; display: flex; flex-direction: column;
+  gap: 12px; overflow-y: auto; }
+.form-row { display: flex; gap: 12px; flex-wrap: wrap; }
+.form-row label { display: flex; flex-direction: column; gap: 4px;
+  font-size: 11.5px; color: var(--text-dim); font-family: var(--mono);
+  flex: 1 1 180px; min-width: 0; }
+.form-row label.full { flex-basis: 100%; }
+.form-row input, .form-row select { background: var(--bg-soft); color: var(--text);
+  border: 1px solid var(--border); border-radius: 6px; padding: 6px 8px;
+  font-size: 12.5px; font-family: inherit; }
+.form-row select[multiple] { font-family: var(--mono); font-size: 12px; }
+.form-row input:focus, .form-row select:focus { outline: none; border-color: var(--accent); }
+.form-row .hint { font-size: 10.5px; color: #5a6280; font-style: italic; }
+.modal-msg { font-size: 12px; font-family: var(--mono); min-height: 16px; }
+.modal-msg.error { color: var(--err); }
+.modal-msg.ok { color: var(--ok); }
+.modal-msg.working { color: var(--text-dim); }
+.modal-actions { display: flex; gap: 8px; justify-content: flex-end; }
+.btn-primary { background: var(--accent); color: white; border: none;
+  border-radius: 8px; padding: 7px 14px; font-size: 13px; cursor: pointer; }
+.btn-secondary { background: var(--bg-soft); color: var(--text); border: 1px solid var(--border);
+  border-radius: 8px; padding: 7px 14px; font-size: 13px; cursor: pointer; }
+
+/* Bootstrap mode radio */
+.radio-group { display: flex; flex-direction: column; gap: 4px; margin-top: 2px; }
+.radio-inline { display: flex !important; flex-direction: row !important;
+  align-items: flex-start; gap: 6px; font-size: 12px; color: var(--text);
+  font-family: inherit; cursor: pointer; }
+.radio-inline input[type="radio"] { margin-top: 2px; }
+.radio-inline span { line-height: 1.3; }
+
+/* Generating panel (streaming parent output) */
+.gen-panel { display: flex; flex-direction: column; gap: 6px; }
+.gen-header { font-size: 12px; color: var(--text-dim); font-family: var(--mono); }
+.gen-output { background: #0c0e14; border: 1px solid var(--border);
+  border-radius: 6px; padding: 8px 10px; margin: 0; max-height: 380px;
+  overflow-y: auto; font-size: 11px; font-family: var(--mono);
+  white-space: pre-wrap; word-break: break-word; min-height: 200px; }
+
+/* Agent preview pane */
+.agent-preview { display: flex; flex-direction: column; gap: 8px; }
+.preview-header { display: flex; gap: 10px; align-items: baseline;
+  padding-bottom: 6px; border-bottom: 1px solid var(--border); }
+.preview-target { font-family: var(--mono); font-size: 11px; color: var(--text-dim); }
+.preview-warnings { display: flex; flex-direction: column; gap: 4px; }
+.warn-row { background: rgba(248, 196, 80, 0.1); border: 1px solid #6a5530;
+  color: #f8c450; padding: 6px 8px; border-radius: 6px; font-size: 11.5px; }
+.preview-files { display: flex; flex-direction: column; gap: 4px;
+  max-height: 50vh; overflow-y: auto; }
+.preview-file { background: var(--bg-soft); border: 1px solid var(--border);
+  border-radius: 6px; padding: 4px 8px; }
+.preview-file summary { cursor: pointer; font-family: var(--mono); font-size: 12px;
+  padding: 2px 0; display: flex; justify-content: space-between; align-items: center; }
+.preview-file .file-size { color: var(--text-dim); font-size: 10.5px; }
+.preview-file pre { background: #0c0e14; border: 1px solid var(--border);
+  border-radius: 6px; padding: 6px 8px; margin: 4px 0 2px; font-size: 11px;
+  font-family: var(--mono); white-space: pre-wrap; word-break: break-word;
+  max-height: 280px; overflow-y: auto; }
 
 /* Taskbar for minimized windows */
 .taskbar { display: flex; gap: 6px; padding: 6px 12px; background: var(--bg-soft);
