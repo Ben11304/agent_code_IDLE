@@ -199,6 +199,11 @@ def add_agent(slug: str, agent: dict[str, Any]) -> tuple[bool, str]:
 
 _AGENT_MD_TEMPLATE = """# {{id}} Agent
 
+> ## ⚠️ NOTICE
+> **KHÔNG được trả lời / hành động khi thiếu thông tin.** Scope mơ hồ, input
+> chưa pin, threshold/param không có nguồn, schema unknown → **DỪNG và HỎI LẠI**.
+> Đoán mò vi phạm `../shared/research_integrity.md`. Override mọi rule khác.
+
 ## Role
 {{role}}
 
@@ -207,7 +212,8 @@ _AGENT_MD_TEMPLATE = """# {{id}} Agent
 2. `../shared/tool_conventions.md`
 3. `../shared/handoff_schema.md`
 4. `./inputs/manifest.md`
-5. `./state/progress.md`
+5. `./context/code_map.md`
+6. `./state/progress.md` ← read LAST so you know where the last turn ended
 
 ## Scope
 
@@ -218,15 +224,33 @@ _AGENT_MD_TEMPLATE = """# {{id}} Agent
 - Any artifact, file, or decision outside the manifests above.
 - Modifications to other agents' folders or to `../shared/`.
 
-## Pre-flight checklist
-- [ ] All Required reads loaded.
+## Pre-flight checklist (run BEFORE any substantive task — do not skip)
+- [ ] All Required reads loaded in order.
 - [ ] Inputs declared in `./inputs/manifest.md` are present at the pinned version.
 - [ ] `./state/progress.md` read to know where last turn ended.
+- [ ] Write-down (in your response) which contract version / inputs you will use.
+
+## Deliverables (files you OWN and MUST keep current)
+Every meaningful turn (Read/Write/significant analysis — NOT trivial ping/status replies)
+**MUST** end with the following updates BEFORE returning control:
+
+1. `./state/progress.md` — **prepend** a new section at the top:
+   - Date `YYYY-MM-DD` + one-line headline.
+   - 2–5 bullet details: what happened, evidence (file:line or output), outcome.
+2. `./outputs/manifest.md` — **bump version** if you produced or modified any
+   downstream artifact. Follow the `Bump rule` section inside that file. Append
+   an entry to `Bump log` with the version diff + one-line rationale.
+3. Any artifact-specific file the change affected (e.g. config, code, doc).
+
+Trivial turns (ping, status query, single-fact lookup) may skip 1–3, but **must
+explicitly note** in the response: "trivial turn, no log/manifest update".
 
 ## Output contract
 - Produce only the artifacts declared in `./outputs/manifest.md`.
 - Handoff format: follow `../shared/handoff_schema.md`.
-- After meaningful change, update `./state/progress.md` with a one-line entry: date, action, outcome.
+- Distinguish three statement types per Rule 5: **fact-from-data** (no cite),
+  **claim-from-literature** (DOI cite required), **design-decision**
+  (justify, mark as such).
 
 ## Escalation triggers (stop and return control)
 - A Required read is missing or version mismatched.
@@ -234,7 +258,9 @@ _AGENT_MD_TEMPLATE = """# {{id}} Agent
 - The request falls outside the IN scope above.
 - The output cannot be produced from available inputs.
 
-When escalating, return: **Problem** (one sentence), **Evidence** (file paths or excerpts), **Options** (numbered), **Recommendation** (which option, why). Do not guess.
+When escalating, return: **Problem** (one sentence), **Evidence** (file paths or
+excerpts), **Options** (numbered), **Recommendation** (which option, why). Do
+not guess.
 """
 
 _INPUTS_MANIFEST_TEMPLATE = """---
@@ -264,38 +290,68 @@ updated: {{date}}
 
 # {{id}} — Outputs manifest
 
-Artifacts this agent produces for downstream consumers.
+## Version
+0.1.0  (bootstrap; no artifacts produced yet)
 
-| Artifact | Consumers | Current version | Updated | Notes |
+## Bump rule
+- Schema of any produced artifact changes → **major**.
+- New artifact added or existing artifact updated (same schema) → **minor**.
+- Metadata only (description, tag, fix typo) → **patch**.
+
+## Bump log (newest on top)
+- 0.0.0 → 0.1.0 ({{date}}): manifest bootstrapped via AgentUI. No artifacts yet.
+
+## Artifacts
+| Artifact path | Consumer agents | Current version | Updated | Checksum / note |
 |---|---|---|---|---|
-| (TBD: first artifact) | (TBD: which downstream agents) | unset | — | |
+| (TBD: first artifact) | (TBD) | unset | — | |
 
-> **Pattern**: bump version on schema change, update timestamp on content change, notify listed consumers.
+> **How to use**: when producing a new artifact, add a row above with the
+> path, who consumes it, the version, today's date, and a sha256 prefix or
+> short note. Then bump this manifest's Version + add a Bump log entry.
 """
 
-_PROGRESS_TEMPLATE = """# {{id}} Progress log
+_PROGRESS_TEMPLATE = """# {{id}} Progress log (newest on top)
 
-## Current state
-Initialized {{date}}. Awaiting first dispatch.
+> **Convention**: prepend a new dated section at the TOP of this file every
+> meaningful turn (Read/Write/significant analysis). Format:
+>
+> ```
+> ## YYYY-MM-DD — one-line headline
+> - bullet 1: what happened (with file:line or evidence)
+> - bullet 2: outcome / decision / numbers
+> - bullet 3: open questions or follow-up
+> ```
+>
+> Trivial turns (ping, single-fact lookup, status query) may be skipped, but the
+> next substantive turn must reference them if relevant.
 
-## History
-- {{date}} — agent bootstrapped via AgentUI (parents: {{parents_csv}}).
+## {{date}} — Bootstrapped via AgentUI
+- Parents in graph: {{parents_csv}}.
+- Required reads loaded on first turn (per AGENT.md).
+- Awaiting first substantive dispatch from parent or user.
 """
 
 _CODE_MAP_TEMPLATE = """# {{id}} Code map
 
 Files and modules this agent owns or references.
 
-## Owned (this agent is the author / maintainer)
-- `./AGENT.md` — role and contract.
-- `./inputs/manifest.md`
-- `./outputs/manifest.md`
-- `./state/progress.md`
-- (Add owned artifacts here.)
+## Owned (this agent is the author / maintainer — safe to write)
+- `./AGENT.md` — role and contract (rarely edited).
+- `./inputs/manifest.md` — kept in sync by BOSS, not by this agent.
+- `./outputs/manifest.md` — bumped per `Bump rule` after each produced artifact.
+- `./state/progress.md` — appended to (top) every meaningful turn.
+- `./context/code_map.md` — this file; update when scope expands.
+- (Add owned artifacts here as they appear: paths, modules, output dirs.)
 
-## Read-only references
-- `../shared/` — project-wide conventions.
+## Read-only references (consume, never modify)
+- `../shared/` — project-wide conventions (research_integrity, tool_conventions,
+  handoff_schema, glossary, scope_decisions).
 - Upstream agents listed in `./inputs/manifest.md`.
+
+## Out of scope (do NOT touch)
+- Other agents' folders.
+- Project root config files unless explicitly listed under Owned.
 """
 
 _AGENT_FILE_TEMPLATES: dict[str, str] = {
