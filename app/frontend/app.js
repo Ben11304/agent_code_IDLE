@@ -1,41 +1,36 @@
-// AgentUI frontend, vanilla JS + SVG.
-// State shape:
-//   projects: list from /api/projects
-//   openTabs: [slug, ...]
-//   activeTab: slug
-//   projectCache: { slug: detail }
-//   selectedAgent: { slug, agentId } | null
-//   currentSession: { id, claude_session_id, messages: [...] } | null
+// AgentUI — vanilla JS, floating windows, multi-agent chats.
 
 const state = {
   projects: [],
   openTabs: [],
   activeTab: null,
   projectCache: {},
-  selectedAgent: null,
-  currentSession: null,
-  streaming: false,
   activeDispatches: new Set(),
-  viewBoxes: {},   // slug -> {x,y,w,h}
-  graphBounds: {}, // slug -> {x,y,w,h} of fitted content
+  viewBoxes: {},          // slug -> {x,y,w,h}
+  graphBounds: {},        // slug -> {x,y,w,h}
+  tree: {},               // slug -> {expanded, cache, selectedAbs, flat}
+  windows: [],            // [{id, projectSlug, type, agentId?, x, y, w, h, z, hidden, el, ...state}]
+  zTop: 10,
 };
 
 const $ = (id) => document.getElementById(id);
+const escapeHtml = (s) => (s || "").replace(/[&<>"']/g, (c) => ({
+  "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;",
+}[c]));
+
+// ---------- Init ----------
 
 async function init() {
   await loadProjects();
   renderProjectList();
-  if (state.projects.length) {
-    await openProject(state.projects[0].slug);
-  }
-  bindChat();
-  bindZoomControls();
+  if (state.projects.length) await openProject(state.projects[0].slug);
+  bindGlobalKeys();
+  bindTreeKeys();
 }
 
 async function loadProjects() {
   const r = await fetch("/api/projects");
-  const j = await r.json();
-  state.projects = j.projects || [];
+  state.projects = (await r.json()).projects || [];
 }
 
 function renderProjectList() {
@@ -60,7 +55,10 @@ async function openProject(slug) {
   }
   renderTabs();
   renderProjectList();
-  renderGraph();
+  ensureGraphWindow(slug);
+  applyTabVisibility();
+  await loadTreeRoot(slug);
+  renderTree();
 }
 
 function closeTab(slug) {
@@ -68,14 +66,14 @@ function closeTab(slug) {
   if (state.activeTab === slug) {
     state.activeTab = state.openTabs[state.openTabs.length - 1] || null;
   }
-  if (state.selectedAgent && state.selectedAgent.slug === slug) {
-    state.selectedAgent = null;
-    state.currentSession = null;
-    renderRightPanel();
+  // remove all windows for this project
+  for (const w of state.windows.filter((w) => w.projectSlug === slug)) {
+    closeWindow(w, true);
   }
   renderTabs();
   renderProjectList();
-  renderGraph();
+  applyTabVisibility();
+  renderTree();
 }
 
 function renderTabs() {
@@ -86,7 +84,7 @@ function renderTabs() {
     const tab = document.createElement("div");
     tab.className = "tab" + (state.activeTab === slug ? " active" : "");
     tab.innerHTML = `<span>${escapeHtml(proj ? proj.name : slug)}</span>
-      <span class="close" data-slug="${slug}">×</span>`;
+      <span class="close">×</span>`;
     tab.onclick = (e) => {
       if (e.target.classList.contains("close")) {
         e.stopPropagation();
@@ -94,18 +92,237 @@ function renderTabs() {
       } else {
         state.activeTab = slug;
         renderTabs();
-        renderGraph();
         renderProjectList();
+        applyTabVisibility();
+        renderTree();
       }
     };
     root.appendChild(tab);
   });
 }
 
-// ---------- Graph layout & render ----------
+// ---------- Window manager ----------
 
-function layoutAgents(agents, edges) {
-  // Layer by longest path from a root.
+function applyTabVisibility() {
+  const slug = state.activeTab;
+  for (const w of state.windows) {
+    if (w.projectSlug !== slug || w.hidden) {
+      w.el.style.display = "none";
+    } else {
+      w.el.style.display = "";
+    }
+  }
+  const anyVisible = state.windows.some((w) => w.projectSlug === slug && !w.hidden);
+  $("canvasEmpty").style.display = anyVisible ? "none" : "flex";
+  renderTaskbar();
+}
+
+function nextZ() { state.zTop += 1; return state.zTop; }
+
+function focusWindow(w) {
+  w.z = nextZ();
+  w.el.style.zIndex = w.z;
+  for (const x of state.windows) x.el.classList.toggle("focused", x === w);
+}
+
+function hideWindow(w) {
+  w.hidden = true;
+  w.el.style.display = "none";
+  renderTaskbar();
+}
+
+function showWindow(w) {
+  w.hidden = false;
+  if (w.projectSlug === state.activeTab) w.el.style.display = "";
+  focusWindow(w);
+  renderTaskbar();
+}
+
+function closeWindow(w, silent) {
+  // tear down per-type
+  if (w.type === "chat" && w.streaming && w.abortController) {
+    try { w.abortController.abort(); } catch {}
+  }
+  w.el.remove();
+  state.windows = state.windows.filter((x) => x !== w);
+  if (!silent) renderTaskbar();
+}
+
+function renderTaskbar() {
+  const tb = $("taskbar");
+  tb.innerHTML = "";
+  const hidden = state.windows.filter((w) => w.projectSlug === state.activeTab && w.hidden);
+  hidden.forEach((w) => {
+    const it = document.createElement("div");
+    it.className = "taskbar-item";
+    it.innerHTML = `<span>${escapeHtml(windowTitle(w))}</span>
+      <span class="close" title="đóng">×</span>`;
+    it.onclick = (e) => {
+      if (e.target.classList.contains("close")) {
+        e.stopPropagation();
+        closeWindow(w);
+      } else {
+        showWindow(w);
+      }
+    };
+    tb.appendChild(it);
+  });
+}
+
+function windowTitle(w) {
+  const proj = state.projectCache[w.projectSlug];
+  const projName = proj ? proj.name : w.projectSlug;
+  if (w.type === "graph") return `${projName} • graph`;
+  if (w.type === "chat") return `${projName} • ${w.agentId}`;
+  return w.id;
+}
+
+function createWindowDom(w) {
+  const root = $("windowsRoot");
+  const el = document.createElement("div");
+  el.className = "window focused";
+  el.dataset.id = w.id;
+  el.style.left = w.x + "px";
+  el.style.top = w.y + "px";
+  el.style.width = w.w + "px";
+  el.style.height = w.h + "px";
+  el.style.zIndex = w.z;
+  el.innerHTML = `
+    <div class="window-titlebar">
+      <span class="window-title">${escapeHtml(windowTitle(w))}<span class="badge">${w.type}</span></span>
+      <div class="window-controls">
+        <button class="window-btn hide" title="ẩn (minimize)">—</button>
+        <button class="window-btn close" title="đóng">×</button>
+      </div>
+    </div>
+    <div class="window-content"></div>
+    <div class="window-resize" title="resize"></div>
+  `;
+  root.appendChild(el);
+  w.el = el;
+  w.contentEl = el.querySelector(".window-content");
+
+  bindWindowChrome(w);
+  renderWindowContent(w);
+  focusWindow(w);
+}
+
+function bindWindowChrome(w) {
+  const tb = w.el.querySelector(".window-titlebar");
+  tb.addEventListener("mousedown", (e) => {
+    if (e.target.classList.contains("window-btn")) return;
+    startWindowDrag(w, e);
+  });
+  w.el.querySelector(".close").onclick = (e) => {
+    e.stopPropagation();
+    closeWindow(w);
+  };
+  w.el.querySelector(".hide").onclick = (e) => {
+    e.stopPropagation();
+    hideWindow(w);
+  };
+  w.el.querySelector(".window-resize").addEventListener("mousedown", (e) => startWindowResize(w, e));
+  w.el.addEventListener("mousedown", () => focusWindow(w));
+}
+
+let _drag = null;
+function startWindowDrag(w, e) {
+  e.preventDefault();
+  _drag = { w, dx: e.clientX - w.x, dy: e.clientY - w.y };
+  w.el.classList.add("dragging");
+  document.addEventListener("mousemove", _onDragMove);
+  document.addEventListener("mouseup", _endDrag);
+}
+function _onDragMove(e) {
+  if (!_drag) return;
+  const { w, dx, dy } = _drag;
+  w.x = Math.max(0, e.clientX - dx);
+  w.y = Math.max(0, e.clientY - dy);
+  w.el.style.left = w.x + "px";
+  w.el.style.top = w.y + "px";
+}
+function _endDrag() {
+  if (!_drag) return;
+  _drag.w.el.classList.remove("dragging");
+  _drag = null;
+  document.removeEventListener("mousemove", _onDragMove);
+  document.removeEventListener("mouseup", _endDrag);
+}
+
+let _resize = null;
+function startWindowResize(w, e) {
+  e.preventDefault(); e.stopPropagation();
+  _resize = { w, sx: e.clientX, sy: e.clientY, w0: w.w, h0: w.h };
+  document.addEventListener("mousemove", _onResizeMove);
+  document.addEventListener("mouseup", _endResize);
+}
+function _onResizeMove(e) {
+  if (!_resize) return;
+  const w = _resize.w;
+  w.w = Math.max(280, _resize.w0 + (e.clientX - _resize.sx));
+  w.h = Math.max(180, _resize.h0 + (e.clientY - _resize.sy));
+  w.el.style.width = w.w + "px";
+  w.el.style.height = w.h + "px";
+  if (w.type === "graph") renderGraphInWindow(w);
+}
+function _endResize() {
+  if (!_resize) return;
+  _resize = null;
+  document.removeEventListener("mousemove", _onResizeMove);
+  document.removeEventListener("mouseup", _endResize);
+}
+
+function renderWindowContent(w) {
+  const c = w.contentEl;
+  if (w.type === "graph") {
+    c.innerHTML = `<svg class="graph-svg" xmlns="http://www.w3.org/2000/svg"></svg>
+      <div class="zoom-controls">
+        <button data-z="in" title="zoom in">+</button>
+        <button data-z="out" title="zoom out">−</button>
+        <button data-z="fit" title="fit">⌖</button>
+        <span class="zoom-level"></span>
+      </div>`;
+    bindGraphWindow(w);
+    renderGraphInWindow(w);
+  } else if (w.type === "chat") {
+    c.innerHTML = `
+      <div class="chat-header"></div>
+      <div class="messages"></div>
+      <div class="chatbox">
+        <div class="chatbox-label">Chat session</div>
+        <form class="chat-form">
+          <textarea class="chat-input" rows="2"
+            placeholder="Enter để gửi (Shift+Enter xuống dòng)"></textarea>
+          <button class="chat-send" type="submit">Gửi</button>
+        </form>
+        <div class="chat-status"></div>
+      </div>`;
+    renderChatHeader(w);
+    bindChatWindow(w);
+    refreshChatSession(w);
+  }
+}
+
+// ---------- Graph window ----------
+
+function ensureGraphWindow(slug) {
+  let w = state.windows.find((x) => x.projectSlug === slug && x.type === "graph");
+  if (!w) {
+    w = {
+      id: `graph-${slug}`, projectSlug: slug, type: "graph",
+      x: 16, y: 12, w: 760, h: 460, z: nextZ(), hidden: false,
+    };
+    state.windows.push(w);
+    createWindowDom(w);
+  } else if (w.hidden) {
+    showWindow(w);
+  } else {
+    focusWindow(w);
+  }
+  return w;
+}
+
+function layoutAgents(agents) {
   const ids = agents.map((a) => a.id);
   const parentMap = Object.fromEntries(agents.map((a) => [a.id, a.parents || []]));
   const depth = {};
@@ -120,58 +337,43 @@ function layoutAgents(agents, edges) {
   }
   ids.forEach((id) => d(id));
   const layers = {};
-  ids.forEach((id) => {
-    const lvl = depth[id];
-    (layers[lvl] = layers[lvl] || []).push(id);
-  });
+  ids.forEach((id) => { (layers[depth[id]] = layers[depth[id]] || []).push(id); });
   return { depth, layers };
 }
 
-function renderGraph() {
-  const svg = $("graph");
-  const empty = $("canvasEmpty");
+function renderGraphInWindow(w) {
+  const svg = w.el.querySelector(".graph-svg");
+  if (!svg) return;
   svg.innerHTML = "";
-  const proj = state.projectCache[state.activeTab];
-  if (!proj) {
-    empty.style.display = "flex";
-    updateZoomLevel();
-    return;
-  }
-  empty.style.display = "none";
+  const proj = state.projectCache[w.projectSlug];
+  if (!proj) return;
 
-  const W = svg.clientWidth || 800;
-  const H = svg.clientHeight || 600;
-  const { depth, layers } = layoutAgents(proj.agents, proj.edges);
+  const W = svg.clientWidth || w.w - 20;
+  const H = svg.clientHeight || w.h - 50;
+  const { layers } = layoutAgents(proj.agents);
   const layerKeys = Object.keys(layers).map(Number).sort((a, b) => a - b);
 
-  const nodeW = 160, nodeH = 60, vGap = 90, hGap = 30;
+  const nodeW = 150, nodeH = 56, vGap = 80, hGap = 26;
   const positions = {};
-  const yStart = 70;
-  let maxRowW = 0;
+  const yStart = 50;
   layerKeys.forEach((lvl, li) => {
     const row = layers[lvl];
     const totalW = row.length * nodeW + (row.length - 1) * hGap;
-    if (totalW > maxRowW) maxRowW = totalW;
-    const xStart = Math.max(40, (W - totalW) / 2);
+    const xStart = Math.max(30, (W - totalW) / 2);
     row.forEach((id, i) => {
-      positions[id] = {
-        x: xStart + i * (nodeW + hGap),
-        y: yStart + li * (nodeH + vGap),
-      };
+      positions[id] = { x: xStart + i * (nodeW + hGap), y: yStart + li * (nodeH + vGap) };
     });
   });
 
-  // Content bounding box for fit-to-view.
   const allPos = Object.values(positions);
   if (allPos.length) {
-    const minX = Math.min(...allPos.map(p => p.x)) - 30;
-    const minY = Math.min(...allPos.map(p => p.y)) - 30;
-    const maxX = Math.max(...allPos.map(p => p.x + nodeW)) + 30;
-    const maxY = Math.max(...allPos.map(p => p.y + nodeH)) + 30;
+    const minX = Math.min(...allPos.map((p) => p.x)) - 24;
+    const minY = Math.min(...allPos.map((p) => p.y)) - 24;
+    const maxX = Math.max(...allPos.map((p) => p.x + nodeW)) + 24;
+    const maxY = Math.max(...allPos.map((p) => p.y + nodeH)) + 24;
     state.graphBounds[proj.slug] = { x: minX, y: minY, w: maxX - minX, h: maxY - minY };
   }
 
-  // Defs / arrow marker
   const ns = "http://www.w3.org/2000/svg";
   const defs = document.createElementNS(ns, "defs");
   defs.innerHTML = `<marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5"
@@ -179,56 +381,49 @@ function renderGraph() {
       <path d="M0,0 L10,5 L0,10 z" fill="#5a6280"/></marker>`;
   svg.appendChild(defs);
 
-  // Edges
   proj.edges.forEach((e) => {
-    const s = positions[e.source];
-    const t = positions[e.target];
+    const s = positions[e.source], t = positions[e.target];
     if (!s || !t) return;
     const x1 = s.x + nodeW / 2, y1 = s.y + nodeH;
     const x2 = t.x + nodeW / 2, y2 = t.y;
     const my = (y1 + y2) / 2;
     const path = document.createElementNS(ns, "path");
-    const dispatchKey = `${e.source}->${e.target}`;
     let edgeCls = "edge";
-    if (state.activeDispatches.has(dispatchKey)) edgeCls += " edge-active";
+    if (state.activeDispatches.has(`${e.source}->${e.target}`)) edgeCls += " edge-active";
     path.setAttribute("class", edgeCls);
     path.setAttribute("d", `M ${x1} ${y1} C ${x1} ${my}, ${x2} ${my}, ${x2} ${y2}`);
     svg.appendChild(path);
   });
 
-  // Nodes
   proj.agents.forEach((a) => {
     const pos = positions[a.id];
     if (!pos) return;
     const isOrchestrator = (a.parents || []).length === 0;
-    const isSelected = state.selectedAgent
-      && state.selectedAgent.slug === proj.slug
-      && state.selectedAgent.agentId === a.id;
     const status = (proj.statuses && proj.statuses[a.id]) || "idle";
+    const isOpenChat = state.windows.some(
+      (x) => x.type === "chat" && x.projectSlug === proj.slug && x.agentId === a.id);
 
     const g = document.createElementNS(ns, "g");
     g.style.cursor = "pointer";
-    g.onclick = () => selectAgent(proj.slug, a.id);
+    g.onclick = () => openChat(proj.slug, a.id);
 
     const rect = document.createElementNS(ns, "rect");
     let cls = "node-rect";
     if (isOrchestrator) cls += " orchestrator";
-    if (isSelected) cls += " selected";
+    if (isOpenChat) cls += " selected";
     if (status === "running") cls += " pulse";
     rect.setAttribute("class", cls);
     rect.setAttribute("data-status", status);
     rect.setAttribute("x", pos.x);
     rect.setAttribute("y", pos.y);
-    rect.setAttribute("rx", 8);
-    rect.setAttribute("ry", 8);
-    rect.setAttribute("width", nodeW);
-    rect.setAttribute("height", nodeH);
+    rect.setAttribute("rx", 8); rect.setAttribute("ry", 8);
+    rect.setAttribute("width", nodeW); rect.setAttribute("height", nodeH);
     g.appendChild(rect);
 
     const label = document.createElementNS(ns, "text");
     label.setAttribute("class", "node-label");
     label.setAttribute("x", pos.x + nodeW / 2);
-    label.setAttribute("y", pos.y + 24);
+    label.setAttribute("y", pos.y + 22);
     label.setAttribute("text-anchor", "middle");
     label.textContent = a.id;
     g.appendChild(label);
@@ -236,7 +431,7 @@ function renderGraph() {
     const model = document.createElementNS(ns, "text");
     model.setAttribute("class", "node-model");
     model.setAttribute("x", pos.x + nodeW / 2);
-    model.setAttribute("y", pos.y + 42);
+    model.setAttribute("y", pos.y + 40);
     model.setAttribute("text-anchor", "middle");
     model.textContent = modelLabel(a);
     g.appendChild(model);
@@ -252,127 +447,12 @@ function renderGraph() {
     svg.appendChild(g);
   });
 
-  applyViewBox(svg, proj.slug);
-}
-
-function applyViewBox(svg, slug) {
-  if (!state.viewBoxes[slug]) {
-    fitGraph(slug);
-  }
-  const vb = state.viewBoxes[slug];
-  if (!vb) return;
-  svg.setAttribute("viewBox", `${vb.x} ${vb.y} ${vb.w} ${vb.h}`);
-  svg.setAttribute("preserveAspectRatio", "xMidYMid meet");
-  updateZoomLevel();
-}
-
-function fitGraph(slug) {
-  const b = state.graphBounds[slug];
-  if (!b) return;
-  state.viewBoxes[slug] = { ...b };
-}
-
-function updateZoomLevel() {
-  const el = $("zoomLevel");
-  if (!el) return;
-  const slug = state.activeTab;
-  const vb = state.viewBoxes[slug];
-  const b = state.graphBounds[slug];
-  if (!vb || !b) { el.textContent = ""; return; }
-  const pct = Math.round((b.w / vb.w) * 100);
-  el.textContent = `${pct}%`;
-}
-
-function zoomBy(factor, anchorPx, anchorPy) {
-  const slug = state.activeTab;
-  const vb = state.viewBoxes[slug];
-  if (!vb) return;
-  const newW = vb.w * factor;
-  const newH = vb.h * factor;
-  // anchor: keep the content point under cursor stationary in screen space
-  if (anchorPx !== undefined && anchorPy !== undefined) {
-    vb.x += (vb.w - newW) * anchorPx;
-    vb.y += (vb.h - newH) * anchorPy;
-  } else {
-    vb.x += (vb.w - newW) / 2;
-    vb.y += (vb.h - newH) / 2;
-  }
-  vb.w = newW;
-  vb.h = newH;
-  const svg = $("graph");
-  svg.setAttribute("viewBox", `${vb.x} ${vb.y} ${vb.w} ${vb.h}`);
-  updateZoomLevel();
-}
-
-let panState = null;
-
-function onGraphWheel(e) {
-  if (!state.viewBoxes[state.activeTab]) return;
-  e.preventDefault();
-  const svg = e.currentTarget;
-  const rect = svg.getBoundingClientRect();
-  const px = (e.clientX - rect.left) / rect.width;
-  const py = (e.clientY - rect.top) / rect.height;
-  const factor = e.deltaY < 0 ? 0.88 : 1.12;
-  zoomBy(factor, px, py);
-}
-
-function onGraphMouseDown(e) {
-  // Only pan when click hits empty canvas, not a node group.
-  // Nodes use a <g> element; the wrapper svg or the defs/path get hit on background.
-  let t = e.target;
-  while (t && t !== e.currentTarget) {
-    if (t.tagName === "g") return; // clicked on a node, let node onclick handle
-    t = t.parentNode;
-  }
-  const vb = state.viewBoxes[state.activeTab];
-  if (!vb) return;
-  panState = { startX: e.clientX, startY: e.clientY, vb: { ...vb } };
-  e.currentTarget.classList.add("panning");
-  document.addEventListener("mousemove", onGraphMouseMove);
-  document.addEventListener("mouseup", onGraphMouseUp);
-}
-
-function onGraphMouseMove(e) {
-  if (!panState) return;
-  const svg = $("graph");
-  const rect = svg.getBoundingClientRect();
-  const dx = ((e.clientX - panState.startX) / rect.width) * panState.vb.w;
-  const dy = ((e.clientY - panState.startY) / rect.height) * panState.vb.h;
-  const vb = state.viewBoxes[state.activeTab];
-  vb.x = panState.vb.x - dx;
-  vb.y = panState.vb.y - dy;
-  svg.setAttribute("viewBox", `${vb.x} ${vb.y} ${vb.w} ${vb.h}`);
-}
-
-function onGraphMouseUp() {
-  panState = null;
-  $("graph").classList.remove("panning");
-  document.removeEventListener("mousemove", onGraphMouseMove);
-  document.removeEventListener("mouseup", onGraphMouseUp);
-}
-
-function bindZoomControls() {
-  const svg = $("graph");
-  svg.addEventListener("wheel", onGraphWheel, { passive: false });
-  svg.addEventListener("mousedown", onGraphMouseDown);
-  $("zoomIn").onclick = () => zoomBy(0.85);
-  $("zoomOut").onclick = () => zoomBy(1.18);
-  $("zoomReset").onclick = () => {
-    delete state.viewBoxes[state.activeTab];
-    fitGraph(state.activeTab);
-    const vb = state.viewBoxes[state.activeTab];
-    if (vb) {
-      svg.setAttribute("viewBox", `${vb.x} ${vb.y} ${vb.w} ${vb.h}`);
-      updateZoomLevel();
-    }
-  };
+  applyViewBox(svg, proj.slug, w);
 }
 
 function modelLabel(a) {
   if (a.model === "grok") return "grok";
-  const m = a.claude_model || "claude-sonnet-4-6";
-  return m.replace(/^claude-/, "").replace(/-\d+$/, (s) => s);
+  return (a.claude_model || "claude-sonnet-4-6").replace(/^claude-/, "");
 }
 
 function statusColor(s) {
@@ -385,40 +465,216 @@ function statusColor(s) {
   }
 }
 
-// ---------- Right panel ----------
-
-async function selectAgent(slug, agentId) {
-  state.selectedAgent = { slug, agentId };
-  await refreshSession();
-  renderGraph();
-  renderRightPanel();
+function rerenderGraphsForSlug(slug) {
+  state.windows.filter((w) => w.type === "graph" && w.projectSlug === slug)
+    .forEach((w) => renderGraphInWindow(w));
 }
 
-async function refreshSession() {
-  const { slug, agentId } = state.selectedAgent;
-  const r = await fetch(`/api/projects/${slug}/agents/${agentId}/session`);
-  const j = await r.json();
-  state.currentSession = { ...j.session, messages: j.messages };
-}
+// ---------- Graph viewBox / zoom / pan ----------
 
-function renderRightPanel() {
-  const header = $("rightHeader");
-  const msgRoot = $("messages");
-  msgRoot.innerHTML = "";
-  if (!state.selectedAgent) {
-    header.textContent = "Chưa chọn agent";
-    return;
+function applyViewBox(svg, slug, w) {
+  if (!state.viewBoxes[slug]) {
+    const b = state.graphBounds[slug];
+    if (b) state.viewBoxes[slug] = { ...b };
   }
-  const proj = state.projectCache[state.selectedAgent.slug];
-  const agent = proj.agents.find((a) => a.id === state.selectedAgent.agentId);
-  header.innerHTML = `${escapeHtml(agent.id)}
-    <span class="sub">${escapeHtml(agent.role || "")} • ${escapeHtml(modelLabel(agent))}</span>`;
-
-  (state.currentSession?.messages || []).forEach((m) => addBubble(m.role, m.content));
+  const vb = state.viewBoxes[slug];
+  if (!vb) return;
+  svg.setAttribute("viewBox", `${vb.x} ${vb.y} ${vb.w} ${vb.h}`);
+  svg.setAttribute("preserveAspectRatio", "xMidYMid meet");
+  const zl = w.el.querySelector(".zoom-level");
+  if (zl) {
+    const b = state.graphBounds[slug];
+    zl.textContent = b ? `${Math.round((b.w / vb.w) * 100)}%` : "";
+  }
 }
 
-function addBubble(role, text) {
-  const root = $("messages");
+function bindGraphWindow(w) {
+  const svg = w.el.querySelector(".graph-svg");
+  svg.addEventListener("wheel", (e) => onGraphWheel(e, w), { passive: false });
+  svg.addEventListener("mousedown", (e) => onGraphMouseDown(e, w));
+  w.el.querySelectorAll(".zoom-controls button").forEach((btn) => {
+    btn.onclick = () => {
+      const act = btn.dataset.z;
+      if (act === "in") zoomBy(w, 0.85);
+      else if (act === "out") zoomBy(w, 1.18);
+      else if (act === "fit") {
+        delete state.viewBoxes[w.projectSlug];
+        renderGraphInWindow(w);
+      }
+    };
+  });
+}
+
+function zoomBy(w, factor, px, py) {
+  const slug = w.projectSlug;
+  const vb = state.viewBoxes[slug];
+  if (!vb) return;
+  const newW = vb.w * factor, newH = vb.h * factor;
+  if (px !== undefined && py !== undefined) {
+    vb.x += (vb.w - newW) * px;
+    vb.y += (vb.h - newH) * py;
+  } else {
+    vb.x += (vb.w - newW) / 2;
+    vb.y += (vb.h - newH) / 2;
+  }
+  vb.w = newW; vb.h = newH;
+  const svg = w.el.querySelector(".graph-svg");
+  svg.setAttribute("viewBox", `${vb.x} ${vb.y} ${vb.w} ${vb.h}`);
+  const zl = w.el.querySelector(".zoom-level");
+  if (zl) {
+    const b = state.graphBounds[slug];
+    zl.textContent = b ? `${Math.round((b.w / vb.w) * 100)}%` : "";
+  }
+}
+
+function onGraphWheel(e, w) {
+  if (!state.viewBoxes[w.projectSlug]) return;
+  e.preventDefault();
+  const svg = e.currentTarget;
+  const rect = svg.getBoundingClientRect();
+  const px = (e.clientX - rect.left) / rect.width;
+  const py = (e.clientY - rect.top) / rect.height;
+  zoomBy(w, e.deltaY < 0 ? 0.88 : 1.12, px, py);
+}
+
+let _pan = null;
+function onGraphMouseDown(e, w) {
+  let t = e.target;
+  while (t && t !== e.currentTarget) {
+    if (t.tagName === "g") return;
+    t = t.parentNode;
+  }
+  const vb = state.viewBoxes[w.projectSlug];
+  if (!vb) return;
+  _pan = { w, sx: e.clientX, sy: e.clientY, vb: { ...vb } };
+  e.currentTarget.classList.add("panning");
+  document.addEventListener("mousemove", _onPanMove);
+  document.addEventListener("mouseup", _endPan);
+}
+function _onPanMove(e) {
+  if (!_pan) return;
+  const svg = _pan.w.el.querySelector(".graph-svg");
+  const rect = svg.getBoundingClientRect();
+  const dx = ((e.clientX - _pan.sx) / rect.width) * _pan.vb.w;
+  const dy = ((e.clientY - _pan.sy) / rect.height) * _pan.vb.h;
+  const vb = state.viewBoxes[_pan.w.projectSlug];
+  vb.x = _pan.vb.x - dx;
+  vb.y = _pan.vb.y - dy;
+  svg.setAttribute("viewBox", `${vb.x} ${vb.y} ${vb.w} ${vb.h}`);
+}
+function _endPan() {
+  if (!_pan) return;
+  _pan.w.el.querySelector(".graph-svg").classList.remove("panning");
+  _pan = null;
+  document.removeEventListener("mousemove", _onPanMove);
+  document.removeEventListener("mouseup", _endPan);
+}
+
+// ---------- Chat window ----------
+
+function openChat(slug, agentId) {
+  let w = state.windows.find(
+    (x) => x.type === "chat" && x.projectSlug === slug && x.agentId === agentId);
+  if (w) {
+    if (w.hidden) showWindow(w);
+    else focusWindow(w);
+  } else {
+    const offset = state.windows.filter((x) => x.type === "chat").length * 28;
+    w = {
+      id: `chat-${slug}-${agentId}`, projectSlug: slug, type: "chat", agentId,
+      x: 80 + offset, y: 60 + offset, w: 460, h: 540, z: nextZ(), hidden: false,
+      streaming: false,
+    };
+    state.windows.push(w);
+    createWindowDom(w);
+  }
+  rerenderGraphsForSlug(slug);
+  return w;
+}
+
+const CLAUDE_MODELS = [
+  { value: "claude-opus-4-8",     label: "opus 4.8"   },
+  { value: "claude-opus-4-7",     label: "opus 4.7"   },
+  { value: "claude-sonnet-4-6",   label: "sonnet 4.6" },
+  { value: "claude-haiku-4-5",    label: "haiku 4.5"  },
+];
+const EFFORT_LEVELS = [
+  { value: "",       label: "default" },
+  { value: "low",    label: "low"     },
+  { value: "medium", label: "medium"  },
+  { value: "high",   label: "high"    },
+  { value: "max",    label: "max"     },
+];
+
+function renderChatHeader(w) {
+  const header = w.el.querySelector(".chat-header");
+  const proj = state.projectCache[w.projectSlug];
+  const agent = proj?.agents.find((a) => a.id === w.agentId);
+  if (!agent) { header.textContent = w.agentId; return; }
+
+  const modelText = agent.model === "grok"
+    ? "grok (qua aas)"
+    : (agent.claude_model || agent.default_claude_model || "claude-sonnet-4-6").replace(/^claude-/, "");
+  const effortText = agent.effort ? `effort ${agent.effort}` : "";
+
+  header.innerHTML = `
+    <div class="header-top">
+      <span class="header-name">${escapeHtml(agent.id)}</span>
+      <span class="header-role">${escapeHtml(agent.role || "")}</span>
+    </div>
+    <div class="header-meta">
+      <span class="meta-model">${escapeHtml(modelText)}</span>
+      ${effortText ? `<span class="meta-effort">${escapeHtml(effortText)}</span>` : ""}
+      <span class="meta-hint">gõ <code>/</code> để xem lệnh</span>
+      <span class="save-hint"></span>
+    </div>`;
+}
+
+async function updateAgentSettings(w, claudeModel, effort) {
+  const slug = w.projectSlug;
+  const agentId = w.agentId;
+  const hint = w.el.querySelector(".save-hint");
+  if (hint) { hint.textContent = "lưu…"; hint.style.color = "var(--text-dim)"; }
+  try {
+    const r = await fetch(`/api/projects/${slug}/agents/${agentId}/settings`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ claude_model: claudeModel, effort: effort || null }),
+    });
+    if (!r.ok) throw new Error("save failed");
+
+    // refresh project cache so all graph windows + other chat windows reflect change
+    const pr = await fetch(`/api/projects/${slug}`);
+    state.projectCache[slug] = await pr.json();
+    rerenderGraphsForSlug(slug);
+    // also refresh any other open chat windows for the same agent so their headers update
+    state.windows
+      .filter((x) => x.type === "chat" && x.projectSlug === slug && x.agentId === agentId)
+      .forEach((x) => renderChatHeader(x));
+    if (hint) {
+      hint.textContent = "✓ áp dụng lượt sau";
+      hint.style.color = "var(--ok)";
+      clearTimeout(updateAgentSettings._t);
+      updateAgentSettings._t = setTimeout(() => { hint.textContent = ""; }, 2500);
+    }
+  } catch (err) {
+    if (hint) { hint.textContent = "lỗi"; hint.style.color = "var(--err)"; }
+  }
+}
+
+async function refreshChatSession(w) {
+  try {
+    const r = await fetch(`/api/projects/${w.projectSlug}/agents/${w.agentId}/session`);
+    const j = await r.json();
+    w.session = j.session;
+    const msgRoot = w.el.querySelector(".messages");
+    msgRoot.innerHTML = "";
+    (j.messages || []).forEach((m) => addBubble(w, m.role, m.content));
+  } catch {}
+}
+
+function addBubble(w, role, text) {
+  const root = w.el.querySelector(".messages");
   const b = document.createElement("div");
   b.className = `bubble ${role}`;
   b.innerHTML = `<div class="role">${role}</div><div class="content"></div>`;
@@ -433,19 +689,16 @@ const DISPATCH_OPEN_RE = /<dispatch\s+agent="([^"]+)"\s*>([\s\S]*)$/i;
 
 function setContent(el, text) {
   if (!text) { el.innerHTML = ""; return; }
-  const html = renderMessage(text);
-  el.innerHTML = html;
+  el.innerHTML = renderMessage(text);
 }
 
 function renderMessage(text) {
-  // Replace complete dispatch tags with placeholder, render markdown, then swap back.
   const cards = [];
   let stripped = text.replace(DISPATCH_TAG_RE, (_m, target, body) => {
     const idx = cards.length;
     cards.push({ target, body, complete: true });
     return `\n\n@@DISPATCH_CARD_${idx}@@\n\n`;
   });
-  // Detect unclosed dispatch tag being streamed in.
   const openMatch = stripped.match(DISPATCH_OPEN_RE);
   if (openMatch) {
     const idx = cards.length;
@@ -461,9 +714,7 @@ function renderMessage(text) {
     html = escapeHtml(stripped).replace(/\n/g, "<br>");
   }
   html = html.replace(/@@DISPATCH_CARD_(\d+)@@/g, (_m, i) => dispatchCardHtml(cards[+i]));
-  if (window.DOMPurify) {
-    html = DOMPurify.sanitize(html, { ADD_TAGS: ["details", "summary"] });
-  }
+  if (window.DOMPurify) html = DOMPurify.sanitize(html, { ADD_TAGS: ["details", "summary"] });
   return html;
 }
 
@@ -479,42 +730,309 @@ function dispatchCardHtml(card) {
   </div>`;
 }
 
-// ---------- Chat dispatch ----------
+function bindChatWindow(w) {
+  const form = w.el.querySelector(".chat-form");
+  const input = w.el.querySelector(".chat-input");
+  const sendBtn = w.el.querySelector(".chat-send");
 
-function bindChat() {
-  const form = $("chatForm");
-  const input = $("chatInput");
-  form.onsubmit = async (e) => {
+  form.onsubmit = (e) => e.preventDefault();
+
+  sendBtn.onclick = async (e) => {
     e.preventDefault();
+    if (w.streaming) { stopChat(w); return; }
     const text = input.value.trim();
-    if (!text || state.streaming) return;
-    if (!state.selectedAgent) {
-      setStatus("Hãy chọn một agent trên đồ thị trước.");
+    if (!text) return;
+    if (text.startsWith("/")) {
+      input.value = "";
+      hideCommandMenu(w);
+      await executeChatCommand(w, text);
       return;
     }
     input.value = "";
-    await sendMessage(text);
+    await sendMessageInWindow(w, text);
   };
+
+  input.addEventListener("input", () => maybeShowCommandMenu(w, input.value));
+
   input.addEventListener("keydown", (e) => {
+    // command menu navigation
+    if (w.commandMenu) {
+      if (e.key === "ArrowDown") {
+        e.preventDefault();
+        commandMenuMove(w, +1);
+        return;
+      }
+      if (e.key === "ArrowUp") {
+        e.preventDefault();
+        commandMenuMove(w, -1);
+        return;
+      }
+      if (e.key === "Tab") {
+        e.preventDefault();
+        const items = w.commandMenu.items;
+        pickCommand(w, items[w.commandMenu.selectedIdx].cmd);
+        return;
+      }
+      if (e.key === "Escape") {
+        e.preventDefault();
+        hideCommandMenu(w);
+        return;
+      }
+      if (e.key === "Enter" && !e.shiftKey) {
+        e.preventDefault();
+        const items = w.commandMenu.items;
+        const m = items[w.commandMenu.selectedIdx];
+        // if only command typed (no space yet), insert; else submit
+        if (!input.value.includes(" ")) {
+          pickCommand(w, m.cmd);
+        } else {
+          sendBtn.click();
+        }
+        return;
+      }
+    }
+
     if (e.key === "Enter" && !e.shiftKey) {
       e.preventDefault();
-      form.requestSubmit();
+      sendBtn.click();
+    }
+    if (e.key === "Escape" && w.streaming) {
+      e.preventDefault();
+      stopChat(w);
     }
   });
 }
 
-async function sendMessage(text) {
-  const { slug, agentId: rootAgent } = state.selectedAgent;
+function stopChat(w) {
+  if (w.abortController) {
+    try { w.abortController.abort(); } catch {}
+  }
+  setChatStatus(w, "đang dừng…");
+}
+
+// ---------- Slash commands ----------
+
+const CHAT_COMMANDS = [
+  { cmd: "/help",     hint: "",                       desc: "danh sách commands",                              exec: cmdHelp },
+  { cmd: "/clear",    hint: "",                       desc: "tạo session mới (history cũ vẫn lưu trong db)",   exec: cmdClear },
+  { cmd: "/model",    hint: "<opus-4-8|opus-4-7|sonnet|haiku>", desc: "đổi model agent này",                   exec: cmdModel },
+  { cmd: "/effort",   hint: "<default|low|medium|high|max>",    desc: "đổi effort agent này",                  exec: cmdEffort },
+  { cmd: "/focus",    hint: "<AGENT_ID>",             desc: "mở chat agent khác trong project",                exec: cmdFocus },
+  { cmd: "/dispatch", hint: "<AGENT_ID> <task>",      desc: "mở chat agent đích và gửi task ngay",             exec: cmdDispatch },
+  { cmd: "/stop",     hint: "",                       desc: "dừng stream hiện tại",                            exec: cmdStop },
+  { cmd: "/status",   hint: "",                       desc: "trạng thái session, model, effort",               exec: cmdStatus },
+];
+
+function maybeShowCommandMenu(w, text) {
+  if (!text.startsWith("/")) { hideCommandMenu(w); return; }
+  const space = text.indexOf(" ");
+  const head = space === -1 ? text.toLowerCase() : text.slice(0, space).toLowerCase();
+  const matches = CHAT_COMMANDS.filter((c) => c.cmd.startsWith(head));
+  if (!matches.length) { hideCommandMenu(w); return; }
+  showCommandMenu(w, matches);
+}
+
+function showCommandMenu(w, items) {
+  let menu = w.el.querySelector(".command-menu");
+  if (!menu) {
+    menu = document.createElement("div");
+    menu.className = "command-menu";
+    w.el.querySelector(".chatbox").appendChild(menu);
+  }
+  menu.innerHTML = items.map((it, i) =>
+    `<div class="command-item ${i === 0 ? "selected" : ""}" data-idx="${i}">
+      <span class="ci-cmd">${escapeHtml(it.cmd)}</span>
+      <span class="ci-hint">${escapeHtml(it.hint || "")}</span>
+      <span class="ci-desc">${escapeHtml(it.desc)}</span>
+    </div>`).join("");
+  menu.style.display = "block";
+  w.commandMenu = { items, selectedIdx: 0 };
+  menu.querySelectorAll(".command-item").forEach((el, i) => {
+    el.onmousedown = (e) => {
+      e.preventDefault();
+      pickCommand(w, items[i].cmd);
+    };
+  });
+}
+
+function commandMenuMove(w, delta) {
+  if (!w.commandMenu) return;
+  const m = w.commandMenu;
+  m.selectedIdx = (m.selectedIdx + delta + m.items.length) % m.items.length;
+  w.el.querySelectorAll(".command-item").forEach((el, i) =>
+    el.classList.toggle("selected", i === m.selectedIdx));
+}
+
+function hideCommandMenu(w) {
+  const menu = w.el.querySelector(".command-menu");
+  if (menu) menu.style.display = "none";
+  w.commandMenu = null;
+}
+
+function pickCommand(w, cmd) {
+  const input = w.el.querySelector(".chat-input");
+  input.value = cmd + " ";
+  hideCommandMenu(w);
+  input.focus();
+  // shift cursor to end
+  input.selectionStart = input.selectionEnd = input.value.length;
+}
+
+async function executeChatCommand(w, text) {
+  const space = text.indexOf(" ");
+  const cmd = (space === -1 ? text : text.slice(0, space)).toLowerCase();
+  const arg = space === -1 ? "" : text.slice(space + 1).trim();
+  const handler = CHAT_COMMANDS.find((c) => c.cmd === cmd);
+  if (!handler) {
+    addSystemBubble(w, `❓ command không hợp lệ: \`${cmd}\`. Gõ \`/help\` để xem danh sách.`);
+    return;
+  }
+  await handler.exec(w, arg);
+}
+
+function addSystemBubble(w, markdown) {
+  const root = w.el.querySelector(".messages");
+  const b = document.createElement("div");
+  b.className = "bubble system";
+  b.innerHTML = `<div class="content"></div>`;
+  setContent(b.querySelector(".content"), markdown);
+  root.appendChild(b);
+  root.scrollTop = root.scrollHeight;
+}
+
+async function cmdHelp(w) {
+  const lines = ["**Slash commands**", ""];
+  for (const c of CHAT_COMMANDS) {
+    const sig = c.hint ? `\`${c.cmd}\` \`${c.hint}\`` : `\`${c.cmd}\``;
+    lines.push(`- ${sig} — ${c.desc}`);
+  }
+  lines.push("", "Phím tắt trong input: Tab chọn lệnh, ↑↓ duyệt, Esc đóng menu / dừng stream.");
+  addSystemBubble(w, lines.join("\n"));
+}
+
+async function cmdClear(w) {
+  const slug = w.projectSlug, agent = w.agentId;
+  try {
+    await fetch(`/api/projects/${slug}/agents/${agent}/clear`, { method: "POST" });
+    await refreshChatSession(w);
+    addSystemBubble(w, "✓ session mới đã tạo. History cũ vẫn còn trong db, không xoá vĩnh viễn.");
+  } catch (err) {
+    addSystemBubble(w, "lỗi khi tạo session mới: " + err.message);
+  }
+}
+
+const _MODEL_ALIAS = {
+  "opus-4-8": "claude-opus-4-8",
+  "opus-4-7": "claude-opus-4-7",
+  "opus": "claude-opus-4-8",
+  "sonnet": "claude-sonnet-4-6",
+  "sonnet-4-6": "claude-sonnet-4-6",
+  "haiku": "claude-haiku-4-5",
+  "haiku-4-5": "claude-haiku-4-5",
+};
+
+async function cmdModel(w, arg) {
+  if (!arg) {
+    addSystemBubble(w, "Cú pháp: `/model <opus-4-8|opus-4-7|sonnet|haiku>`");
+    return;
+  }
+  const target = _MODEL_ALIAS[arg.toLowerCase()] || (arg.startsWith("claude-") ? arg : null);
+  if (!target) {
+    addSystemBubble(w, `model không hợp lệ: \`${arg}\``);
+    return;
+  }
+  const proj = state.projectCache[w.projectSlug];
+  const agent = proj.agents.find((a) => a.id === w.agentId);
+  const eff = agent.effort ?? "";
+  await updateAgentSettings(w, target, eff);
+  addSystemBubble(w, `✓ model → \`${target}\` (áp dụng lượt chat tiếp theo)`);
+}
+
+async function cmdEffort(w, arg) {
+  const allowed = ["default", "low", "medium", "high", "max"];
+  if (!arg || !allowed.includes(arg.toLowerCase())) {
+    addSystemBubble(w, "Cú pháp: `/effort default|low|medium|high|max`");
+    return;
+  }
+  const eff = arg.toLowerCase() === "default" ? "" : arg.toLowerCase();
+  const proj = state.projectCache[w.projectSlug];
+  const agent = proj.agents.find((a) => a.id === w.agentId);
+  await updateAgentSettings(w, agent.claude_model || "claude-sonnet-4-6", eff);
+  addSystemBubble(w, `✓ effort → \`${arg}\``);
+}
+
+async function cmdFocus(w, arg) {
+  if (!arg) { addSystemBubble(w, "Cú pháp: `/focus <AGENT_ID>`"); return; }
+  const proj = state.projectCache[w.projectSlug];
+  const agent = proj.agents.find((a) => a.id.toUpperCase() === arg.toUpperCase());
+  if (!agent) { addSystemBubble(w, `không thấy agent: \`${arg}\``); return; }
+  openChat(w.projectSlug, agent.id);
+}
+
+async function cmdDispatch(w, arg) {
+  const space = arg.indexOf(" ");
+  if (space === -1) {
+    addSystemBubble(w, "Cú pháp: `/dispatch <AGENT_ID> <task>`");
+    return;
+  }
+  const targetId = arg.slice(0, space).trim();
+  const task = arg.slice(space + 1).trim();
+  const proj = state.projectCache[w.projectSlug];
+  const agent = proj.agents.find((a) => a.id.toUpperCase() === targetId.toUpperCase());
+  if (!agent) { addSystemBubble(w, `không thấy agent: \`${targetId}\``); return; }
+  const tw = openChat(w.projectSlug, agent.id);
+  // small delay so the new window has bound its DOM before we call into it
+  setTimeout(() => sendMessageInWindow(tw, task), 50);
+}
+
+async function cmdStop(w) {
+  if (!w.streaming) { addSystemBubble(w, "không có stream nào đang chạy."); return; }
+  stopChat(w);
+}
+
+async function cmdStatus(w) {
+  const proj = state.projectCache[w.projectSlug];
+  const agent = proj.agents.find((a) => a.id === w.agentId);
+  const lines = [
+    `**Agent**: \`${agent.id}\``,
+    `**Project**: ${proj.name}`,
+    `**Model**: \`${agent.claude_model || "claude-sonnet-4-6"}\` (default: \`${agent.default_claude_model || "claude-sonnet-4-6"}\`)`,
+    `**Effort**: \`${agent.effort || "default"}\``,
+    `**Status**: ${proj.statuses[agent.id] || "idle"}`,
+    `**Streaming**: ${w.streaming ? "yes" : "no"}`,
+  ];
+  addSystemBubble(w, lines.join("\n"));
+}
+
+function setSendBtn(w, mode) {
+  const btn = w.el.querySelector(".chat-send");
+  if (!btn) return;
+  if (mode === "stop") {
+    btn.textContent = "Stop";
+    btn.classList.add("stop");
+    btn.disabled = false;
+  } else {
+    btn.textContent = "Gửi";
+    btn.classList.remove("stop");
+    btn.disabled = false;
+  }
+}
+
+function setChatStatus(w, s) {
+  const el = w.el.querySelector(".chat-status");
+  if (el) el.textContent = s;
+}
+
+async function sendMessageInWindow(w, text) {
+  const slug = w.projectSlug;
+  const rootAgent = w.agentId;
   const proj = state.projectCache[slug];
-
-  addBubble("user", text);
-  const bubbles = {}; // agentId -> {bubble, contentEl, thinkEl, assembled}
-
+  addBubble(w, "user", text);
+  const bubbles = {};
   function bubbleFor(agentId) {
     if (bubbles[agentId]) return bubbles[agentId];
-    const b = addBubble("assistant", "");
-    const roleEl = b.querySelector(".role");
-    roleEl.textContent = "assistant • " + agentId;
+    const b = addBubble(w, "assistant", "");
+    b.querySelector(".role").textContent = "assistant • " + agentId;
     const contentEl = b.querySelector(".content");
     const thinkEl = document.createElement("div");
     thinkEl.className = "thinking";
@@ -522,25 +1040,25 @@ async function sendMessage(text) {
     bubbles[agentId] = { bubble: b, contentEl, thinkEl, assembled: "" };
     return bubbles[agentId];
   }
-
-  state.streaming = true;
-  $("chatSend").disabled = true;
-  setStatus("đang chạy...");
+  w.streaming = true;
+  setSendBtn(w, "stop");
+  setChatStatus(w, "đang chạy... (Esc để dừng)");
   proj.statuses[rootAgent] = "running";
-  renderGraph();
+  rerenderGraphsForSlug(slug);
 
   try {
+    w.abortController = new AbortController();
     const resp = await fetch(`/api/projects/${slug}/agents/${rootAgent}/chat`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
+      method: "POST", headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ message: text }),
+      signal: w.abortController.signal,
     });
     if (!resp.ok || !resp.body) {
-      const errText = await resp.text();
+      const t = await resp.text();
       const b = bubbleFor(rootAgent);
-      setContent(b.contentEl, `(lỗi backend ${resp.status}) ${errText}`);
+      setContent(b.contentEl, `(lỗi backend ${resp.status}) ${t}`);
       proj.statuses[rootAgent] = "error";
-      renderGraph();
+      rerenderGraphsForSlug(slug);
       return;
     }
     const reader = resp.body.getReader();
@@ -559,30 +1077,29 @@ async function sendMessage(text) {
         if (!payload) continue;
         let evt;
         try { evt = JSON.parse(payload); } catch { continue; }
-        handleEvent(slug, evt, bubbleFor, rootAgent);
+        handleEventInWindow(w, slug, evt, bubbleFor, rootAgent);
       }
     }
-    setStatus("xong");
+    setChatStatus(w, "xong");
   } catch (err) {
-    setStatus("network error: " + err.message);
-    proj.statuses[rootAgent] = "error";
-    renderGraph();
+    if (err.name === "AbortError") {
+      setChatStatus(w, "đã dừng");
+    } else {
+      setChatStatus(w, "network error: " + err.message);
+    }
   } finally {
-    state.streaming = false;
-    $("chatSend").disabled = false;
+    w.streaming = false;
+    w.abortController = null;
+    setSendBtn(w, "send");
   }
 }
 
-function handleEvent(slug, evt, bubbleFor, rootAgent) {
+function handleEventInWindow(w, slug, evt, bubbleFor, rootAgent) {
   const proj = state.projectCache[slug];
   const agent = evt.agent || rootAgent;
-  const showHere = state.selectedAgent
-    && state.selectedAgent.slug === slug
-    && agent === state.selectedAgent.agentId;
 
   switch (evt.type) {
     case "delta": {
-      if (!showHere) break;
       const b = bubbleFor(agent);
       b.assembled += evt.text;
       setContent(b.contentEl, b.assembled);
@@ -590,18 +1107,18 @@ function handleEvent(slug, evt, bubbleFor, rootAgent) {
         b.thinkEl.style.display = "none";
         b.thinkEl.dataset.done = "1";
       }
-      $("messages").scrollTop = $("messages").scrollHeight;
+      const m = w.el.querySelector(".messages");
+      m.scrollTop = m.scrollHeight;
       break;
     }
     case "thinking": {
-      if (!showHere) break;
       const b = bubbleFor(agent);
       b.thinkEl.textContent = "đang suy nghĩ… " + (evt.text || "").slice(-80);
-      $("messages").scrollTop = $("messages").scrollHeight;
+      const m = w.el.querySelector(".messages");
+      m.scrollTop = m.scrollHeight;
       break;
     }
     case "status": {
-      if (!showHere) break;
       const b = bubbleFor(agent);
       if (evt.status === "thinking" && b.thinkEl.dataset.done !== "1") {
         b.thinkEl.textContent = "đang suy nghĩ…";
@@ -613,64 +1130,217 @@ function handleEvent(slug, evt, bubbleFor, rootAgent) {
     }
     case "agent_status": {
       proj.statuses[agent] = evt.status;
-      renderGraph();
+      rerenderGraphsForSlug(slug);
       break;
     }
     case "agent_done": {
       proj.statuses[agent] = evt.status || "ok";
-      if (showHere) {
-        const b = bubbleFor(agent);
-        b.thinkEl.style.display = "none";
-      }
-      renderGraph();
+      const b = bubbleFor(agent);
+      b.thinkEl.style.display = "none";
+      rerenderGraphsForSlug(slug);
+      // mirror final to dispatched agent's window if open
+      mirrorDispatchedMessages(slug, agent);
       break;
     }
     case "dispatch_started": {
-      const key = `${evt.source}->${evt.target}`;
-      state.activeDispatches.add(key);
+      state.activeDispatches.add(`${evt.source}->${evt.target}`);
       proj.statuses[evt.target] = "running";
-      renderGraph();
-      const preview = (evt.task || "").replace(/\s+/g, " ").slice(0, 80);
-      setStatus(`${evt.source} → ${evt.target}: ${preview}`);
+      rerenderGraphsForSlug(slug);
+      setChatStatus(w, `${evt.source} → ${evt.target}: ${(evt.task || "").slice(0, 80)}`);
+      // if target's chat window is open, refresh so the user sees the task message arrive
+      mirrorDispatchedMessages(slug, evt.target);
       break;
     }
     case "dispatch_complete": {
-      const key = `${evt.source}->${evt.target}`;
-      state.activeDispatches.delete(key);
+      state.activeDispatches.delete(`${evt.source}->${evt.target}`);
       proj.statuses[evt.target] = evt.status === "ok" ? "ok" : "error";
-      renderGraph();
-      setStatus(`${evt.source} → ${evt.target} ${evt.status === "ok" ? "xong" : "lỗi"}`);
+      rerenderGraphsForSlug(slug);
+      setChatStatus(w, `${evt.source} → ${evt.target}: ${evt.status}`);
+      mirrorDispatchedMessages(slug, evt.target);
       break;
     }
     case "dispatch_rejected": {
-      setStatus(`dispatch bị từ chối ${evt.target}: ${evt.reason}`);
+      setChatStatus(w, `dispatch ${evt.target} bị từ chối: ${evt.reason}`);
       break;
     }
     case "error": {
-      if (showHere) {
-        const b = bubbleFor(agent);
-        setContent(b.contentEl, (b.assembled || "") + `\n\n> **[error]** ${evt.message || ""}`);
-      }
+      const b = bubbleFor(agent);
+      setContent(b.contentEl, (b.assembled || "") + `\n\n> **[error]** ${evt.message || ""}`);
       proj.statuses[agent] = "error";
-      renderGraph();
+      rerenderGraphsForSlug(slug);
       break;
     }
-    case "meta":
-    case "start":
-    case "complete":
-      break;
   }
 }
 
-function setStatus(s) {
-  $("chatStatus").textContent = s;
+function mirrorDispatchedMessages(slug, agentId) {
+  const target = state.windows.find(
+    (x) => x.type === "chat" && x.projectSlug === slug && x.agentId === agentId);
+  if (!target) return;
+  // pull latest messages from server into the target window
+  refreshChatSession(target);
 }
 
-function escapeHtml(s) {
-  return (s || "").replace(/[&<>"']/g, (c) => ({
-    "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;",
-  }[c]));
+// ---------- Folder tree ----------
+
+function _treeState(slug) {
+  if (!state.tree[slug]) {
+    state.tree[slug] = { expanded: new Set([""]), cache: {}, selectedAbs: null, flat: [] };
+  }
+  return state.tree[slug];
 }
 
-window.addEventListener("resize", renderGraph);
+async function loadTreeRoot(slug) {
+  const t = _treeState(slug);
+  if (!t.cache[""]) await fetchTreeLevel(slug, "");
+}
+
+async function fetchTreeLevel(slug, relPath) {
+  const t = _treeState(slug);
+  try {
+    const r = await fetch(`/api/projects/${slug}/tree?path=${encodeURIComponent(relPath)}`);
+    if (!r.ok) { t.cache[relPath] = []; return; }
+    const j = await r.json();
+    t.cache[relPath] = j.items || [];
+  } catch { t.cache[relPath] = []; }
+}
+
+function buildFlatTree(slug) {
+  const t = _treeState(slug);
+  const flat = [];
+  function walk(relPath, depth) {
+    const items = t.cache[relPath];
+    if (!items) return;
+    for (const item of items) {
+      flat.push({ ...item, depth });
+      if (item.type === "folder" && t.expanded.has(item.rel_path)) walk(item.rel_path, depth + 1);
+    }
+  }
+  walk("", 0);
+  t.flat = flat;
+  return flat;
+}
+
+function renderTree() {
+  const root = $("treeRoot");
+  if (!root) return;
+  root.innerHTML = "";
+  if (!state.activeTab) return;
+  const slug = state.activeTab;
+  const t = _treeState(slug);
+  buildFlatTree(slug);
+  if (!t.flat.length) { root.innerHTML = '<div class="tree-empty">(trống)</div>'; return; }
+  for (const item of t.flat) {
+    const node = document.createElement("div");
+    node.className = "tree-node " + item.type;
+    if (t.selectedAbs === item.abs_path) node.classList.add("selected");
+    node.style.paddingLeft = (6 + item.depth * 14) + "px";
+    const arrow = item.type === "folder"
+      ? (t.expanded.has(item.rel_path) ? "▾" : "▸") : "";
+    const icon = item.type === "folder" ? "▣" : "·";
+    node.innerHTML = `<span class="arrow">${arrow}</span>` +
+      `<span class="icon">${icon}</span>` +
+      `<span class="label" title="${escapeHtml(item.abs_path)}">${escapeHtml(item.name)}</span>`;
+    node.onclick = () => onTreeNodeClick(slug, item);
+    node.ondblclick = () => { if (item.type === "folder") onTreeToggle(slug, item); };
+    root.appendChild(node);
+  }
+}
+
+async function onTreeNodeClick(slug, item) {
+  const t = _treeState(slug);
+  t.selectedAbs = item.abs_path;
+  if (item.type === "folder") await onTreeToggle(slug, item);
+  else renderTree();
+}
+
+async function onTreeToggle(slug, item) {
+  const t = _treeState(slug);
+  if (t.expanded.has(item.rel_path)) t.expanded.delete(item.rel_path);
+  else {
+    t.expanded.add(item.rel_path);
+    if (!t.cache[item.rel_path]) await fetchTreeLevel(slug, item.rel_path);
+  }
+  renderTree();
+}
+
+function selectedTreeItem(slug) {
+  const t = _treeState(slug);
+  if (!t.selectedAbs) return null;
+  return t.flat.find((it) => it.abs_path === t.selectedAbs) || null;
+}
+
+async function copySelectedPath() {
+  const slug = state.activeTab;
+  if (!slug) return;
+  const item = selectedTreeItem(slug);
+  if (!item) { flashHint("chưa chọn file/folder nào"); return; }
+  try {
+    await navigator.clipboard.writeText(item.abs_path);
+    flashHint("copied: " + item.abs_path);
+  } catch { flashHint("clipboard bị chặn, path: " + item.abs_path); }
+}
+
+function flashHint(msg) {
+  const el = $("treeHint");
+  if (!el) return;
+  const prev = el.textContent;
+  el.textContent = msg;
+  el.style.color = "var(--accent)";
+  clearTimeout(flashHint._t);
+  flashHint._t = setTimeout(() => { el.textContent = prev; el.style.color = ""; }, 2200);
+}
+
+function bindTreeKeys() {
+  const root = $("treeRoot");
+  if (!root) return;
+  root.addEventListener("keydown", (e) => {
+    const slug = state.activeTab;
+    if (!slug) return;
+    const t = _treeState(slug);
+    if (!t.flat.length) return;
+    const idx = t.flat.findIndex((it) => it.abs_path === t.selectedAbs);
+    if (e.key === "ArrowDown") {
+      e.preventDefault();
+      const next = t.flat[Math.min(t.flat.length - 1, Math.max(0, idx + 1))];
+      if (next) { t.selectedAbs = next.abs_path; renderTree(); }
+    } else if (e.key === "ArrowUp") {
+      e.preventDefault();
+      const prev = t.flat[Math.max(0, idx - 1)];
+      if (prev) { t.selectedAbs = prev.abs_path; renderTree(); }
+    } else if (e.key === "ArrowRight" || e.key === "Enter") {
+      e.preventDefault();
+      const cur = t.flat[idx];
+      if (cur && cur.type === "folder" && !t.expanded.has(cur.rel_path)) onTreeToggle(slug, cur);
+    } else if (e.key === "ArrowLeft") {
+      e.preventDefault();
+      const cur = t.flat[idx];
+      if (cur && cur.type === "folder" && t.expanded.has(cur.rel_path)) onTreeToggle(slug, cur);
+    }
+  });
+}
+
+// ---------- Global keys ----------
+
+function bindGlobalKeys() {
+  window.addEventListener("keydown", (e) => {
+    // Cmd+Alt+C — copy selected tree path
+    if (e.metaKey && e.altKey && (e.key === "c" || e.key === "C" || e.code === "KeyC")) {
+      e.preventDefault();
+      copySelectedPath();
+      return;
+    }
+    // Cmd+W — close focused window
+    if (e.metaKey && (e.key === "w" || e.key === "W")) {
+      const focused = state.windows.filter((w) => !w.hidden && w.projectSlug === state.activeTab)
+        .sort((a, b) => b.z - a.z)[0];
+      if (focused) { e.preventDefault(); closeWindow(focused); }
+    }
+  });
+}
+
+window.addEventListener("resize", () => {
+  state.windows.filter((w) => w.type === "graph").forEach((w) => renderGraphInWindow(w));
+});
+
 init();

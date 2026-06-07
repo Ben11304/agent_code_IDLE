@@ -4,6 +4,7 @@ import asyncio
 import json
 import re
 from pathlib import Path
+from typing import Optional
 
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
@@ -13,6 +14,12 @@ from pydantic import BaseModel
 
 from . import db, projects
 from .adapters import get_stream
+
+TREE_EXCLUDE = {
+    ".git", ".venv", "venv", "env", "__pycache__", "node_modules",
+    ".DS_Store", ".vscode", ".idea", ".pytest_cache", ".mypy_cache",
+    ".ipynb_checkpoints", "dist", "build", ".cache",
+}
 
 FRONTEND_DIR = Path(__file__).resolve().parent.parent / "frontend"
 
@@ -25,6 +32,9 @@ app.add_middleware(
 )
 
 db.init_db()
+_orphan_count = db.cleanup_stale_running()
+if _orphan_count:
+    print(f"[startup] reset {_orphan_count} orphan 'running' session(s) to 'cancelled'")
 
 DISPATCH_RE = re.compile(
     r'<dispatch\s+agent="([^"]+)"\s*>([\s\S]*?)</dispatch>',
@@ -44,10 +54,76 @@ def api_project(slug: str):
         raise HTTPException(404, "project not found")
     out = dict(p)
     statuses = {}
+    overrides = db.list_agent_overrides(slug)
     for a in out["agents"]:
         statuses[a["id"]] = db.get_last_status(slug, a["id"]) or "idle"
+        ov = overrides.get(a["id"]) or {}
+        a["default_claude_model"] = a.get("claude_model") or "claude-sonnet-4-6"
+        a["default_effort"] = a.get("effort")
+        if ov.get("claude_model"):
+            a["claude_model"] = ov["claude_model"]
+        if "effort" in ov:
+            a["effort"] = ov["effort"]
     out["statuses"] = statuses
     return out
+
+
+class AgentSettings(BaseModel):
+    claude_model: Optional[str] = None
+    effort: Optional[str] = None
+
+
+@app.post("/api/projects/{slug}/agents/{agent_id}/clear")
+def api_clear_session(slug: str, agent_id: str):
+    found = projects.get_agent(slug, agent_id)
+    if not found:
+        raise HTTPException(404, "agent not found")
+    sess = db.new_session(slug, agent_id)
+    return {"ok": True, "new_session_id": sess["id"]}
+
+
+@app.post("/api/projects/{slug}/agents/{agent_id}/settings")
+def api_set_agent_settings(slug: str, agent_id: str, body: AgentSettings):
+    found = projects.get_agent(slug, agent_id)
+    if not found:
+        raise HTTPException(404, "agent not found")
+    db.set_agent_override(slug, agent_id,
+                          claude_model=body.claude_model,
+                          effort=body.effort)
+    return {"ok": True}
+
+
+@app.get("/api/projects/{slug}/tree")
+def api_tree(slug: str, path: str = ""):
+    project = projects.get_project(slug)
+    if not project:
+        raise HTTPException(404, "project not found")
+    root = Path(project["root"]).resolve()
+    target = (root / path).resolve()
+    try:
+        target.relative_to(root)
+    except ValueError:
+        raise HTTPException(400, "path escapes project root")
+    if not target.exists() or not target.is_dir():
+        raise HTTPException(404, "directory not found")
+
+    items = []
+    try:
+        children = list(target.iterdir())
+    except PermissionError:
+        return {"items": [], "rel_path": path, "abs_path": str(target)}
+    children.sort(key=lambda p: (not p.is_dir(), p.name.lower()))
+    for child in children:
+        if child.name in TREE_EXCLUDE:
+            continue
+        is_dir = child.is_dir()
+        items.append({
+            "name": child.name,
+            "type": "folder" if is_dir else "file",
+            "rel_path": str(child.relative_to(root)),
+            "abs_path": str(child),
+        })
+    return {"items": items, "rel_path": path, "abs_path": str(target)}
 
 
 @app.get("/api/projects/{slug}/agents/{agent_id}/session")
@@ -72,20 +148,35 @@ def _get_children(project_data: dict, agent_id: str) -> list[str]:
 
 def _dispatch_instructions(children: list[str]) -> str:
     return (
-        "\n\n## Dispatch protocol — MANDATORY\n"
+        "\n\n## Dispatch protocol — MANDATORY (overrides any invoke pattern described in this file's main body)\n"
         f"You orchestrate these workers: {', '.join(children)}.\n\n"
         "**You MUST dispatch to a worker for ANY task involving reading their scope (code, data, files, configs, manifests), "
         "answering questions about their domain, running their pipelines, or producing artifacts. "
-        "Reading source files yourself to answer the user is a violation of your role — that work belongs to the worker who owns that scope.**\n\n"
-        "Direct-answer is ONLY allowed for: routing decisions, status summaries you already have from prior dispatches, "
-        "or meta-questions about orchestration. If unsure, dispatch.\n\n"
-        "Self-justifying excuses NOT accepted: \"simpler\", \"faster\", \"just a quick read\", \"information query\" — these mean DISPATCH anyway. "
-        "Workers have focused context for their scope; they are not slower than you doing it yourself, they are correct.\n\n"
+        "Reading source files yourself is a violation of your role.** Self-justifying excuses NOT accepted: "
+        '"simpler", "faster", "just a quick read", "information query" — these mean DISPATCH anyway.\n\n'
         "Format (verbatim, one tag per worker, exact ID):\n\n"
-        '<dispatch agent="WORKER_ID">Concrete self-contained task. Include the user\'s actual question or the specific files/outputs the worker should produce.</dispatch>\n\n'
-        "The system parses these tags in real time and runs the worker; the user verifies your orchestration by watching the graph light up. "
-        "Narrating \"I will dispatch\" without emitting the tag is a lie — the user sees nothing happen. "
-        "Only dispatch to workers in the list above. Do not invent agent IDs.\n"
+        '<dispatch agent="WORKER_ID">Concise task statement.</dispatch>\n\n'
+        "## How to write the task inside the tag — read carefully\n"
+        "The system automatically injects the worker's role context (their AGENT.md is appended as system prompt) "
+        "AND resumes their prior session if alive. The worker therefore ALREADY knows:\n"
+        "  • who they are and their scope,\n"
+        "  • the shared/ files they must read on pre-flight,\n"
+        "  • their tool conventions, manifest schema, integrity rules,\n"
+        "  • everything from their prior turns in this session.\n\n"
+        "Do NOT repeat any of these in the dispatch task. No \"Bạn là X agent\", no reading lists, "
+        "no path references to shared/*, no pre-flight reminders. Those are wasted tokens and the worker already has them.\n\n"
+        "The dispatch task should be ONE concise statement of what to do this turn, often 1–3 sentences. "
+        "If the worker's session is fresh, you may include the agent folder path "
+        "(e.g. \".claude/AGENT/<NAME>/\") once as the only orientation hint. Nothing more.\n\n"
+        "Examples of correct dispatch task body:\n"
+        "  • \"List tất cả references cite trong paper ASCE 2027, group theo hazard. Đọc documentation/REFERENCES.md, paper/REFERENCES.md, paper/latex/references.bib.\"\n"
+        "  • \"Verify câu BOSS vừa nói về formula vulnerability 0.40/0.30/0.30 trong vulnerability/energy_vulnerability_analyzer.py. Report line evidence.\"\n"
+        "  • \"Continue: bổ sung thêm bullet về Cascadia exposure vào bản report bạn vừa làm.\"\n\n"
+        "Examples of INCORRECT (do not produce):\n"
+        "  • \"Bạn là DOCS agent. Đọc theo thứ tự bắt buộc: 1. shared/research_integrity.md 2. ...\"\n"
+        "  • Reading lists, role briefings, pre-flight blocks.\n\n"
+        "The system parses tags in real time and runs the worker; the user verifies your orchestration by watching "
+        "the graph light up. Narrating \"I will dispatch\" without emitting the tag is a lie — user sees nothing happen.\n"
     )
 
 
@@ -122,13 +213,14 @@ async def _run_agent(
 
     model = agent.get("model", "claude")
     stream_fn = get_stream(model)
+    override = db.get_agent_override(slug, agent_id) or {}
     if model == "claude":
         agen = stream_fn(
             message=message,
             system_prompt=system_prompt,
             cwd=cwd,
-            model=agent.get("claude_model") or "claude-sonnet-4-6",
-            effort=agent.get("effort"),
+            model=override.get("claude_model") or agent.get("claude_model") or "claude-sonnet-4-6",
+            effort=override.get("effort") if "effort" in override else agent.get("effort"),
             resume_session_id=sess.get("claude_session_id"),
         )
     else:
@@ -245,6 +337,15 @@ async def api_chat(slug: str, agent_id: str, body: ChatBody):
             await _run_agent(slug, agent_id, body.message, emit, tracker)
             if tracker:
                 await asyncio.gather(*tracker, return_exceptions=True)
+        except asyncio.CancelledError:
+            # User aborted (browser disconnect / stop button).
+            # Cascade cancel to any still-running dispatched workers so they stop too.
+            for t in tracker:
+                if not t.done():
+                    t.cancel()
+            if tracker:
+                await asyncio.gather(*tracker, return_exceptions=True)
+            raise
         except Exception as e:
             await queue.put({"type": "error", "agent": agent_id, "message": str(e)})
         finally:

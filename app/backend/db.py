@@ -37,6 +37,14 @@ def init_db() -> None:
                 meta TEXT,
                 FOREIGN KEY(session_id) REFERENCES sessions(id)
             );
+            CREATE TABLE IF NOT EXISTS agent_overrides (
+                project_slug TEXT NOT NULL,
+                agent_id TEXT NOT NULL,
+                claude_model TEXT,
+                effort TEXT,
+                updated_at REAL NOT NULL,
+                PRIMARY KEY (project_slug, agent_id)
+            );
             CREATE INDEX IF NOT EXISTS idx_sessions_proj_agent
                 ON sessions(project_slug, agent_id, updated_at DESC);
             CREATE INDEX IF NOT EXISTS idx_messages_session
@@ -70,6 +78,22 @@ def get_or_create_active_session(project_slug: str, agent_id: str) -> dict:
             "updated_at": now,
             "last_status": None,
         }
+
+
+def new_session(project_slug: str, agent_id: str) -> dict:
+    now = time.time()
+    sid = str(uuid.uuid4())
+    with _conn() as c:
+        c.execute(
+            "INSERT INTO sessions(id, project_slug, agent_id, created_at, updated_at) "
+            "VALUES (?, ?, ?, ?, ?)",
+            (sid, project_slug, agent_id, now, now),
+        )
+    return {
+        "id": sid, "project_slug": project_slug, "agent_id": agent_id,
+        "claude_session_id": None, "created_at": now, "updated_at": now,
+        "last_status": None,
+    }
 
 
 def list_sessions(project_slug: str, agent_id: str) -> list[dict]:
@@ -130,6 +154,55 @@ def set_claude_session_id(session_id: str, claude_session_id: str) -> None:
             "UPDATE sessions SET claude_session_id=? WHERE id=?",
             (claude_session_id, session_id),
         )
+
+
+def get_agent_override(project_slug: str, agent_id: str) -> dict | None:
+    with _conn() as c:
+        row = c.execute(
+            "SELECT claude_model, effort FROM agent_overrides "
+            "WHERE project_slug=? AND agent_id=?",
+            (project_slug, agent_id),
+        ).fetchone()
+    if not row:
+        return None
+    return {"claude_model": row["claude_model"], "effort": row["effort"]}
+
+
+def set_agent_override(project_slug: str, agent_id: str,
+                       claude_model: str | None, effort: str | None) -> None:
+    with _conn() as c:
+        c.execute(
+            "INSERT INTO agent_overrides(project_slug, agent_id, claude_model, effort, updated_at) "
+            "VALUES (?, ?, ?, ?, ?) "
+            "ON CONFLICT(project_slug, agent_id) DO UPDATE SET "
+            "claude_model=excluded.claude_model, effort=excluded.effort, updated_at=excluded.updated_at",
+            (project_slug, agent_id, claude_model, effort, time.time()),
+        )
+
+
+def list_agent_overrides(project_slug: str) -> dict[str, dict]:
+    with _conn() as c:
+        rows = c.execute(
+            "SELECT agent_id, claude_model, effort FROM agent_overrides WHERE project_slug=?",
+            (project_slug,),
+        ).fetchall()
+    return {r["agent_id"]: {"claude_model": r["claude_model"], "effort": r["effort"]} for r in rows}
+
+
+def cleanup_stale_running() -> int:
+    """Mark any sessions that the previous process left in 'running' as 'cancelled'.
+
+    Called at startup. If the previous process died mid-stream (uvicorn reload,
+    browser disconnect that killed the task, OS kill), `running` sessions are
+    orphaned with no way to ever finish.
+    """
+    with _conn() as c:
+        cur = c.execute(
+            "UPDATE sessions SET last_status='cancelled', updated_at=? "
+            "WHERE last_status='running'",
+            (time.time(),),
+        )
+        return cur.rowcount
 
 
 def get_last_status(project_slug: str, agent_id: str) -> str | None:
