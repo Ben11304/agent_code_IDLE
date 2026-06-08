@@ -41,6 +41,52 @@ DISPATCH_RE = re.compile(
     re.IGNORECASE,
 )
 
+# Size guard when injecting a worker result back into the orchestrator's prompt.
+# Larger results are truncated head+tail with a marker; the full output remains in
+# the worker's own session db / state/ files.
+_LEDGER_MAX_CHARS = 8000
+_LEDGER_HEAD_CHARS = _LEDGER_MAX_CHARS - 1200
+_LEDGER_TAIL_CHARS = 1000
+
+
+def _format_results_as_context(results: list) -> str:
+    """Render dispatch ledger rows as <dispatch_result> blocks that the
+    orchestrator model can read on its next turn. Mirrors the <dispatch> tag
+    style the orchestrator already knows from `_dispatch_instructions`.
+    """
+    blocks = []
+    for r in results:
+        text = r.get("result_text") or ""
+        if len(text) > _LEDGER_MAX_CHARS:
+            head = text[:_LEDGER_HEAD_CHARS]
+            tail = text[-_LEDGER_TAIL_CHARS:]
+            text = (
+                f"{head}\n\n[... truncated; full output in {r['target_agent']} "
+                f"chat window or its `state/` files ...]\n\n{tail}"
+            )
+        status_attr = ""
+        if r.get("status") and r["status"] != "ok":
+            status_attr = f' status="{r["status"]}"'
+        task_excerpt = (r.get("task") or "").strip().splitlines()[0] if r.get("task") else ""
+        if len(task_excerpt) > 200:
+            task_excerpt = task_excerpt[:200] + "…"
+        blocks.append(
+            f'<dispatch_result from="{r["target_agent"]}"{status_attr}>\n'
+            f'(task: {task_excerpt})\n\n'
+            f'{text}\n'
+            f'</dispatch_result>'
+        )
+    if not blocks:
+        return ""
+    return (
+        "\n\n".join(blocks)
+        + "\n\n---\n\nThe `<dispatch_result>` blocks above contain the actual outputs "
+        "from workers you dispatched in your previous response(s). Reason over this "
+        "real data; **do NOT pretend you are still waiting for results**. If a result "
+        "is incomplete or in error/cancelled status, decide whether to retry, escalate, "
+        "or report to the user."
+    )
+
 
 @app.get("/api/projects")
 def api_projects():
@@ -534,7 +580,13 @@ def _dispatch_instructions(children: list[str]) -> str:
         "  • \"Bạn là DOCS agent. Đọc theo thứ tự bắt buộc: 1. shared/research_integrity.md 2. ...\"\n"
         "  • Reading lists, role briefings, pre-flight blocks.\n\n"
         "The system parses tags in real time and runs the worker; the user verifies your orchestration by watching "
-        "the graph light up. Narrating \"I will dispatch\" without emitting the tag is a lie — user sees nothing happen.\n"
+        "the graph light up. Narrating \"I will dispatch\" without emitting the tag is a lie — user sees nothing happen.\n\n"
+        "## How you receive worker results\n"
+        "On the turn AFTER a dispatch (either an automatic CONTROL-PLANE CONTINUATION or the user's next message), "
+        "the prompt will begin with `<dispatch_result from=\"WORKER_ID\">...</dispatch_result>` blocks containing "
+        "the full output of each worker you dispatched. Reason over that real data. **Never claim you are still "
+        "waiting for results when these blocks are present.** If a result is incomplete or marked status=error/cancelled, "
+        "decide whether to retry, escalate, or report to the user.\n"
     )
 
 
@@ -560,9 +612,25 @@ async def _run_agent(
     project, agent = found
 
     sess = db.get_or_create_active_session(slug, agent_id)
+    # Record the ORIGINAL user/synth message in the messages table (for UI
+    # fidelity). The string we actually send to the CLI may be enriched below
+    # with worker results from prior dispatches.
     db.add_message(sess["id"], "user", message, meta={"chain": list(chain)} if chain else None)
     db.update_session_status(sess["id"], "running")
     await emit({"type": "agent_status", "agent": agent_id, "status": "running"})
+
+    # ----- LEDGER ENRICHMENT -----
+    # If this agent dispatched workers in a prior turn and the results have not
+    # yet been consumed, prepend them to the message that goes to the CLI so the
+    # model can reason over the actual data. The original `message` is still
+    # what the user sees in the chat history; only the CLI prompt is enriched.
+    pending_results = db.get_unconsumed_results(slug, agent_id)
+    consumed_ids: list = []
+    if pending_results:
+        ledger_block = _format_results_as_context(pending_results)
+        message = ledger_block + "\n\n" + message
+        consumed_ids = [int(r["id"]) for r in pending_results]
+    # ----- END LEDGER ENRICHMENT -----
 
     system_prompt = projects.resolve_system_prompt(project["root"], agent.get("system_prompt_file", ""))
     cwd = projects.resolve_cwd(project["root"], agent.get("cwd", "."))
@@ -679,19 +747,66 @@ async def _run_agent(
         if final_text:
             db.add_message(sess["id"], "assistant", final_text)
         db.update_session_status(sess["id"], final_status)
+        # Mark ledger rows consumed only on a clean turn — if we errored or were
+        # cancelled, leave the rows so the next attempt can still see them.
+        if consumed_ids and final_status == "ok":
+            db.consume_results(consumed_ids, sess["id"])
         await emit({"type": "agent_done", "agent": agent_id, "text": final_text, "status": final_status})
 
     return "".join(assembled)
 
 
 async def _dispatched_run(slug, source_id, target_id, task, emit, tracker, chain):
+    """Run a worker dispatched by source_id. Capture its final text and write
+    it to the dispatch_results ledger so source_id can see the output on its
+    next prompt (via enrichment in _run_agent).
+    """
     status = "ok"
     error_msg = None
+    result_text = ""
     try:
-        await _run_agent(slug, target_id, task, emit, tracker, chain)
+        result_text = await _run_agent(slug, target_id, task, emit, tracker, chain) or ""
+        # _run_agent sets final_status internally (e.g. to "error" on
+        # adapter error events) and updates the worker session row before
+        # returning. Read it back to preserve nuance in the ledger.
+        worker_status = db.get_last_status(slug, target_id)
+        if worker_status in ("error", "cancelled"):
+            status = worker_status
+    except asyncio.CancelledError:
+        status = "cancelled"
+        # On cancellation, recover whatever the worker had assembled before
+        # being cut off, so the source agent at least sees a partial result.
+        if not result_text:
+            try:
+                sessions = db.list_sessions(slug, target_id)
+                if sessions:
+                    msgs = db.get_messages(sessions[0]["id"])
+                    if msgs and msgs[-1]["role"] == "assistant":
+                        result_text = msgs[-1]["content"] or ""
+            except Exception:
+                pass
+        db.record_dispatch_result(
+            project_slug=slug, source_agent=source_id, target_agent=target_id,
+            task=task,
+            result_text=result_text or "(cancelled before any output)",
+            status=status, meta={"chain": list(chain)},
+        )
+        await emit({
+            "type": "dispatch_complete", "source": source_id,
+            "target": target_id, "status": status, "message": "cancelled",
+        })
+        raise
     except Exception as e:
         status = "error"
         error_msg = str(e)
+
+    db.record_dispatch_result(
+        project_slug=slug, source_agent=source_id, target_agent=target_id,
+        task=task,
+        result_text=result_text or (error_msg or "(empty result)"),
+        status=status, meta={"chain": list(chain)},
+    )
+
     await emit({
         "type": "dispatch_complete",
         "source": source_id,
@@ -721,19 +836,37 @@ async def api_chat(slug: str, agent_id: str, body: ChatBody):
     } if (body.best_of_n or body.check_loop or body.memory_mode) else None
 
     async def driver():
+        cont_tracker: list = []
         try:
             await _run_agent(slug, agent_id, body.message, emit, tracker,
                              grok_options=grok_options)
             if tracker:
                 await asyncio.gather(*tracker, return_exceptions=True)
+                # Bounded continuation: now that worker results are in the
+                # ledger, run the orchestrator one more time so it can react
+                # inside the SAME SSE response (the enrichment in _run_agent
+                # will pull the unconsumed results into the prompt). Capped at
+                # one extra turn — any further dispatch happens but does not
+                # trigger another auto-continuation.
+                synth = (
+                    "[CONTROL-PLANE CONTINUATION] All worker dispatches you fired in the "
+                    "previous response have completed. Their outputs are provided as "
+                    "<dispatch_result> blocks at the top of this message. Reason over the "
+                    "real data and either: produce your final answer / summary for the user, "
+                    "or — if the results require it — emit the next dispatch tag(s). "
+                    "Do NOT re-emit the same tasks. Do NOT say you are still waiting."
+                )
+                await _run_agent(slug, agent_id, synth, emit, cont_tracker)
+                if cont_tracker:
+                    await asyncio.gather(*cont_tracker, return_exceptions=True)
         except asyncio.CancelledError:
-            # User aborted (browser disconnect / stop button).
-            # Cascade cancel to any still-running dispatched workers so they stop too.
-            for t in tracker:
+            for t in tracker + cont_tracker:
                 if not t.done():
                     t.cancel()
             if tracker:
                 await asyncio.gather(*tracker, return_exceptions=True)
+            if cont_tracker:
+                await asyncio.gather(*cont_tracker, return_exceptions=True)
             raise
         except Exception as e:
             await queue.put({"type": "error", "agent": agent_id, "message": str(e)})

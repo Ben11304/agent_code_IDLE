@@ -52,6 +52,21 @@ def init_db() -> None:
                 updated_at REAL NOT NULL,
                 PRIMARY KEY (project_slug, agent_id)
             );
+            CREATE TABLE IF NOT EXISTS dispatch_results (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                project_slug TEXT NOT NULL,
+                source_agent TEXT NOT NULL,
+                target_agent TEXT NOT NULL,
+                task TEXT NOT NULL,
+                result_text TEXT NOT NULL,
+                status TEXT NOT NULL CHECK(status IN ('ok','error','cancelled')),
+                completed_at REAL NOT NULL,
+                consumed_at REAL,
+                consumed_by_session TEXT,
+                meta TEXT
+            );
+            CREATE INDEX IF NOT EXISTS idx_dr_source
+                ON dispatch_results(project_slug, source_agent, consumed_at, completed_at);
             CREATE INDEX IF NOT EXISTS idx_sessions_proj_agent
                 ON sessions(project_slug, agent_id, updated_at DESC);
             CREATE INDEX IF NOT EXISTS idx_messages_session
@@ -207,6 +222,69 @@ def list_agent_overrides(project_slug: str) -> dict[str, dict]:
         "grok_model": r["grok_model"],
         "effort": r["effort"],
     } for r in rows}
+
+
+def record_dispatch_result(
+    project_slug: str,
+    source_agent: str,
+    target_agent: str,
+    task: str,
+    result_text: str,
+    status: str,
+    meta: dict | None = None,
+) -> int:
+    """Append a row to the dispatch_results ledger so the SOURCE agent can see
+    this worker's output in its next prompt (via get_unconsumed_results +
+    enrichment in _run_agent).
+    """
+    with _conn() as c:
+        cur = c.execute(
+            "INSERT INTO dispatch_results(project_slug, source_agent, target_agent, "
+            "task, result_text, status, completed_at, meta) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            (project_slug, source_agent, target_agent, task, result_text or "",
+             status, time.time(),
+             json.dumps(meta) if meta else None),
+        )
+        return cur.lastrowid
+
+
+def get_unconsumed_results(project_slug: str, for_source_agent: str) -> list[dict]:
+    """Return dispatch results for which `for_source_agent` is the source and
+    nobody has consumed them yet. These are the worker outputs the source agent
+    has NOT yet seen in any of its own prompts.
+    """
+    with _conn() as c:
+        rows = c.execute(
+            "SELECT id, project_slug, source_agent, target_agent, task, "
+            "result_text, status, completed_at, meta "
+            "FROM dispatch_results "
+            "WHERE project_slug=? AND source_agent=? AND consumed_at IS NULL "
+            "ORDER BY completed_at ASC",
+            (project_slug, for_source_agent),
+        ).fetchall()
+    out = []
+    for r in rows:
+        d = dict(r)
+        if d.get("meta"):
+            try:
+                d["meta"] = json.loads(d["meta"])
+            except Exception:
+                pass
+        out.append(d)
+    return out
+
+
+def consume_results(result_ids: list[int], session_id: str) -> None:
+    if not result_ids:
+        return
+    placeholders = ",".join("?" * len(result_ids))
+    with _conn() as c:
+        c.execute(
+            f"UPDATE dispatch_results SET consumed_at=?, consumed_by_session=? "
+            f"WHERE id IN ({placeholders})",
+            (time.time(), session_id, *result_ids),
+        )
 
 
 def cleanup_stale_running() -> int:
