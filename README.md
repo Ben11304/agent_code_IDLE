@@ -22,11 +22,11 @@ See [DEPLOY.md](DEPLOY.md) — SSH tunnel + systemd service.
 
 - **Graph of agents** with live status (idle / running pulse / ok / error)
 - **Floating windows**, draggable, resizable, hidable. Open multiple agents at once.
-- **Auto-dispatch**: orchestrator emits `<dispatch agent="X">task</dispatch>`, backend parses live, fires worker, animates edge + worker node
+- **Auto-dispatch + result feedback**: orchestrator emits `<dispatch agent="X">task</dispatch>`, backend parses live, fires worker, animates edge + worker node. After workers finish, a **dispatch ledger** + bounded auto-continuation feeds the worker outputs back into the orchestrator's next prompt as `<dispatch_result>` blocks, so the orchestrator can synthesise / chain / report inside the same SSE response (no more "still waiting" hallucinations). Design rationale in [docs/agentui-dispatch-spec.md](docs/agentui-dispatch-spec.md).
 - **Add agent through UI**: `+ agent` button opens a form. Default flow asks the first parent (e.g. BOSS) to **write the bootstrap files** based on its project context (streamed live, then previewed). Fallback to generic template if no parent or for speed. Backend atomically creates `<ID>/AGENT.md`, `inputs/manifest.md`, `outputs/manifest.md`, `state/progress.md`, `context/code_map.md` and appends to `project.yaml` (ruamel.yaml preserves comments).
 - **Mix Claude and Grok agents** in the same project graph. Each agent picks its adapter; the wrapper handles streaming, sessions, dispatch tags uniformly.
 - **Slash commands** in chat input (`/help`, `/clear`, `/model`, `/effort`, `/focus`, `/dispatch`, `/stop`, `/status`)
-- **Folder tree** sidebar with ⌥⌘C copy-path shortcut
+- **Workspace-wide folder tree** in the sidebar (project roots get a diamond marker); ⌥⌘C copy-path shortcut; click any file to open in a floating viewer (markdown render, code mono, PDF + images via browser, binary fallback with download)
 - **Markdown rendering** of agent output (marked + DOMPurify); dispatch tags become collapsed cards
 - **Streaming via PTY** so Claude CLI doesn't block-buffer; tokens arrive in real time
 - **Stop button** + Esc to cancel mid-stream, cascade-cancels all in-flight dispatched workers

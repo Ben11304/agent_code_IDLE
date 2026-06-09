@@ -17,10 +17,10 @@ This file is read on session start. Follow it.
 ```
 app/
 ├── backend/
-│   ├── main.py          FastAPI: /api/projects*, /tree, /session, /clear, /settings, SSE chat with dispatch parsing
-│   ├── adapters.py      claude_stream (PTY) + grok_stream (aas subprocess)
-│   ├── projects.py      registry + project.yaml loader, graph edges
-│   └── db.py            SQLite sessions, messages, agent_overrides; cleanup_stale_running on startup
+│   ├── main.py          FastAPI: /api/projects*, /tree, /file + /raw, /workspace/*, SSE chat with dispatch parsing + ledger enrichment + auto-continuation
+│   ├── adapters.py      claude_stream (PTY) + grok_stream (PTY, streaming-json, --resume, --best-of-n, --check, --memory)
+│   ├── projects.py      registry + project.yaml loader, graph edges, workspace_root, agent bootstrap templates + create_agent atomic
+│   └── db.py            SQLite sessions, messages, agent_overrides, dispatch_results; cleanup_stale_running on startup
 ├── frontend/
 │   ├── index.html       Loads marked + DOMPurify from CDN, sidebar + workspace + taskbar
 │   ├── app.js           Vanilla JS, window manager, SVG graph, SSE parser, markdown render, slash commands
@@ -54,7 +54,7 @@ Port conflicts: `lsof -ti tcp:5174 | xargs kill -9`.
 
 ## UI overview
 
-- **Sidebar (left)**: project cards + folder tree. ⌥⌘C copies absolute path of the selected file/folder.
+- **Sidebar (left)**: project cards + **workspace-wide folder tree** (rooted at `workspace_root` from registry.yaml or the common parent of all registered projects; folders that are themselves registered projects get a diamond ◆ accent). Click any file to open it in a floating viewer window (markdown rendered, code in monospace, PDF + images via browser-native preview, binary fallback with a "tải về raw" link). ⌥⌘C copies absolute path of the selected file/folder.
 - **Tabs (top)**: open projects. Switch tabs to change the active project; windows from other projects are hidden but kept in memory.
 - **Workspace (center)**: floating windows. Graph window auto-opens per project. Click an agent node to open its chat window. Drag title bar, resize bottom-right corner, hide (minimize) to taskbar, close with × or Cmd+W.
 - **Taskbar (bottom)**: minimized windows; click to restore.
@@ -141,6 +141,29 @@ agents:
 `claude_model` and `effort` are baseline; the UI's `/model` and `/effort` commands store **runtime overrides** in `agent_overrides` table that win over yaml.
 
 Layout rule: an agent with no parents is rendered as orchestrator (top layer). An agent's `children` (any agent listing this one as parent) are the only valid dispatch targets — the system rejects dispatches outside that set.
+
+## Dispatch ledger (orchestrator sees worker outputs)
+
+The "blind dispatch" problem — orchestrator emits `<dispatch>`, user sees the worker reply on screen, but the orchestrator's `--resume` context never contains it — is solved by a SQLite ledger + message-string enrichment + one bounded auto-continuation. Designed via Grok best-of-3 spec at [docs/agentui-dispatch-spec.md](docs/agentui-dispatch-spec.md).
+
+Flow per user turn:
+
+1. User → orchestrator. Orchestrator streams an `<dispatch agent="WORKER">…</dispatch>` tag.
+2. Backend parses live, fires `_dispatched_run` for the worker.
+3. Worker runs through the same `_run_agent`, streams to UI, returns its `final_text`.
+4. `_dispatched_run` writes a row into `dispatch_results` table: `(project_slug, source_agent, target_agent, task, result_text, status, completed_at)`.
+5. Driver `gather`s all tracker tasks, then fires ONE auto-continuation: `_run_agent(orchestrator, "[CONTROL-PLANE CONTINUATION] …")`.
+6. Inside `_run_agent`, ENRICHMENT block queries the ledger for `source_agent = orchestrator AND consumed_at IS NULL`, formats them as `<dispatch_result from="WORKER">…</dispatch_result>` blocks, and **prepends them to the `message` string sent to the CLI**. The original message stays unchanged in the messages table for UI fidelity; only the CLI prompt is enriched.
+7. Orchestrator's CLI sees the real worker outputs and synthesises / chains / reports — all inside the same SSE response the user is watching.
+8. On clean turn end (`final_status == "ok"`), the consumed ledger rows are marked. They never resurface.
+
+Truncation: head 6.8 KB + tail 1 KB + "[… truncated; full output in <worker> chat or its `state/` files]" marker when a single worker result exceeds 8 KB. Full text stays in the worker's session db.
+
+Cancellation: `_dispatched_run` catches `CancelledError`, recovers partial assembled text from the worker's session, writes a `status="cancelled"` row, propagates. Orchestrator's next turn sees the partial/cancelled result and decides.
+
+Why not MCP today: the proper Anthropic pattern (orchestrator calls a `dispatch_to_worker` MCP tool, gets the result as a tool_result inside the same turn) requires changing `adapters.py` cmd construction (risk to PTY contract), a cross-process trigger from a stdio MCP child of the claude CLI back into uvicorn's driver/tracker/emit, and a different mechanism for grok which has no MCP support today. The ledger is the persistence layer a future MCP tool would use anyway, so the work isn't thrown away — when MCP is added, the tool handler will just call `_run_agent` and `record_dispatch_result` exactly as `_dispatched_run` does today.
+
+When extending this: never write worker results into the orchestrator's `messages` table as fake rows. The `messages` table only affects UI replay; the CLI never reads it. Only enrichment of the `message=` argument actually reaches the model.
 
 ## Dispatch protocol
 
@@ -229,7 +252,7 @@ Template generation lives in `projects.py:_AGENT_FILE_TEMPLATES` (5 templates) +
 ## Known limitations / next iterations
 
 - **No project-wide event bus**. Worker SSE events flow only through the parent chat that triggered them. If you open a separate worker chat window during a BOSS-triggered dispatch, it refreshes from db on `dispatch_started` / `agent_done` / `dispatch_complete` (mirror). Live token-by-token mirroring would need a pub/sub channel.
-- **No worker result feedback to orchestrator**. Dispatch is fire-and-forget; BOSS does not see PIPELINE's output for the next decision. Plan: MCP server exposing `dispatch_to_worker(id, task)` as a real tool, response returned in the tool result.
+- **Worker result feedback to orchestrator is solved by the dispatch ledger** (see the dedicated section above). Future work: an optional MCP tool surface so claude-native tool_result UX is available for Claude orchestrators without changing the persistence model.
 - **No idle reaper**. Sessions live forever. Plan: idle timeout + startup reaping with pid groups.
 - **No compaction**. Long chats grow `--resume` context indefinitely. Plan: periodic summarise + new session ID. `/clear` is the manual escape hatch.
 - **Tab close cancels SSE**. Dispatched workers can be killed mid-turn if the browser disconnects (driver cascades cancel). On startup the orphan reaper marks any leftover `running` sessions as `cancelled` so the UI is never permanently stuck.
