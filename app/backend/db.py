@@ -75,6 +75,8 @@ def init_db() -> None:
         )
         # backward-compat: add grok_model column if older db
         _ensure_column(c, "agent_overrides", "grok_model", "TEXT")
+        # latest real token usage from the CLI (JSON: input/output/cache buckets)
+        _ensure_column(c, "sessions", "usage", "TEXT")
 
 
 def get_or_create_active_session(project_slug: str, agent_id: str) -> dict:
@@ -177,6 +179,15 @@ def set_claude_session_id(session_id: str, claude_session_id: str) -> None:
         c.execute(
             "UPDATE sessions SET claude_session_id=? WHERE id=?",
             (claude_session_id, session_id),
+        )
+
+
+def set_session_usage(session_id: str, usage: dict) -> None:
+    """Persist the latest real token usage reported by the CLI for this session."""
+    with _conn() as c:
+        c.execute(
+            "UPDATE sessions SET usage=? WHERE id=?",
+            (json.dumps(usage), session_id),
         )
 
 

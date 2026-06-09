@@ -5,6 +5,8 @@ const state = {
   openTabs: [],
   activeTab: null,
   projectCache: {},
+  statsCache: {},         // slug -> { agentId -> stats }
+  expandedNodes: new Set(), // "slug:agentId" set of expanded graph panels
   activeDispatches: new Set(),
   viewBoxes: {},          // slug -> {x,y,w,h}
   graphBounds: {},        // slug -> {x,y,w,h}
@@ -342,6 +344,7 @@ function ensureGraphWindow(slug) {
   } else {
     focusWindow(w);
   }
+  ensureStats(slug);
   return w;
 }
 
@@ -418,59 +421,146 @@ function renderGraphInWindow(w) {
     svg.appendChild(path);
   });
 
+  // Expanded panels are painted last so they overlay neighbouring nodes/edges
+  // instead of being clipped behind them.
+  const deferred = [];
   proj.agents.forEach((a) => {
     const pos = positions[a.id];
     if (!pos) return;
-    const isOrchestrator = (a.parents || []).length === 0;
-    const status = (proj.statuses && proj.statuses[a.id]) || "idle";
-    const isOpenChat = state.windows.some(
-      (x) => x.type === "chat" && x.projectSlug === proj.slug && x.agentId === a.id);
-
-    const g = document.createElementNS(ns, "g");
-    g.style.cursor = "pointer";
-    g.onclick = () => openChat(proj.slug, a.id);
-
-    const rect = document.createElementNS(ns, "rect");
-    let cls = "node-rect";
-    if (isOrchestrator) cls += " orchestrator";
-    if (isOpenChat) cls += " selected";
-    if (status === "running") cls += " pulse";
-    rect.setAttribute("class", cls);
-    rect.setAttribute("data-status", status);
-    rect.setAttribute("x", pos.x);
-    rect.setAttribute("y", pos.y);
-    rect.setAttribute("rx", 8); rect.setAttribute("ry", 8);
-    rect.setAttribute("width", nodeW); rect.setAttribute("height", nodeH);
-    g.appendChild(rect);
-
-    const label = document.createElementNS(ns, "text");
-    label.setAttribute("class", "node-label");
-    label.setAttribute("x", pos.x + nodeW / 2);
-    label.setAttribute("y", pos.y + 22);
-    label.setAttribute("text-anchor", "middle");
-    label.textContent = a.id;
-    g.appendChild(label);
-
-    const model = document.createElementNS(ns, "text");
-    model.setAttribute("class", "node-model");
-    model.setAttribute("x", pos.x + nodeW / 2);
-    model.setAttribute("y", pos.y + 40);
-    model.setAttribute("text-anchor", "middle");
-    model.textContent = modelLabel(a);
-    g.appendChild(model);
-
-    const dot = document.createElementNS(ns, "circle");
-    dot.setAttribute("class", "status-dot");
-    dot.setAttribute("cx", pos.x + 10);
-    dot.setAttribute("cy", pos.y + 10);
-    dot.setAttribute("r", 5);
-    dot.setAttribute("fill", statusColor(status));
-    g.appendChild(dot);
-
-    svg.appendChild(g);
+    const g = buildAgentNode(proj, a, pos, nodeW, nodeH);
+    if (state.expandedNodes.has(`${proj.slug}:${a.id}`)) deferred.push(g);
+    else svg.appendChild(g);
   });
+  deferred.forEach((g) => svg.appendChild(g));
 
   applyViewBox(svg, proj.slug, w);
+}
+
+// Expanded-panel geometry (viewBox units, matches collapsed node width baseline).
+const PANEL_W = 212, PANEL_H = 232;
+
+function buildAgentNode(proj, a, pos, nodeW, nodeH) {
+  const ns = "http://www.w3.org/2000/svg";
+  const status = (proj.statuses && proj.statuses[a.id]) || "idle";
+  const isOrchestrator = (a.parents || []).length === 0;
+  const isOpenChat = state.windows.some(
+    (x) => x.type === "chat" && x.projectSlug === proj.slug && x.agentId === a.id);
+  const key = `${proj.slug}:${a.id}`;
+  const expanded = state.expandedNodes.has(key);
+  const stats = (state.statsCache[proj.slug] || {})[a.id];
+
+  const g = document.createElementNS(ns, "g");
+  const fo = document.createElementNS(ns, "foreignObject");
+  fo.setAttribute("x", pos.x);
+  fo.setAttribute("y", pos.y);
+  fo.setAttribute("width", expanded ? PANEL_W : nodeW);
+  fo.setAttribute("height", expanded ? PANEL_H : nodeH);
+  fo.setAttribute("overflow", "visible");
+
+  let cls = "agent-card status-" + status;
+  if (isOrchestrator) cls += " orchestrator";
+  if (isOpenChat) cls += " selected";
+  if (status === "running") cls += " pulse";
+  if (expanded) cls += " expanded";
+
+  fo.innerHTML =
+    `<div xmlns="http://www.w3.org/1999/xhtml" class="${cls}" style="min-height:${nodeH}px">`
+    + nodeCardHtml(a, status, expanded, stats) + `</div>`;
+  g.appendChild(fo);
+
+  const chev = fo.querySelector(".ac-expand");
+  if (chev) chev.onclick = (e) => { e.stopPropagation(); toggleNode(proj.slug, a.id); };
+  const head = fo.querySelector(".ac-head");
+  if (head) head.onclick = (e) => {
+    if (e.target.closest(".ac-expand")) return;
+    openChat(proj.slug, a.id);
+  };
+  const openBtn = fo.querySelector(".ac-open");
+  if (openBtn) openBtn.onclick = (e) => { e.stopPropagation(); openChat(proj.slug, a.id); };
+  return g;
+}
+
+function nodeCardHtml(a, status, expanded, stats) {
+  const chev = expanded ? "▾" : "▸";
+  let html = `
+    <div class="ac-head">
+      <span class="ac-dot" style="background:${statusColor(status)}"></span>
+      <span class="ac-id">${escapeHtml(a.id)}</span>
+      <span class="ac-expand" title="${expanded ? "thu gọn" : "mở rộng"}">${chev}</span>
+    </div>
+    <div class="ac-model">${escapeHtml(modelLabel(a))}</div>`;
+  if (expanded) html += `<div class="ac-body">${nodeBodyHtml(a, stats)}</div>`;
+  return html;
+}
+
+function nodeBodyHtml(a, stats) {
+  if (!stats) return `<div class="ac-loading">đang tải số liệu…</div>`;
+  const pct = stats.context_pct || 0;
+  const barCls = pct > 80 ? "hot" : (pct > 50 ? "warm" : "");
+  const mem = stats.memory;
+  const memTime = mem && mem.mtime ? fmtRelTime(mem.mtime) : "—";
+  const memHead = mem && mem.headline ? escapeHtml(mem.headline) : "";
+  const lastAct = stats.updated_at ? fmtRelTime(stats.updated_at) : "—";
+  const effort = stats.effort ? escapeHtml(stats.effort) : "default";
+  const sessTxt = stats.has_session
+    ? `live${stats.num_sessions > 1 ? " · " + stats.num_sessions : ""}`
+    : "fresh";
+  const exact = stats.token_source === "exact";
+  const tokK = exact ? "tokens" : "≈ tokens";
+  const ctxTitle = exact ? "số token thật từ CLI (lượt gần nhất)" : "ước lượng chars/4 — chưa có lượt hoàn tất";
+  return `
+    <div class="ac-row ac-ctx" title="${ctxTitle}">
+      <span class="ac-k">context${exact ? "" : " ≈"}</span>
+      <span class="ac-bar"><i class="${barCls}" style="width:${Math.min(100, pct)}%"></i></span>
+      <span class="ac-v">${pct}%</span>
+    </div>
+    <div class="ac-row"><span class="ac-k">${tokK}</span><span class="ac-v">${fmtTokens(stats.context_tokens)} / ${fmtTokens(stats.context_window)}</span></div>
+    <div class="ac-row"><span class="ac-k">bộ nhớ</span><span class="ac-v">${memTime}</span></div>
+    ${memHead ? `<div class="ac-headline" title="${memHead}">${memHead}</div>` : ""}
+    <div class="ac-row"><span class="ac-k">hoạt động</span><span class="ac-v">${lastAct}</span></div>
+    <div class="ac-row"><span class="ac-k">messages</span><span class="ac-v">${stats.message_count}</span></div>
+    <div class="ac-row"><span class="ac-k">effort</span><span class="ac-v">${effort}</span></div>
+    <div class="ac-row"><span class="ac-k">session</span><span class="ac-v">${sessTxt}</span></div>
+    <div class="ac-actions"><button class="ac-open">mở chat ↗</button></div>`;
+}
+
+function toggleNode(slug, id) {
+  const key = `${slug}:${id}`;
+  if (state.expandedNodes.has(key)) {
+    state.expandedNodes.delete(key);
+  } else {
+    state.expandedNodes.add(key);
+    if (!state.statsCache[slug]) ensureStats(slug);
+  }
+  rerenderGraphsForSlug(slug);
+}
+
+async function ensureStats(slug, force) {
+  if (!force && state.statsCache[slug]) return;
+  try {
+    const r = await fetch(`/api/projects/${slug}/stats`);
+    if (r.ok) state.statsCache[slug] = (await r.json()).stats || {};
+  } catch (e) { /* keep stale cache on network error */ }
+  rerenderGraphsForSlug(slug);
+}
+
+function fmtTokens(n) {
+  n = n || 0;
+  if (n >= 1000) return (n / 1000).toFixed(n >= 10000 ? 0 : 1).replace(/\.0$/, "") + "k";
+  return String(n);
+}
+
+function fmtRelTime(epochSec) {
+  if (!epochSec) return "—";
+  let d = Date.now() / 1000 - epochSec;
+  if (d < 0) d = 0;
+  if (d < 45) return "vừa xong";
+  if (d < 90) return "1 phút trước";
+  if (d < 3600) return Math.round(d / 60) + " phút trước";
+  if (d < 7200) return "1 giờ trước";
+  if (d < 86400) return Math.round(d / 3600) + " giờ trước";
+  if (d < 172800) return "hôm qua";
+  return Math.round(d / 86400) + " ngày trước";
 }
 
 function modelLabel(a) {
@@ -1821,6 +1911,7 @@ function handleEventInWindow(w, slug, evt, bubbleFor, rootAgent) {
         b.thinkBlock.style.display = "none";
       }
       rerenderGraphsForSlug(slug);
+      ensureStats(slug, true);
       mirrorDispatchedMessages(slug, agent);
       break;
     }
@@ -1837,6 +1928,7 @@ function handleEventInWindow(w, slug, evt, bubbleFor, rootAgent) {
       state.activeDispatches.delete(`${evt.source}->${evt.target}`);
       proj.statuses[evt.target] = evt.status === "ok" ? "ok" : "error";
       rerenderGraphsForSlug(slug);
+      ensureStats(slug, true);
       setChatStatus(w, `${evt.source} → ${evt.target}: ${evt.status}`);
       mirrorDispatchedMessages(slug, evt.target);
       break;
@@ -1860,7 +1952,9 @@ function mirrorDispatchedMessages(slug, agentId) {
   const target = state.windows.find(
     (x) => x.type === "chat" && x.projectSlug === slug && x.agentId === agentId);
   if (!target) return;
-  // pull latest messages from server into the target window
+  // Don't wipe the messages area while the root agent is still streaming —
+  // dispatched sub-bubbles are live in the DOM and would be destroyed.
+  if (target.streaming) return;
   refreshChatSession(target);
 }
 

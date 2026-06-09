@@ -117,6 +117,148 @@ def api_project(slug: str):
     return out
 
 
+# Approximate context-window sizes per adapter family. Used only to render the
+# "context window" gauge in the expandable agent panel — token counts are
+# ESTIMATED (chars/4 over the active session + system prompt), not exact, since
+# the CLIs do not report usage in a form we persist. Labelled "≈" in the UI.
+_CONTEXT_WINDOWS = {"claude": 200_000, "grok": 256_000}
+
+
+def _memory_info(project_root: str, agent: dict, cwd_abs: str) -> Optional[dict]:
+    """Inspect an agent's persistent memory file (`state/progress.md`): when it
+    was last written and the most recent dated headline. Returns None if absent.
+
+    The memory file lives in the agent's own folder, which is the parent of its
+    `system_prompt_file` (e.g. `BOSS/AGENT.md` → `BOSS/`). That is NOT always the
+    same as `cwd` (an orchestrator may run with `cwd: .`), so we try the prompt
+    folder first, then `cwd`, then the `<ID>` convention.
+    """
+    root = Path(project_root)
+    candidates = []
+    spf = agent.get("system_prompt_file") or ""
+    if spf:
+        candidates.append((root / spf).parent)
+    if cwd_abs:
+        candidates.append(Path(cwd_abs))
+    candidates.append(root / agent["id"])
+
+    prog = None
+    for base in candidates:
+        p = base / "state" / "progress.md"
+        if p.exists() and p.is_file():
+            prog = p
+            break
+    if prog is None:
+        return None
+    try:
+        st = prog.stat()
+    except OSError:
+        return None
+    headline = ""
+    try:
+        with prog.open("r", encoding="utf-8", errors="replace") as f:
+            for _ in range(200):
+                line = f.readline()
+                if not line:
+                    break
+                s = line.strip()
+                if s.startswith("## "):
+                    headline = s[3:].strip()
+                    break
+    except OSError:
+        pass
+    try:
+        rel = str(prog.resolve().relative_to(Path(project_root).resolve()))
+    except Exception:
+        rel = str(prog)
+    return {"path": rel, "mtime": st.st_mtime, "headline": headline}
+
+
+@app.get("/api/projects/{slug}/stats")
+def api_project_stats(slug: str):
+    """Per-agent runtime stats for the expandable graph panels: status, effective
+    model/effort, last activity, message count, ESTIMATED context-window usage,
+    and persistent-memory freshness. Cheap enough to call on every graph refresh.
+    """
+    project = projects.get_project(slug)
+    if not project:
+        raise HTTPException(404, "project not found")
+    root = project["root"]
+    overrides = db.list_agent_overrides(slug)
+    stats: dict = {}
+    for a in project["agents"]:
+        aid = a["id"]
+        status = db.get_last_status(slug, aid) or "idle"
+        sessions = db.list_sessions(slug, aid)
+        sess = sessions[0] if sessions else None
+        msg_count = 0
+        est_chars = 0
+        updated_at = None
+        has_session = False
+        usage = None
+        if sess:
+            updated_at = sess.get("updated_at")
+            has_session = bool(sess.get("claude_session_id"))
+            msgs = db.get_messages(sess["id"])
+            msg_count = len(msgs)
+            est_chars = sum(len(m.get("content") or "") for m in msgs)
+            if sess.get("usage"):
+                try:
+                    usage = json.loads(sess["usage"])
+                except (ValueError, TypeError):
+                    usage = None
+
+        model_kind = a.get("model", "claude")
+        ov = overrides.get(aid) or {}
+        if model_kind == "grok":
+            eff_model = ov.get("grok_model") or a.get("grok_model") or "grok-build"
+        else:
+            eff_model = ov.get("claude_model") or a.get("claude_model") or "claude-sonnet-4-6"
+        effort = ov.get("effort") if (ov and "effort" in ov) else a.get("effort")
+
+        window = _CONTEXT_WINDOWS.get(model_kind, 200_000)
+        # Prefer the CLI's real token usage from the last turn. Context-window
+        # occupancy = every input bucket (fresh + cache create + cache read) +
+        # output. Fall back to a chars/4 estimate only when no usage is recorded
+        # yet (e.g. a session that has never completed a turn, or a grok node).
+        if usage:
+            ctx_tokens = (
+                (usage.get("input_tokens") or 0)
+                + (usage.get("cache_creation_input_tokens") or 0)
+                + (usage.get("cache_read_input_tokens") or 0)
+                + (usage.get("output_tokens") or 0)
+            )
+            token_source = "exact"
+        else:
+            sys_chars = 0
+            try:
+                sp = projects.resolve_system_prompt(root, a.get("system_prompt_file", ""))
+                sys_chars = len(sp or "")
+            except Exception:
+                pass
+            ctx_tokens = (est_chars + sys_chars) // 4
+            token_source = "estimate"
+        pct = round(min(100.0, ctx_tokens / window * 100.0), 1) if window else 0.0
+
+        cwd_abs = projects.resolve_cwd(root, a.get("cwd", "."))
+        stats[aid] = {
+            "status": status,
+            "model_kind": model_kind,
+            "model": eff_model,
+            "effort": effort,
+            "updated_at": updated_at,
+            "message_count": msg_count,
+            "context_tokens": ctx_tokens,
+            "token_source": token_source,
+            "context_window": window,
+            "context_pct": pct,
+            "has_session": has_session,
+            "num_sessions": len(sessions),
+            "memory": _memory_info(root, a, cwd_abs),
+        }
+    return {"stats": stats}
+
+
 class AgentSettings(BaseModel):
     claude_model: Optional[str] = None
     grok_model: Optional[str] = None
@@ -190,6 +332,8 @@ def _bootstrap_prompt(slug: str, body: "NewAgent", parent_id: str) -> str:
         f"- Name: {proj['name']}\n"
         f"- Other agents: {', '.join(others) or 'none'}\n\n"
         "## Output format — STRICT\n"
+        "⚠️ DO NOT use Write, Edit, Bash, or any file-system tools. Do NOT create files or folders on disk. "
+        "The control plane parses your TEXT output and creates the files — your only job is to write content into the tags below.\n\n"
         "Emit ONLY the file blocks below, in this exact order, with NO prose before, between, or after. "
         "Each block uses the verbatim envelope:\n\n"
         f'<file path="{body.id}/RELATIVE_PATH">\n'
@@ -728,6 +872,8 @@ async def _run_agent(
                 data = evt.get("data") or {}
                 if data.get("claude_session_id"):
                     db.set_claude_session_id(sess["id"], data["claude_session_id"])
+                if data.get("usage"):
+                    db.set_session_usage(sess["id"], data["usage"])
                 await emit({"type": "meta", "agent": agent_id, "data": data})
             elif etype == "thinking":
                 await emit({"type": "thinking", "agent": agent_id, "text": evt.get("text", "")})

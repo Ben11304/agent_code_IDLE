@@ -441,8 +441,10 @@ def create_agent(slug: str, agent: dict[str, Any]) -> tuple[bool, str]:
 
     folder_name = agent["id"]
     target = root / folder_name
-    if target.exists():
-        return False, f"folder already exists: {target.name}"
+    # folder_pre_exists: parent agent may have created it already during bootstrap
+    # (bypassPermissions + Write tool). We tolerate this — just overwrite files and
+    # update yaml. Only reject if the agent is already registered in project.yaml.
+    folder_pre_exists = target.exists()
 
     custom = agent.get("custom_files")
     if custom:
@@ -465,7 +467,7 @@ def create_agent(slug: str, agent: dict[str, Any]) -> tuple[bool, str]:
         )
 
     try:
-        target.mkdir(parents=True, exist_ok=False)
+        target.mkdir(parents=True, exist_ok=True)
         for relpath, content in files_to_write.items():
             fp = target / relpath
             fp.parent.mkdir(parents=True, exist_ok=True)
@@ -481,7 +483,8 @@ def create_agent(slug: str, agent: dict[str, Any]) -> tuple[bool, str]:
             raise RuntimeError(f"yaml update failed: {msg}")
     except Exception as e:
         import shutil as _shutil
-        if target.exists():
+        # Only wipe the folder if WE created it — don't destroy pre-existing work.
+        if target.exists() and not folder_pre_exists:
             _shutil.rmtree(target, ignore_errors=True)
         return False, f"rollback: {e}"
 

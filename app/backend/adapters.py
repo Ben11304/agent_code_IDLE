@@ -136,10 +136,17 @@ async def claude_stream(
                             yield {"type": "delta", "text": text}
             elif etype == "result":
                 final = evt.get("result") or "".join(assembled)
+                # Real token usage for this turn. For a resumed session the bulk
+                # of the prompt lands in cache_read_input_tokens, so the context
+                # window occupancy is the SUM of all input buckets + output.
+                usage = evt.get("usage") or {}
+                if usage:
+                    yield {"type": "meta", "data": {"usage": usage}}
                 yield {"type": "done", "text": final, "meta": {
                     "duration_ms": evt.get("duration_ms"),
                     "total_cost_usd": evt.get("total_cost_usd"),
                     "claude_session_id": claude_session_id,
+                    "usage": usage,
                 }}
                 return
     finally:
