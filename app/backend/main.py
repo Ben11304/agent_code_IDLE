@@ -1,8 +1,12 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
+import os
 import re
+import time
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
 
@@ -40,6 +44,99 @@ DISPATCH_RE = re.compile(
     r'<dispatch\s+agent="([^"]+)"\s*>([\s\S]*?)</dispatch>',
     re.IGNORECASE,
 )
+
+# Step-by-step protocol tags, parsed from the stream like <dispatch>. <plan>
+# declares (or replaces) the agent's step list; <step> marks one step's status.
+# Persisted to the agent's own `state/plan.md` so the plan survives sessions.
+PLAN_RE = re.compile(r'<plan>([\s\S]*?)</plan>', re.IGNORECASE)
+STEP_RE = re.compile(
+    r'<step\s+n="(\d+)"\s+status="(pending|doing|done|blocked)"\s*(?:/>|>([\s\S]*?)</step>)',
+    re.IGNORECASE,
+)
+
+_PLAN_LINE_RE = re.compile(r"^\s*(\d+)\.\s*\[([ x~!])\]\s*(.*)$")
+_PLAN_STATUS_MARK = {"pending": " ", "doing": "~", "done": "x", "blocked": "!"}
+_MARK_TO_STATUS = {" ": "pending", "~": "doing", "x": "done", "!": "blocked"}
+
+_PLAN_INSTRUCTIONS = (
+    "\n\n## Step-by-step protocol (control-plane parsed — BẮT BUỘC cho task nhiều bước)\n"
+    "Task có ≥2 bước rõ rệt: emit kế hoạch TRƯỚC khi bắt tay làm, dạng tag:\n"
+    "<plan>\n1. bước một\n2. bước hai\n</plan>\n"
+    "Rồi NGAY SAU KHI xong/bắt đầu/kẹt mỗi bước, emit:\n"
+    "<step n=\"1\" status=\"done\">ghi chú 1 dòng (tùy chọn)</step>\n"
+    "status hợp lệ: doing | done | blocked. Control-plane parse tag realtime, persist vào "
+    "`state/plan.md` (sống qua session) và hiện tiến độ trên graph — kể lể bước mà không emit "
+    "tag là VÔ HÌNH với user. Khi thức dậy ở session mới mà `state/plan.md` còn bước dở → "
+    "TIẾP TỤC từ bước đó, KHÔNG re-plan trừ khi user yêu cầu."
+)
+
+
+def _extract_plan_steps(body: str) -> list[str]:
+    steps = []
+    for ln in body.splitlines():
+        s = re.sub(r"^(?:\d+[.)]|[-*•])\s*", "", ln.strip()).strip()
+        if s:
+            steps.append(s)
+    return steps
+
+
+def _write_plan_file(path: Path, agent_id: str, steps: list[str]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    lines = [
+        f"# Plan — {agent_id}",
+        "_(control-plane managed — cập nhật qua tag `<plan>`/`<step>`, không sửa tay)_",
+        "",
+    ]
+    lines += [f"{i}. [ ] {s}" for i, s in enumerate(steps, 1)]
+    path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+
+def _set_plan_step(path: Path, n: int, status: str, note: str = "") -> bool:
+    mark = _PLAN_STATUS_MARK.get(status)
+    if mark is None:
+        return False
+    try:
+        lines = path.read_text(encoding="utf-8").splitlines()
+    except OSError:
+        return False
+    for i, ln in enumerate(lines):
+        m = _PLAN_LINE_RE.match(ln)
+        if m and int(m.group(1)) == n:
+            text = m.group(3)
+            if note:
+                text = f"{text} — {note}"
+            lines[i] = f"{m.group(1)}. [{mark}] {text}"
+            path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+            return True
+    return False
+
+
+def _read_plan(path: Path) -> Optional[dict]:
+    """Parse plan.md → progress summary for the stats panel / preamble."""
+    try:
+        lines = path.read_text(encoding="utf-8").splitlines()
+    except OSError:
+        return None
+    steps = []
+    for ln in lines:
+        m = _PLAN_LINE_RE.match(ln)
+        if m:
+            steps.append({
+                "n": int(m.group(1)),
+                "status": _MARK_TO_STATUS.get(m.group(2), "pending"),
+                "text": m.group(3),
+            })
+    if not steps:
+        return None
+    done = sum(1 for s in steps if s["status"] == "done")
+    cur = (next((s for s in steps if s["status"] in ("doing", "blocked")), None)
+           or next((s for s in steps if s["status"] == "pending"), None))
+    return {
+        "total": len(steps),
+        "done": done,
+        "blocked": any(s["status"] == "blocked" for s in steps),
+        "current": f'{cur["n"]}. {cur["text"]}' if cur else None,
+    }
 
 # Size guard when injecting a worker result back into the orchestrator's prompt.
 # Larger results are truncated head+tail with a marker; the full output remains in
@@ -124,6 +221,39 @@ def api_project(slug: str):
 _CONTEXT_WINDOWS = {"claude": 200_000, "grok": 256_000}
 
 
+def _usage_ctx_tokens(usage: dict) -> int:
+    """Context-window occupancy from a CLI usage blob = the LARGEST single API
+    request in the turn, NOT the top-level sums (cumulative billing across
+    agentic rounds — routinely exceeds the window). Shared by the stats endpoint
+    and the auto-compact threshold check."""
+    def _req_total(d: dict) -> int:
+        return (
+            (d.get("input_tokens") or 0)
+            + (d.get("cache_creation_input_tokens") or 0)
+            + (d.get("cache_read_input_tokens") or 0)
+            + (d.get("output_tokens") or 0)
+        )
+    iters = usage.get("iterations") or []
+    if iters:
+        return max(_req_total(it) for it in iters)
+    return _req_total(usage)
+
+
+def _session_context_pct(sess: Optional[dict], model_kind: str) -> float:
+    """Context % of a session's last completed turn, 0.0 when unknown (no usage
+    recorded yet — fresh session, or a grok node which reports no usage)."""
+    if not sess or not sess.get("usage"):
+        return 0.0
+    try:
+        usage = json.loads(sess["usage"])
+    except (ValueError, TypeError):
+        return 0.0
+    window = _CONTEXT_WINDOWS.get(model_kind, 200_000)
+    if not window:
+        return 0.0
+    return round(_usage_ctx_tokens(usage) / window * 100.0, 1)
+
+
 def _memory_info(project_root: str, agent: dict, cwd_abs: str) -> Optional[dict]:
     """Inspect an agent's persistent memory file (`state/progress.md`): when it
     was last written and the most recent dated headline. Returns None if absent.
@@ -174,6 +304,121 @@ def _memory_info(project_root: str, agent: dict, cwd_abs: str) -> Optional[dict]
     return {"path": rel, "mtime": st.st_mtime, "headline": headline}
 
 
+def _agent_dir(project_root: str, agent: dict, cwd_abs: str) -> Path:
+    """The agent's OWN folder (where `state/` lives) — parent of its
+    `system_prompt_file`, else `cwd`, else the `<ID>` convention. Mirrors the
+    resolution order in `_memory_info` so the rollup lands beside progress.md."""
+    root = Path(project_root)
+    spf = agent.get("system_prompt_file") or ""
+    if spf:
+        return (root / spf).parent
+    if cwd_abs:
+        return Path(cwd_abs)
+    return root / agent["id"]
+
+
+def _iso(ts) -> Optional[str]:
+    if not ts:
+        return None
+    try:
+        return datetime.fromtimestamp(ts, timezone.utc).astimezone().isoformat(timespec="seconds")
+    except (OSError, OverflowError, ValueError):
+        return None
+
+
+def _file_hash(project_root: str, rel_path: Optional[str]) -> Optional[str]:
+    """sha256 of a child's progress.md content, so the rollup can detect a real
+    content change (not just an mtime touch). Short prefix is enough to compare."""
+    if not rel_path:
+        return None
+    p = Path(project_root) / rel_path
+    try:
+        h = hashlib.sha256(p.read_bytes()).hexdigest()
+        return "sha256:" + h[:16]
+    except OSError:
+        return None
+
+
+# A child that was active much more recently than it last wrote its memory file
+# has been working without persisting — the exact "active 6h ago, memory 9 days
+# stale" failure the rollup is meant to surface. Threshold: 6 hours.
+_STALE_MEMORY_GAP_S = 6 * 3600
+
+# status (raw session state) → coarse job status for the parent rollup. We only
+# emit what we can actually observe; we do NOT fabricate "done"/"blocked".
+_JOB_STATUS = {"running": "in_progress", "ok": "idle", "error": "failed", "idle": "idle"}
+
+
+def _write_children_rollups(project_root: str, project: dict, stats: dict) -> list[str]:
+    """For every agent that HAS children, write a read-only, AUTO-DERIVED rollup
+    of its children's job status to `<parent>/state/children_status.json`.
+
+    This is a *projection* of the per-agent stats we already computed — never a
+    hand-written second memory. The parent must never edit it. Writes are atomic
+    and skipped when the meaningful payload is unchanged (only `generated_at`
+    would differ), so polling `/stats` on every graph refresh does not churn git.
+    """
+    agents = project["agents"]
+    written: list[str] = []
+    now = time.time()
+    for parent in agents:
+        pid = parent["id"]
+        child_ids = [a["id"] for a in agents if pid in (a.get("parents") or [])]
+        if not child_ids:
+            continue
+        children: dict = {}
+        for cid in child_ids:
+            st = stats.get(cid) or {}
+            mem = st.get("memory") or {}
+            mtime = mem.get("mtime")
+            last_act = st.get("updated_at")
+            stale = bool(last_act and mtime and (last_act - mtime) > _STALE_MEMORY_GAP_S)
+            children[cid] = {
+                "status": _JOB_STATUS.get(st.get("status"), st.get("status") or "idle"),
+                "context_pct": st.get("context_pct"),
+                "context_tokens": st.get("context_tokens"),
+                "message_count": st.get("message_count"),
+                "last_activity": last_act,
+                "last_activity_iso": _iso(last_act),
+                "memory_mtime": mtime,
+                "memory_updated_iso": _iso(mtime),
+                "memory_headline": mem.get("headline") or None,
+                "memory_hash": _file_hash(project_root, mem.get("path")),
+                "stale_memory": stale,
+            }
+        digest = hashlib.sha256(
+            json.dumps(children, sort_keys=True, ensure_ascii=False).encode("utf-8")
+        ).hexdigest()[:16]
+        state_dir = _agent_dir(project_root, parent, projects.resolve_cwd(project_root, parent.get("cwd", "."))) / "state"
+        out = state_dir / "children_status.json"
+        # Skip rewrite if the substantive payload is identical to what is on disk.
+        try:
+            prev = json.loads(out.read_text(encoding="utf-8"))
+            if prev.get("digest") == digest:
+                continue
+        except (OSError, ValueError):
+            pass
+        body = {
+            "generated_at": _iso(now),
+            "generated_by": "agentui control-plane (DERIVED, read-only — do NOT hand-edit)",
+            "parent": pid,
+            "digest": digest,
+            "children": children,
+        }
+        try:
+            state_dir.mkdir(parents=True, exist_ok=True)
+            tmp = out.with_suffix(".json.tmp")
+            tmp.write_text(json.dumps(body, indent=2, ensure_ascii=False), encoding="utf-8")
+            os.replace(tmp, out)
+            try:
+                written.append(str(out.resolve().relative_to(Path(project_root).resolve())))
+            except ValueError:
+                written.append(str(out))
+        except OSError:
+            pass
+    return written
+
+
 @app.get("/api/projects/{slug}/stats")
 def api_project_stats(slug: str):
     """Per-agent runtime stats for the expandable graph panels: status, effective
@@ -222,12 +467,7 @@ def api_project_stats(slug: str):
         # output. Fall back to a chars/4 estimate only when no usage is recorded
         # yet (e.g. a session that has never completed a turn, or a grok node).
         if usage:
-            ctx_tokens = (
-                (usage.get("input_tokens") or 0)
-                + (usage.get("cache_creation_input_tokens") or 0)
-                + (usage.get("cache_read_input_tokens") or 0)
-                + (usage.get("output_tokens") or 0)
-            )
+            ctx_tokens = _usage_ctx_tokens(usage)
             token_source = "exact"
         else:
             sys_chars = 0
@@ -255,8 +495,19 @@ def api_project_stats(slug: str):
             "has_session": has_session,
             "num_sessions": len(sessions),
             "memory": _memory_info(root, a, cwd_abs),
+            "plan": _read_plan(_agent_dir(root, a, cwd_abs) / "state" / "plan.md"),
         }
-    return {"stats": stats}
+    rollups = _write_children_rollups(root, project, stats)
+    return {"stats": stats, "rollups_written": rollups}
+
+
+@app.post("/api/projects/{slug}/rollup")
+def api_project_rollup(slug: str):
+    """Force-regenerate every parent's `state/children_status.json` from the
+    current per-agent stats. Same derivation as the `/stats` side-effect, exposed
+    standalone so a parent agent (or the UI) can refresh the rollup on demand."""
+    data = api_project_stats(slug)
+    return {"rollups_written": data.get("rollups_written", [])}
 
 
 class AgentSettings(BaseModel):
@@ -505,6 +756,62 @@ def api_add_agent(slug: str, body: NewAgent):
     return {"ok": True, "project": refreshed}
 
 
+# ----- New-project creation (scaffold a fresh agent system) -----
+
+class NewProject(BaseModel):
+    root: str
+    name: Optional[str] = None
+    slug: Optional[str] = None
+    description: Optional[str] = ""
+    agents: list = []  # [{id, role, model, claude_model?, grok_model?, effort?, parents?}]
+
+
+@app.get("/api/fs/validate")
+def api_fs_validate(path: str):
+    p = Path(path).expanduser()
+    return {
+        "path": str(p),
+        "exists": p.exists(),
+        "is_dir": p.is_dir() if p.exists() else None,
+        "is_project": (p / ".agentui" / "project.yaml").exists(),
+        "non_empty": bool(p.is_dir() and any(p.iterdir())) if p.exists() else False,
+        "parent_exists": p.parent.exists(),
+    }
+
+
+def _validate_project_agents(agents: list) -> None:
+    ids = [a.get("id") for a in agents]
+    if len(ids) != len(set(ids)):
+        raise HTTPException(400, "trùng agent id trong danh sách")
+    for a in agents:
+        if not _AGENT_ID_RE.match(a.get("id") or ""):
+            raise HTTPException(400, f"agent id không hợp lệ (UPPERCASE): {a.get('id')}")
+        if a.get("model", "claude") not in ("claude", "grok"):
+            raise HTTPException(400, f"model phải claude|grok: {a.get('id')}")
+        for p in a.get("parents") or []:
+            if p not in ids:
+                raise HTTPException(400, f"parent '{p}' không có trong project (agent {a.get('id')})")
+        if a.get("id") in (a.get("parents") or []):
+            raise HTTPException(400, f"agent không thể là parent của chính nó: {a.get('id')}")
+
+
+@app.post("/api/projects/preview-create")
+def api_preview_create(body: NewProject):
+    _validate_project_agents(body.agents or [])
+    return projects.preview_project(body.model_dump())
+
+
+@app.post("/api/projects/create")
+def api_create_project(body: NewProject):
+    if not body.root or not body.root.strip():
+        raise HTTPException(400, "thiếu đường dẫn thư mục dự án")
+    _validate_project_agents(body.agents or [])
+    ok, msg, slug = projects.create_project(body.model_dump())
+    if not ok:
+        raise HTTPException(400, msg)
+    return {"ok": True, "slug": slug, "projects": projects.list_projects()}
+
+
 @app.post("/api/projects/{slug}/agents/{agent_id}/clear")
 def api_clear_session(slug: str, agent_id: str):
     found = projects.get_agent(slug, agent_id)
@@ -524,6 +831,47 @@ def api_set_agent_settings(slug: str, agent_id: str, body: AgentSettings):
                           grok_model=body.grok_model,
                           effort=body.effort)
     return {"ok": True}
+
+
+@app.get("/api/skills")
+def api_skills():
+    """List installed global Agent Skills (~/.claude/skills/*/SKILL.md) with name +
+    description parsed from each SKILL.md YAML frontmatter. Read-only reference for
+    the UI's Skills panel — the user decides when to use them."""
+    skills_dir = Path.home() / ".claude" / "skills"
+    out = []
+    if skills_dir.is_dir():
+        for d in sorted(skills_dir.iterdir()):
+            sk = d / "SKILL.md"
+            if not d.is_dir() or not sk.is_file():
+                continue
+            name, desc = d.name, ""
+            try:
+                text = sk.read_text(encoding="utf-8", errors="replace")
+                if text.lstrip().startswith("---"):
+                    fm = text.split("---", 2)[1]
+                    cur = None
+                    for line in fm.splitlines():
+                        if line.startswith("name:"):
+                            name = line.split(":", 1)[1].strip().strip('"\'')
+                            cur = None
+                        elif line.startswith("description:"):
+                            val = line.split(":", 1)[1].strip()
+                            # YAML block scalar (">", ">-", "|", "|-", "|+") → body is
+                            # the following indented lines; the indicator is not text.
+                            if not val or val[0] in ">|":
+                                desc = ""
+                            else:
+                                desc = val.strip('"\'')
+                            cur = "description"
+                        elif cur == "description" and line.startswith(("  ", "\t")):
+                            desc = (desc + " " + line.strip()).strip()  # folded continuation
+                        elif line and not line[0].isspace():
+                            cur = None
+            except Exception:
+                pass
+            out.append({"name": name, "description": desc, "dir": d.name})
+    return {"skills": out}
 
 
 @app.get("/api/workspace/info")
@@ -734,6 +1082,96 @@ def _dispatch_instructions(children: list[str]) -> str:
     )
 
 
+def _read_capped(p: Path, max_chars: int) -> str:
+    try:
+        txt = p.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return ""
+    txt = txt.strip()
+    if len(txt) > max_chars:
+        txt = txt[:max_chars].rstrip() + "\n[… cắt bớt — đọc file đầy đủ nếu cần]"
+    return txt
+
+
+def _progress_excerpt(p: Path, max_sections: int = 2, max_chars: int = 2600) -> str:
+    """First N dated `## ` sections of progress.md (newest first by convention)."""
+    try:
+        lines = p.read_text(encoding="utf-8", errors="replace").splitlines()
+    except OSError:
+        return ""
+    out: list[str] = []
+    sections = 0
+    for ln in lines:
+        if ln.startswith("## "):
+            sections += 1
+            if sections > max_sections:
+                break
+        out.append(ln)
+        if sum(len(x) + 1 for x in out) > max_chars:
+            out.append("[… cắt bớt]")
+            break
+    return "\n".join(out).strip()
+
+
+def _session_preamble(project_root: str, agent: dict, cwd_abs: str) -> str:
+    """Deterministic cold-start recap injected whenever the CLI session can NOT
+    be resumed (brand-new session, post-/clear, or torn last turn). Built ONLY
+    from the agent's persistent files — same sources every time — so every
+    wake-up starts from the same structured state instead of amnesia.
+
+    Order of precedence elsewhere: a /compact seed (richer, conversation-aware)
+    replaces this; the preamble is the fallback floor.
+    """
+    adir = _agent_dir(project_root, agent, cwd_abs)
+    parts: list[str] = []
+
+    prog = adir / "state" / "progress.md"
+    if prog.is_file():
+        ex = _progress_excerpt(prog)
+        if ex:
+            parts.append(f"### Bộ nhớ của bạn (`state/progress.md`, mới nhất trước)\n{ex}")
+
+    plan_p = adir / "state" / "plan.md"
+    if plan_p.is_file() and _read_plan(plan_p):
+        ex = _read_capped(plan_p, 1200)
+        if ex:
+            parts.append(
+                "### Plan đang dở (`state/plan.md`) — TIẾP TỤC từ bước dở, đừng re-plan\n" + ex
+            )
+
+    roll = adir / "state" / "children_status.json"
+    if roll.is_file():
+        try:
+            data = json.loads(roll.read_text(encoding="utf-8"))
+            rows = []
+            for cid, c in (data.get("children") or {}).items():
+                stale = " ⚠ STALE-MEMORY" if c.get("stale_memory") else ""
+                rows.append(
+                    f"- {cid}: {c.get('status')}, ctx {c.get('context_pct')}%, "
+                    f"hoạt động {c.get('last_activity_iso') or '—'}, "
+                    f"memory {c.get('memory_updated_iso') or '—'}{stale}"
+                    + (f" — {c['memory_headline']}" if c.get("memory_headline") else "")
+                )
+            if rows:
+                parts.append("### Trạng thái các worker của bạn (derived, read-only)\n" + "\n".join(rows))
+        except (OSError, ValueError):
+            pass
+
+    man = adir / "inputs" / "manifest.md"
+    if man.is_file():
+        ex = _read_capped(man, 1200)
+        if ex:
+            parts.append(f"### Input contract (`inputs/manifest.md`)\n{ex}")
+
+    if not parts:
+        return ""
+    return (
+        "[CONTROL-PLANE COLD-START] Phiên CLI mới (không resume được phiên trước). "
+        "Dưới đây là trạng thái bền vững của bạn — đọc trước khi làm:\n\n"
+        + "\n\n".join(parts)
+    )
+
+
 async def _run_agent(
     slug: str,
     agent_id: str,
@@ -776,11 +1214,26 @@ async def _run_agent(
         consumed_ids = [int(r["id"]) for r in pending_results]
     # ----- END LEDGER ENRICHMENT -----
 
+    # ----- SEED ENRICHMENT (compact recap) -----
+    # A fresh session created by /compact carries a one-time recap of the prior
+    # (compacted) session. Prepend it so the model continues seamlessly with a
+    # small context, then clear it after a clean turn.
+    seed_text = sess.get("seed")
+    if seed_text:
+        message = (
+            "[COMPACTED CONTEXT] Recap của session trước (đã compact để giảm context). "
+            "Dùng làm nền để tiếp tục liền mạch:\n\n"
+            + seed_text + "\n\n---\n\n" + message
+        )
+    # ----- END SEED ENRICHMENT -----
+
     system_prompt = projects.resolve_system_prompt(project["root"], agent.get("system_prompt_file", ""))
     cwd = projects.resolve_cwd(project["root"], agent.get("cwd", "."))
     children = _get_children(project, agent_id)
     if children:
         system_prompt = (system_prompt or "") + _dispatch_instructions(children)
+    system_prompt = (system_prompt or "") + _PLAN_INSTRUCTIONS
+    plan_path = _agent_dir(project["root"], agent, cwd) / "state" / "plan.md"
 
     model = agent.get("model", "claude")
     stream_fn = get_stream(model)
@@ -794,6 +1247,17 @@ async def _run_agent(
     # "error" cannot be safely resumed: claude --resume into a half-finished
     # state often returns empty or hangs silently. Better to start fresh.
     resume_sid = sess.get("claude_session_id") if sess.get("last_status") == "ok" else None
+
+    # ----- COLD-START PREAMBLE -----
+    # No resumable CLI session → the model wakes up with amnesia (only AGENT.md).
+    # Inject the deterministic recap built from its persistent files so every
+    # wake-up starts from the same state. A /compact seed (prepended above) is
+    # richer and conversation-aware, so it takes precedence over this floor.
+    if resume_sid is None and not seed_text:
+        preamble = _session_preamble(project["root"], agent, cwd)
+        if preamble:
+            message = preamble + "\n\n---\n\n" + message
+    # ----- END COLD-START PREAMBLE -----
 
     if model == "claude":
         agen = stream_fn(
@@ -823,6 +1287,8 @@ async def _run_agent(
     assembled: list[str] = []
     buf = ""
     dispatched: set = set()
+    plan_seen: set = set()
+    step_seen: set = set()
     final_status = "ok"
     new_chain = chain + (agent_id,)
 
@@ -867,6 +1333,28 @@ async def _run_agent(
                         _dispatched_run(slug, agent_id, target, task, emit, tracker, new_chain)
                     )
                     tracker.append(task_handle)
+                # plan / step tags → persist to state/plan.md + notify graph
+                for m in PLAN_RE.finditer(buf):
+                    if m.start() in plan_seen:
+                        continue
+                    plan_seen.add(m.start())
+                    steps = _extract_plan_steps(m.group(1))
+                    if steps:
+                        try:
+                            _write_plan_file(plan_path, agent_id, steps)
+                            await emit({"type": "plan_updated", "agent": agent_id, "total": len(steps)})
+                        except OSError:
+                            pass
+                for m in STEP_RE.finditer(buf):
+                    if m.start() in step_seen:
+                        continue
+                    step_seen.add(m.start())
+                    note = (m.group(3) or "").strip()
+                    if len(note) > 200:
+                        note = note[:200] + "…"
+                    if _set_plan_step(plan_path, int(m.group(1)), m.group(2).lower(), note):
+                        await emit({"type": "plan_step", "agent": agent_id,
+                                    "n": int(m.group(1)), "status": m.group(2).lower()})
                 await emit({"type": "delta", "agent": agent_id, "text": text})
             elif etype == "meta":
                 data = evt.get("data") or {}
@@ -897,9 +1385,48 @@ async def _run_agent(
         # cancelled, leave the rows so the next attempt can still see them.
         if consumed_ids and final_status == "ok":
             db.consume_results(consumed_ids, sess["id"])
+        if seed_text and final_status == "ok":
+            db.clear_session_seed(sess["id"])
         await emit({"type": "agent_done", "agent": agent_id, "text": final_text, "status": final_status})
 
     return "".join(assembled)
+
+
+def _manifest_snapshot(slug: str, agent_id: str) -> Optional[dict]:
+    """mtime + version of a worker's outputs/manifest.md, for the contract
+    verify around a dispatch. None when the agent has no manifest."""
+    found = projects.get_agent(slug, agent_id)
+    if not found:
+        return None
+    project, agent = found
+    cwd_abs = projects.resolve_cwd(project["root"], agent.get("cwd", "."))
+    man = _agent_dir(project["root"], agent, cwd_abs) / "outputs" / "manifest.md"
+    try:
+        st = man.stat()
+    except OSError:
+        return None
+    version = None
+    try:
+        lines = man.read_text(encoding="utf-8", errors="replace").splitlines()[:40]
+        for i, line in enumerate(lines):
+            # frontmatter style: `version: 2.10.0`
+            m = re.match(r"\s*version:\s*([\w.\-]+)", line, re.IGNORECASE)
+            if m:
+                version = m.group(1)
+                break
+            # heading style: `## Version` then the value on a following line
+            if re.match(r"#+\s*version\s*$", line.strip(), re.IGNORECASE):
+                for nxt in lines[i + 1:i + 4]:
+                    nxt = nxt.strip()
+                    if nxt:
+                        vm = re.match(r"([\w.\-]+)", nxt)
+                        if vm:
+                            version = vm.group(1)
+                        break
+                break
+    except OSError:
+        pass
+    return {"mtime": st.st_mtime, "version": version}
 
 
 async def _dispatched_run(slug, source_id, target_id, task, emit, tracker, chain):
@@ -910,6 +1437,7 @@ async def _dispatched_run(slug, source_id, target_id, task, emit, tracker, chain
     status = "ok"
     error_msg = None
     result_text = ""
+    manifest_before = _manifest_snapshot(slug, target_id)
     try:
         result_text = await _run_agent(slug, target_id, task, emit, tracker, chain) or ""
         # _run_agent sets final_status internally (e.g. to "error" on
@@ -946,6 +1474,24 @@ async def _dispatched_run(slug, source_id, target_id, task, emit, tracker, chain
         status = "error"
         error_msg = str(e)
 
+    # Contract verify: did the worker publish via outputs/manifest.md? A soft
+    # flag (not a block) — answer-only dispatches legitimately don't bump it.
+    # The note rides inside the ledger text so the orchestrator model reacts.
+    if status == "ok" and manifest_before is not None:
+        after = _manifest_snapshot(slug, target_id)
+        if after and after["mtime"] == manifest_before["mtime"]:
+            result_text = (result_text or "") + (
+                f"\n\n[control-plane verify] outputs/manifest.md của {target_id} KHÔNG đổi "
+                f"trong dispatch này (vẫn version {after.get('version') or '?'}). Nếu task "
+                "tạo/sửa artifact downstream → kết quả CHƯA công bố đúng contract; yêu cầu "
+                "worker bump manifest trước khi consume."
+            )
+        elif after:
+            result_text = (result_text or "") + (
+                f"\n\n[control-plane verify] outputs/manifest.md đã cập nhật "
+                f"(version {manifest_before.get('version') or '?'} → {after.get('version') or '?'})."
+            )
+
     db.record_dispatch_result(
         project_slug=slug, source_agent=source_id, target_agent=target_id,
         task=task,
@@ -960,6 +1506,65 @@ async def _dispatched_run(slug, source_id, target_id, task, emit, tracker, chain
         "status": status,
         "message": error_msg,
     })
+
+
+# Above this share of the context window, the next user turn triggers an
+# automatic compact (summary → fresh seeded session) BEFORE the turn runs.
+# 80% leaves enough headroom for the summary turn itself to complete.
+_AUTO_COMPACT_PCT = 80.0
+
+# Continuation budget per user turn: how many times the orchestrator may react
+# to completed dispatches (and chain new ones) within one SSE response.
+_MAX_CONT_ROUNDS = 3
+
+
+async def _auto_compact_if_needed(slug: str, agent_id: str, emit) -> bool:
+    """If the agent's active session is above the auto-compact threshold, run
+    the compact flow (same as /compact) before the user's turn: the agent
+    summarises its context, a fresh session is created seeded with the recap.
+    Returns True if a compact happened.
+
+    Torn sessions (last_status != ok) are skipped: they cannot be resumed
+    anyway, so the next turn starts a fresh CLI session and the cold-start
+    preamble covers recovery — compacting would just waste a turn.
+    """
+    found = projects.get_agent(slug, agent_id)
+    if not found:
+        return False
+    _, agent = found
+    sessions = db.list_sessions(slug, agent_id)
+    sess = sessions[0] if sessions else None
+    if not sess or sess.get("last_status") != "ok" or not sess.get("claude_session_id"):
+        return False
+    pct = _session_context_pct(sess, agent.get("model", "claude"))
+    if pct < _AUTO_COMPACT_PCT:
+        return False
+
+    await emit({"type": "compact_started", "agent": agent_id, "auto": True, "pct": pct})
+    tracker: list = []
+    summary = (await _run_agent(slug, agent_id, _COMPACT_PROMPT, emit, tracker) or "").strip()
+    if tracker:
+        await asyncio.gather(*tracker, return_exceptions=True)
+    new_sess = db.new_session(slug, agent_id)
+    if summary:
+        db.set_session_seed(new_sess["id"], summary)
+        db.add_message(
+            new_sess["id"], "assistant",
+            f"📦 **Auto-compact @ {pct}% context** — session mới được seed bằng recap dưới đây. "
+            "Lượt kế tiếp tiếp tục từ recap này.\n\n---\n\n" + summary,
+        )
+    else:
+        # Summary turn failed (likely the old session was too overloaded to
+        # answer). Still rotate to a fresh session — staying at >80% is worse.
+        # The cold-start preamble (state/progress.md) covers recovery.
+        db.add_message(
+            new_sess["id"], "assistant",
+            f"📦 **Auto-compact @ {pct}% context** — recap rỗng (session cũ quá tải?); "
+            "session mới sẽ khởi động bằng cold-start preamble từ `state/progress.md`.",
+        )
+    db.update_session_status(new_sess["id"], "ok")
+    await emit({"type": "compacted", "agent": agent_id, "new_session_id": new_sess["id"], "auto": True})
+    return True
 
 
 @app.post("/api/projects/{slug}/agents/{agent_id}/chat")
@@ -982,37 +1587,50 @@ async def api_chat(slug: str, agent_id: str, body: ChatBody):
     } if (body.best_of_n or body.check_loop or body.memory_mode) else None
 
     async def driver():
-        cont_tracker: list = []
+        # Multi-round continuation: after each wave of dispatches lands in the
+        # ledger, the orchestrator gets another turn to react — synthesise, or
+        # chain follow-up dispatches — inside the SAME SSE response, up to
+        # _MAX_CONT_ROUNDS. Dispatches fired on the final round still run to
+        # completion (results land in the ledger for the NEXT user turn); they
+        # just don't trigger another continuation.
+        all_tasks: list = []
+        cur: list = tracker
         try:
-            await _run_agent(slug, agent_id, body.message, emit, tracker,
+            await _auto_compact_if_needed(slug, agent_id, emit)
+            await _run_agent(slug, agent_id, body.message, emit, cur,
                              grok_options=grok_options)
-            if tracker:
-                await asyncio.gather(*tracker, return_exceptions=True)
-                # Bounded continuation: now that worker results are in the
-                # ledger, run the orchestrator one more time so it can react
-                # inside the SAME SSE response (the enrichment in _run_agent
-                # will pull the unconsumed results into the prompt). Capped at
-                # one extra turn — any further dispatch happens but does not
-                # trigger another auto-continuation.
+            rounds = 0
+            while cur and rounds < _MAX_CONT_ROUNDS:
+                await asyncio.gather(*cur, return_exceptions=True)
+                all_tasks.extend(cur)
+                rounds += 1
+                last = rounds >= _MAX_CONT_ROUNDS
                 synth = (
-                    "[CONTROL-PLANE CONTINUATION] All worker dispatches you fired in the "
-                    "previous response have completed. Their outputs are provided as "
-                    "<dispatch_result> blocks at the top of this message. Reason over the "
-                    "real data and either: produce your final answer / summary for the user, "
-                    "or — if the results require it — emit the next dispatch tag(s). "
-                    "Do NOT re-emit the same tasks. Do NOT say you are still waiting."
+                    f"[CONTROL-PLANE CONTINUATION {rounds}/{_MAX_CONT_ROUNDS}] All worker "
+                    "dispatches from your previous response have completed. Their outputs are "
+                    "provided as <dispatch_result> blocks at the top of this message. Reason "
+                    "over the real data and "
+                    + (
+                        "produce your final answer / summary for the user NOW. Continuation "
+                        "budget is EXHAUSTED — do NOT emit further dispatch tags; work with "
+                        "what you have and report anything unfinished."
+                        if last else
+                        "either: produce your final answer / summary for the user, or — only "
+                        "if the results require it — emit the next dispatch tag(s). Do NOT "
+                        "re-emit the same tasks. Do NOT say you are still waiting."
+                    )
                 )
-                await _run_agent(slug, agent_id, synth, emit, cont_tracker)
-                if cont_tracker:
-                    await asyncio.gather(*cont_tracker, return_exceptions=True)
+                cur = []
+                await _run_agent(slug, agent_id, synth, emit, cur)
+            if cur:
+                await asyncio.gather(*cur, return_exceptions=True)
+                all_tasks.extend(cur)
         except asyncio.CancelledError:
-            for t in tracker + cont_tracker:
-                if not t.done():
-                    t.cancel()
-            if tracker:
-                await asyncio.gather(*tracker, return_exceptions=True)
-            if cont_tracker:
-                await asyncio.gather(*cont_tracker, return_exceptions=True)
+            pending = [t for t in all_tasks + cur if not t.done()]
+            for t in pending:
+                t.cancel()
+            if all_tasks or cur:
+                await asyncio.gather(*(all_tasks + cur), return_exceptions=True)
             raise
         except Exception as e:
             await queue.put({"type": "error", "agent": agent_id, "message": str(e)})
@@ -1031,6 +1649,88 @@ async def api_chat(slug: str, agent_id: str, body: ChatBody):
                     # silently close the SSE and the chat appears to hang as
                     # "đã dừng" with no response. The comment line is not a
                     # data event, so the frontend ignores it.
+                    evt = await asyncio.wait_for(queue.get(), timeout=15.0)
+                except asyncio.TimeoutError:
+                    yield ": keepalive\n\n"
+                    continue
+                if evt is None:
+                    break
+                yield _sse(evt)
+            yield _sse({"type": "complete"})
+        finally:
+            if not task.done():
+                task.cancel()
+
+    return StreamingResponse(
+        sse(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache, no-transform",
+            "X-Accel-Buffering": "no",
+            "Connection": "keep-alive",
+        },
+    )
+
+
+_COMPACT_PROMPT = (
+    "[CONTROL-PLANE COMPACT — không phải task thường] Tóm tắt toàn bộ công việc & hội thoại "
+    "của session này thành một bản RECAP ngắn gọn để CHÍNH BẠN tiếp tục ở session mới với ít "
+    "context hơn. Bao gồm: trạng thái hiện tại, các quyết định đã chốt + lý do ngắn, artifact/version "
+    "đang dùng (path + version), việc đang dở, câu hỏi mở / chờ user. KHÔNG lặp nguyên văn — chỉ giữ "
+    "thông tin tối thiểu cần để tiếp tục liền mạch. KHÔNG dispatch. Output CHỈ bản recap (markdown), "
+    "không lời dẫn."
+)
+
+
+@app.post("/api/projects/{slug}/agents/{agent_id}/compact")
+async def api_compact(slug: str, agent_id: str):
+    """Compact a long session: the agent summarises its own context, then a fresh
+    session is created seeded with that recap (prepended to its next turn). The
+    old session/history stays in the db; the new one starts with small context."""
+    found = projects.get_agent(slug, agent_id)
+    if not found:
+        raise HTTPException(404, "agent not found")
+
+    queue: asyncio.Queue = asyncio.Queue()
+
+    async def emit(evt):
+        await queue.put(evt)
+
+    tracker: list = []
+
+    async def driver():
+        try:
+            summary = await _run_agent(slug, agent_id, _COMPACT_PROMPT, emit, tracker)
+            if tracker:
+                await asyncio.gather(*tracker, return_exceptions=True)
+            summary = (summary or "").strip()
+            if not summary:
+                await queue.put({"type": "error", "agent": agent_id,
+                                 "message": "compact: recap rỗng — không tạo session mới"})
+            else:
+                new_sess = db.new_session(slug, agent_id)
+                db.set_session_seed(new_sess["id"], summary)
+                db.add_message(
+                    new_sess["id"], "assistant",
+                    "📦 **Context compacted** — session mới được seed bằng recap dưới đây. "
+                    "Lượt kế tiếp sẽ tiếp tục từ recap này (context nhỏ lại).\n\n---\n\n" + summary,
+                )
+                db.update_session_status(new_sess["id"], "ok")
+                await queue.put({"type": "compacted", "agent": agent_id,
+                                 "new_session_id": new_sess["id"]})
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            await queue.put({"type": "error", "agent": agent_id, "message": str(e)})
+        finally:
+            await queue.put(None)
+
+    async def sse():
+        yield _sse({"type": "start", "agent": agent_id, "mode": "compact"})
+        task = asyncio.create_task(driver())
+        try:
+            while True:
+                try:
                     evt = await asyncio.wait_for(queue.get(), timeout=15.0)
                 except asyncio.TimeoutError:
                     yield ": keepalive\n\n"

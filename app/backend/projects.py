@@ -197,170 +197,7 @@ def add_agent(slug: str, agent: dict[str, Any]) -> tuple[bool, str]:
     return True, "ok"
 
 
-_AGENT_MD_TEMPLATE = """# {{id}} Agent
-
-> ## ⚠️ NOTICE
-> **KHÔNG được trả lời / hành động khi thiếu thông tin.** Scope mơ hồ, input
-> chưa pin, threshold/param không có nguồn, schema unknown → **DỪNG và HỎI LẠI**.
-> Đoán mò vi phạm `../shared/research_integrity.md`. Override mọi rule khác.
-
-## Role
-{{role}}
-
-## Required reads (in this exact order, before any substantive work)
-1. `../shared/research_integrity.md`
-2. `../shared/tool_conventions.md`
-3. `../shared/handoff_schema.md`
-4. `./inputs/manifest.md`
-5. `./context/code_map.md`
-6. `./state/progress.md` ← read LAST so you know where the last turn ended
-
-## Scope
-
-**IN** — you handle:
-- Whatever is declared in `./inputs/manifest.md` and `./outputs/manifest.md`.
-
-**OUT** — escalate, do not do:
-- Any artifact, file, or decision outside the manifests above.
-- Modifications to other agents' folders or to `../shared/`.
-
-## Pre-flight checklist (run BEFORE any substantive task — do not skip)
-- [ ] All Required reads loaded in order.
-- [ ] Inputs declared in `./inputs/manifest.md` are present at the pinned version.
-- [ ] `./state/progress.md` read to know where last turn ended.
-- [ ] Write-down (in your response) which contract version / inputs you will use.
-
-## Deliverables (files you OWN and MUST keep current)
-Every meaningful turn (Read/Write/significant analysis — NOT trivial ping/status replies)
-**MUST** end with the following updates BEFORE returning control:
-
-1. `./state/progress.md` — **prepend** a new section at the top:
-   - Date `YYYY-MM-DD` + one-line headline.
-   - 2–5 bullet details: what happened, evidence (file:line or output), outcome.
-2. `./outputs/manifest.md` — **bump version** if you produced or modified any
-   downstream artifact. Follow the `Bump rule` section inside that file. Append
-   an entry to `Bump log` with the version diff + one-line rationale.
-3. Any artifact-specific file the change affected (e.g. config, code, doc).
-
-Trivial turns (ping, status query, single-fact lookup) may skip 1–3, but **must
-explicitly note** in the response: "trivial turn, no log/manifest update".
-
-## Output contract
-- Produce only the artifacts declared in `./outputs/manifest.md`.
-- Handoff format: follow `../shared/handoff_schema.md`.
-- Distinguish three statement types per Rule 5: **fact-from-data** (no cite),
-  **claim-from-literature** (DOI cite required), **design-decision**
-  (justify, mark as such).
-
-## Escalation triggers (stop and return control)
-- A Required read is missing or version mismatched.
-- An input is missing, stale, or ambiguous.
-- The request falls outside the IN scope above.
-- The output cannot be produced from available inputs.
-
-When escalating, return: **Problem** (one sentence), **Evidence** (file paths or
-excerpts), **Options** (numbered), **Recommendation** (which option, why). Do
-not guess.
-"""
-
-_INPUTS_MANIFEST_TEMPLATE = """---
-schema_version: 1
-agent: {{id}}
-direction: inputs
-updated: {{date}}
----
-
-# {{id}} — Inputs manifest
-
-This agent consumes the following upstream artifacts. Pin a version when sync occurs; refuse work if pin is unset or stale.
-
-| Source agent | Artifact | Pinned version | Last synced | Status |
-|---|---|---|---|---|
-{{input_rows}}
-
-> **How to use**: when an upstream changes, bump the version pin and re-run pre-flight. If pin can't be satisfied → escalate.
-"""
-
-_OUTPUTS_MANIFEST_TEMPLATE = """---
-schema_version: 1
-agent: {{id}}
-direction: outputs
-updated: {{date}}
----
-
-# {{id}} — Outputs manifest
-
-## Version
-0.1.0  (bootstrap; no artifacts produced yet)
-
-## Bump rule
-- Schema of any produced artifact changes → **major**.
-- New artifact added or existing artifact updated (same schema) → **minor**.
-- Metadata only (description, tag, fix typo) → **patch**.
-
-## Bump log (newest on top)
-- 0.0.0 → 0.1.0 ({{date}}): manifest bootstrapped via AgentUI. No artifacts yet.
-
-## Artifacts
-| Artifact path | Consumer agents | Current version | Updated | Checksum / note |
-|---|---|---|---|---|
-| (TBD: first artifact) | (TBD) | unset | — | |
-
-> **How to use**: when producing a new artifact, add a row above with the
-> path, who consumes it, the version, today's date, and a sha256 prefix or
-> short note. Then bump this manifest's Version + add a Bump log entry.
-"""
-
-_PROGRESS_TEMPLATE = """# {{id}} Progress log (newest on top)
-
-> **Convention**: prepend a new dated section at the TOP of this file every
-> meaningful turn (Read/Write/significant analysis). Format:
->
-> ```
-> ## YYYY-MM-DD — one-line headline
-> - bullet 1: what happened (with file:line or evidence)
-> - bullet 2: outcome / decision / numbers
-> - bullet 3: open questions or follow-up
-> ```
->
-> Trivial turns (ping, single-fact lookup, status query) may be skipped, but the
-> next substantive turn must reference them if relevant.
-
-## {{date}} — Bootstrapped via AgentUI
-- Parents in graph: {{parents_csv}}.
-- Required reads loaded on first turn (per AGENT.md).
-- Awaiting first substantive dispatch from parent or user.
-"""
-
-_CODE_MAP_TEMPLATE = """# {{id}} Code map
-
-Files and modules this agent owns or references.
-
-## Owned (this agent is the author / maintainer — safe to write)
-- `./AGENT.md` — role and contract (rarely edited).
-- `./inputs/manifest.md` — kept in sync by BOSS, not by this agent.
-- `./outputs/manifest.md` — bumped per `Bump rule` after each produced artifact.
-- `./state/progress.md` — appended to (top) every meaningful turn.
-- `./context/code_map.md` — this file; update when scope expands.
-- (Add owned artifacts here as they appear: paths, modules, output dirs.)
-
-## Read-only references (consume, never modify)
-- `../shared/` — project-wide conventions (research_integrity, tool_conventions,
-  handoff_schema, glossary, scope_decisions).
-- Upstream agents listed in `./inputs/manifest.md`.
-
-## Out of scope (do NOT touch)
-- Other agents' folders.
-- Project root config files unless explicitly listed under Owned.
-"""
-
-_AGENT_FILE_TEMPLATES: dict[str, str] = {
-    "AGENT.md": _AGENT_MD_TEMPLATE,
-    "inputs/manifest.md": _INPUTS_MANIFEST_TEMPLATE,
-    "outputs/manifest.md": _OUTPUTS_MANIFEST_TEMPLATE,
-    "state/progress.md": _PROGRESS_TEMPLATE,
-    "context/code_map.md": _CODE_MAP_TEMPLATE,
-}
+TEMPLATES_DIR = Path(__file__).resolve().parent / "templates"
 
 
 def _render(template: str, ctx: dict[str, str]) -> str:
@@ -370,26 +207,57 @@ def _render(template: str, ctx: dict[str, str]) -> str:
     return out
 
 
-def render_agent_files(agent_id: str, role: str, parents: list[str]) -> dict[str, str]:
+def _load_template(relpath: str) -> str:
+    p = TEMPLATES_DIR / relpath
+    return p.read_text(encoding="utf-8") if p.exists() else ""
+
+
+# Per-agent files rendered from templates/agent/** — canonical structure derived
+# from ConstructionVLM-Eval-AGENT. Same set used by create_agent and the
+# "+ agent" template path.
+_AGENT_TEMPLATE_FILES = [
+    "AGENT.md",
+    "inputs/manifest.md",
+    "outputs/manifest.md",
+    "state/progress.md",
+    "context/code_map.md",
+]
+
+
+def _agent_ctx(agent_id: str, role: str, parents: list[str],
+               extra: dict[str, Any] | None = None) -> dict[str, str]:
     from datetime import date
     today = date.today().isoformat()
     if parents:
         input_rows = "\n".join(
-            f"| {p} | (TBD: artifact name) | unset | — | pending |"
-            for p in parents
+            f"- {p}: unset  (ch\u01b0a sync \u2014 ch\u1ea1y `sync.sh {agent_id}`)" for p in parents
         )
     else:
-        input_rows = "| (none — root agent) | | | | |"
-    parents_csv = ", ".join(parents) if parents else "none"
-
-    ctx = {
+        input_rows = "- (none \u2014 root/orchestrator agent, kh\u00f4ng c\u00f3 producer)"
+    ctx: dict[str, str] = {
         "id": agent_id,
-        "role": role or "_(short one-line description of this agent's purpose)_",
+        "role": role or "_(m\u00f4 t\u1ea3 1 d\u00f2ng m\u1ee5c \u0111\u00edch agent n\u00e0y)_",
+        "parents_csv": ", ".join(parents) if parents else "none",
         "input_rows": input_rows,
-        "parents_csv": parents_csv,
         "date": today,
+        "scope_in": "- (TBD: file/\u0111\u01b0\u1eddng d\u1eabn agent n\u00e0y \u0111\u01b0\u1ee3c ph\u00e9p \u0111\u1ecdc & s\u1eeda)",
+        "scope_out": "- Folder c\u1ee7a agent kh\u00e1c; `../shared/` (read-only).",
+        "deliverables": "",
+        "escalation": "",
+        "hard_rules": "",
+        "owned_extra": "",
+        "skills": "",
     }
-    return {fn: _render(tmpl, ctx) for fn, tmpl in _AGENT_FILE_TEMPLATES.items()}
+    if extra:
+        ctx.update({k: str(v) for k, v in extra.items() if v is not None})
+    return ctx
+
+
+def render_agent_files(agent_id: str, role: str, parents: list[str],
+                       extra: dict[str, Any] | None = None) -> dict[str, str]:
+    ctx = _agent_ctx(agent_id, role, parents, extra)
+    return {rel: _render(_load_template(f"agent/{rel}"), ctx)
+            for rel in _AGENT_TEMPLATE_FILES}
 
 
 def _project_root_for_slug(slug: str) -> Path | None:
@@ -507,5 +375,212 @@ def _clean_agent(a: dict[str, Any]) -> dict[str, Any]:
         out["system_prompt_file"] = a["system_prompt_file"]
     if a.get("cwd"):
         out["cwd"] = a["cwd"]
+    out["parents"] = a.get("parents") or []
+    return out
+
+
+# ---------------------------------------------------------------------------
+# Project creation — scaffold a brand-new agent system from templates/
+# (canonical structure derived from ConstructionVLM-Eval-AGENT).
+# ---------------------------------------------------------------------------
+
+_SHARED_FILES = [
+    "research_integrity.md",
+    "tool_conventions.md",
+    "handoff_schema.md",
+    "scope_decisions.md",
+    "glossary.md",
+]
+
+
+def _project_ctx(name: str, description: str, agents: list[dict], date_str: str) -> dict[str, str]:
+    ids = [a["id"] for a in agents]
+    rows = "\n".join(
+        f"| {a['id']} | {a.get('role', '')} | {a.get('model', 'claude')} | "
+        f"{', '.join(a.get('parents') or []) or '—'} |"
+        for a in agents
+    ) or "| (chưa có agent) | | | |"
+    return {
+        "project_name": name,
+        "project_description": description or "",
+        "agent_ids_csv": ", ".join(ids) if ids else "(chưa có)",
+        "agent_table": "| Agent | Role | Model | Parents |\n|---|---|---|---|\n" + rows,
+        "date": date_str,
+    }
+
+
+def render_shared_files(ctx: dict[str, str]) -> dict[str, str]:
+    return {f: _render(_load_template(f"shared/{f}"), ctx) for f in _SHARED_FILES}
+
+
+def generate_sync_sh(agents: list[dict]) -> str:
+    """Generate sync.sh from the agent graph. producers_for(<agent>) = its direct
+    parents (the manifest edges declared in project.yaml)."""
+    cases, valid = [], []
+    for a in agents:
+        parents = a.get("parents") or []
+        if parents:
+            cases.append(f'    {a["id"]})   echo "{" ".join(parents)}" ;;')
+            valid.append(a["id"])
+    ctx = {
+        "cases_block": "\n".join(cases) if cases else '    "") echo "" ;;',
+        "valid_csv": " / ".join(valid) if valid else "(none)",
+    }
+    return _render(_load_template("sync.sh.tmpl"), ctx)
+
+
+def render_readme(ctx: dict[str, str]) -> str:
+    return _render(_load_template("README.md"), ctx)
+
+
+def add_project_to_registry(root: Path) -> None:
+    """Append an absolute project root to registry.yaml (dedup)."""
+    if _ruamel is not None and REGISTRY_PATH.exists():
+        with REGISTRY_PATH.open() as f:
+            data = _ruamel.load(f) or {}
+        projects_list = data.setdefault("projects", [])
+        if str(root) not in [str(p) for p in projects_list]:
+            projects_list.append(str(root))
+        with REGISTRY_PATH.open("w") as f:
+            _ruamel.dump(data, f)
+    else:
+        data = {}
+        if REGISTRY_PATH.exists():
+            with REGISTRY_PATH.open() as f:
+                data = yaml.safe_load(f) or {}
+        projects_list = data.setdefault("projects", [])
+        if str(root) not in [str(p) for p in projects_list]:
+            projects_list.append(str(root))
+        with REGISTRY_PATH.open("w") as f:
+            yaml.safe_dump(data, f, sort_keys=False, allow_unicode=True)
+
+
+def validate_new_project(root_str: str, slug: str) -> tuple[bool, str]:
+    root = Path(root_str).expanduser()
+    if root.exists() and not root.is_dir():
+        return False, "path tồn tại nhưng không phải thư mục"
+    if (root / ".agentui" / "project.yaml").exists():
+        return False, "thư mục đã là một AgentUI project (.agentui/project.yaml tồn tại)"
+    existing = {p["slug"] for p in list_projects()}
+    if slug in existing:
+        return False, f"slug đã tồn tại: {slug}"
+    return True, "ok"
+
+
+def preview_project(payload: dict[str, Any]) -> dict[str, Any]:
+    """Dry-run: what files would be written, plus warnings. No disk writes."""
+    from datetime import date
+    root = Path(payload["root"]).expanduser()
+    name = payload.get("name") or root.name
+    slug = payload.get("slug") or name.lower().replace(" ", "-")
+    agents = payload.get("agents") or []
+    ctx = _project_ctx(name, payload.get("description", ""), agents, date.today().isoformat())
+
+    files: list[str] = ["README.md", "sync.sh", ".agentui/project.yaml"]
+    files += [f"shared/{f}" for f in _SHARED_FILES]
+    for a in agents:
+        files += [f"{a['id']}/{rel}" for rel in _AGENT_TEMPLATE_FILES]
+
+    warnings: list[str] = []
+    if root.exists() and any(root.iterdir()):
+        warnings.append(f"Thư mục `{root}` đã có nội dung — scaffold sẽ thêm vào (không xoá file sẵn có).")
+    ok, msg = validate_new_project(str(root), slug)
+    if not ok:
+        warnings.append(msg)
+    _ = ctx  # ctx used at create time
+    return {"root": str(root), "name": name, "slug": slug,
+            "files": files, "warnings": warnings, "can_create": ok}
+
+
+def create_project(payload: dict[str, Any]) -> tuple[bool, str, str]:
+    """Atomic scaffold of a new project. Returns (ok, message, slug).
+
+    Writes: shared/ (5 conventions), sync.sh, README.md, .agentui/project.yaml,
+    one folder per agent. Appends root to registry.yaml LAST. Rolls back any
+    paths WE created on failure (never touches pre-existing user files)."""
+    from datetime import date
+    root = Path(payload["root"]).expanduser()
+    name = payload.get("name") or root.name
+    slug = payload.get("slug") or name.lower().replace(" ", "-")
+    description = payload.get("description", "")
+    agents = payload.get("agents") or []
+
+    ok, msg = validate_new_project(str(root), slug)
+    if not ok:
+        return False, msg, slug
+
+    ctx = _project_ctx(name, description, agents, date.today().isoformat())
+    created: list[Path] = []  # paths we made (for rollback)
+
+    def _write(path: Path, content: str, executable: bool = False):
+        new_dir = not path.parent.exists()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        if new_dir:
+            created.append(path.parent)
+        existed = path.exists()
+        path.write_text(content, encoding="utf-8")
+        if not existed:
+            created.append(path)
+        if executable:
+            import os as _os
+            _os.chmod(path, 0o755)
+
+    try:
+        root.mkdir(parents=True, exist_ok=True)
+        # shared/
+        for fn, content in render_shared_files(ctx).items():
+            _write(root / "shared" / fn, content)
+        # sync.sh + README
+        _write(root / "sync.sh", generate_sync_sh(agents), executable=True)
+        _write(root / "README.md", render_readme(ctx))
+        # project.yaml
+        project_yaml = {
+            "name": name,
+            "slug": slug,
+            "description": description,
+            "agents": [_project_agent_entry(a) for a in agents],
+        }
+        cfg_path = root / ".agentui" / "project.yaml"
+        cfg_path.parent.mkdir(parents=True, exist_ok=True)
+        if not cfg_path.parent.exists():
+            created.append(cfg_path.parent)
+        with cfg_path.open("w") as f:
+            yaml.safe_dump(project_yaml, f, sort_keys=False, allow_unicode=True)
+        created.append(cfg_path)
+        # per-agent folders
+        for a in agents:
+            for rel, content in render_agent_files(
+                a["id"], a.get("role", ""), a.get("parents") or []
+            ).items():
+                _write(root / a["id"] / rel, content)
+        # registry LAST
+        add_project_to_registry(root.resolve())
+    except Exception as e:
+        import shutil as _shutil
+        for p in reversed(created):
+            try:
+                if p.is_dir():
+                    _shutil.rmtree(p, ignore_errors=True)
+                elif p.exists():
+                    p.unlink()
+            except Exception:
+                pass
+        return False, f"rollback: {e}", slug
+
+    return True, "ok", slug
+
+
+def _project_agent_entry(a: dict[str, Any]) -> dict[str, Any]:
+    out: dict[str, Any] = {"id": a["id"]}
+    if a.get("role"):
+        out["role"] = a["role"]
+    out["model"] = a.get("model", "claude")
+    out["claude_model"] = a.get("claude_model") or "claude-sonnet-4-6"
+    if a.get("model") == "grok":
+        out["grok_model"] = a.get("grok_model") or "grok-build"
+    if a.get("effort"):
+        out["effort"] = a["effort"]
+    out["system_prompt_file"] = f"{a['id']}/AGENT.md"
+    out["cwd"] = a["id"]
     out["parents"] = a.get("parents") or []
     return out

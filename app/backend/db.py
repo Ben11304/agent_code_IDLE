@@ -77,6 +77,8 @@ def init_db() -> None:
         _ensure_column(c, "agent_overrides", "grok_model", "TEXT")
         # latest real token usage from the CLI (JSON: input/output/cache buckets)
         _ensure_column(c, "sessions", "usage", "TEXT")
+        # one-time context seed (compact recap) prepended to this session's next turn
+        _ensure_column(c, "sessions", "seed", "TEXT")
 
 
 def get_or_create_active_session(project_slug: str, agent_id: str) -> dict:
@@ -189,6 +191,18 @@ def set_session_usage(session_id: str, usage: dict) -> None:
             "UPDATE sessions SET usage=? WHERE id=?",
             (json.dumps(usage), session_id),
         )
+
+
+def set_session_seed(session_id: str, text: str) -> None:
+    """Store a one-time context recap (from /compact) to prepend to this session's
+    next turn, then it is cleared. Lets a fresh session continue with small context."""
+    with _conn() as c:
+        c.execute("UPDATE sessions SET seed=? WHERE id=?", (text, session_id))
+
+
+def clear_session_seed(session_id: str) -> None:
+    with _conn() as c:
+        c.execute("UPDATE sessions SET seed=NULL WHERE id=?", (session_id,))
 
 
 def get_agent_override(project_slug: str, agent_id: str) -> dict | None:

@@ -5,6 +5,8 @@ const state = {
   openTabs: [],
   activeTab: null,
   projectCache: {},
+  skills: [],             // installed Agent Skills (name + description)
+  expandedSkills: new Set(),
   statsCache: {},         // slug -> { agentId -> stats }
   expandedNodes: new Set(), // "slug:agentId" set of expanded graph panels
   activeDispatches: new Set(),
@@ -29,6 +31,114 @@ async function init() {
   bindGlobalKeys();
   bindTreeKeys();
   await initWorkspaceTree();
+  const npb = $("newProjectBtn");
+  if (npb) npb.onclick = openNewProjectDialog;
+  bindSidebarResizer();
+  bindSkillsPanel();
+  loadSkills();
+}
+
+// ---------- Skills panel (right side, manual use) ----------
+
+async function loadSkills() {
+  try {
+    const r = await fetch("/api/skills");
+    if (r.ok) state.skills = (await r.json()).skills || [];
+  } catch { /* ignore */ }
+  renderSkills();
+}
+
+function bindSkillsPanel() {
+  const tab = $("skillsTab"), panel = $("skillsPanel"), close = $("skillsClose");
+  if (!tab || !panel) return;
+  const open = () => { panel.classList.add("open"); tab.classList.add("hidden"); };
+  const hide = () => { panel.classList.remove("open"); tab.classList.remove("hidden"); };
+  tab.onclick = open;
+  if (close) close.onclick = hide;
+}
+
+function renderSkills() {
+  const root = $("skillsList");
+  if (!root) return;
+  root.innerHTML = "";
+  if (!state.skills.length) {
+    root.innerHTML = `<div class="skills-empty">Không tìm thấy skill trong ~/.claude/skills</div>`;
+    return;
+  }
+  state.skills.forEach((s) => {
+    const expanded = state.expandedSkills.has(s.name);
+    const row = document.createElement("div");
+    row.className = "skill-row" + (expanded ? " expanded" : "");
+    row.innerHTML = `
+      <div class="skill-top">
+        <span class="skill-name">${escapeHtml(s.name)}</span>
+        <button class="skill-expand" title="${expanded ? "thu gọn" : "xem đầy đủ"}">${expanded ? "▾" : "▸"}</button>
+      </div>
+      <div class="skill-desc">${escapeHtml(s.description || "(không có mô tả)")}</div>
+      <div class="skill-actions"><button class="skill-use">Dùng ↗</button></div>`;
+    row.querySelector(".skill-expand").onclick = () => {
+      if (state.expandedSkills.has(s.name)) state.expandedSkills.delete(s.name);
+      else state.expandedSkills.add(s.name);
+      renderSkills();
+    };
+    row.querySelector(".skill-use").onclick = () => useSkill(s.name);
+    root.appendChild(row);
+  });
+}
+
+function focusedChatWindow() {
+  const chats = state.windows.filter((w) => w.type === "chat" && !w.hidden);
+  if (!chats.length) return null;
+  return chats.reduce((a, b) => (b.z > a.z ? b : a));
+}
+
+function useSkill(name) {
+  const w = focusedChatWindow();
+  if (!w) { flashHint("Mở chat một agent trước đã (click node trong graph)."); return; }
+  const input = w.el.querySelector(".chat-input");
+  if (!input) return;
+  const prefix = input.value.trim() ? input.value.trim() + "\n" : "";
+  input.value = `${prefix}Dùng skill \`${name}\` cho: `;
+  focusWindow(w);
+  input.focus();
+  input.setSelectionRange(input.value.length, input.value.length);
+  flashHint(`đã chèn lệnh gọi \`${name}\` vào chat ${w.agentId} — sửa & gửi`);
+}
+
+function bindSidebarResizer() {
+  const app = document.querySelector(".app");
+  const rez = $("sidebarResizer");
+  if (!app || !rez) return;
+  const MIN = 170, MAX = 620;
+  const saved = parseInt(localStorage.getItem("sidebarW") || "", 10);
+  if (saved >= MIN && saved <= MAX) app.style.setProperty("--sidebar-w", saved + "px");
+  let dragging = false;
+  rez.addEventListener("mousedown", (e) => {
+    e.preventDefault();
+    dragging = true;
+    rez.classList.add("dragging");
+    document.body.style.cursor = "col-resize";
+    document.body.style.userSelect = "none";
+  });
+  document.addEventListener("mousemove", (e) => {
+    if (!dragging) return;
+    const w = Math.max(MIN, Math.min(MAX, e.clientX));
+    app.style.setProperty("--sidebar-w", w + "px");
+  });
+  document.addEventListener("mouseup", () => {
+    if (!dragging) return;
+    dragging = false;
+    rez.classList.remove("dragging");
+    document.body.style.cursor = "";
+    document.body.style.userSelect = "";
+    const w = parseInt(getComputedStyle(app).getPropertyValue("--sidebar-w"), 10);
+    if (w) localStorage.setItem("sidebarW", w);
+  });
+  // Double-click resets to default width.
+  rez.addEventListener("dblclick", () => {
+    app.style.removeProperty("--sidebar-w");
+    localStorage.removeItem("sidebarW");
+  });
 }
 
 async function loadProjects() {
@@ -318,6 +428,7 @@ function renderWindowContent(w) {
         <form class="chat-form">
           <textarea class="chat-input" rows="2"
             placeholder="Enter để gửi (Shift+Enter xuống dòng)"></textarea>
+          <button class="chat-stop" type="button" hidden>Stop</button>
           <button class="chat-send" type="submit">Gửi</button>
         </form>
         <div class="chat-status"></div>
@@ -437,7 +548,7 @@ function renderGraphInWindow(w) {
 }
 
 // Expanded-panel geometry (viewBox units, matches collapsed node width baseline).
-const PANEL_W = 212, PANEL_H = 232;
+const PANEL_W = 212, PANEL_H = 284; // headroom for warn rows + plan progress rows
 
 function buildAgentNode(proj, a, pos, nodeW, nodeH) {
   const ns = "http://www.w3.org/2000/svg";
@@ -500,6 +611,8 @@ function nodeBodyHtml(a, stats) {
   const mem = stats.memory;
   const memTime = mem && mem.mtime ? fmtRelTime(mem.mtime) : "—";
   const memHead = mem && mem.headline ? escapeHtml(mem.headline) : "";
+  // Worked recently but memory file untouched for >6h → working without persisting.
+  const memStale = !!(mem && mem.mtime && stats.updated_at && (stats.updated_at - mem.mtime) > 6 * 3600);
   const lastAct = stats.updated_at ? fmtRelTime(stats.updated_at) : "—";
   const effort = stats.effort ? escapeHtml(stats.effort) : "default";
   const sessTxt = stats.has_session
@@ -515,8 +628,12 @@ function nodeBodyHtml(a, stats) {
       <span class="ac-v">${pct}%</span>
     </div>
     <div class="ac-row"><span class="ac-k">${tokK}</span><span class="ac-v">${fmtTokens(stats.context_tokens)} / ${fmtTokens(stats.context_window)}</span></div>
-    <div class="ac-row"><span class="ac-k">bộ nhớ</span><span class="ac-v">${memTime}</span></div>
+    ${pct >= 80 ? `<div class="ac-warn" title="ngưỡng auto-compact: 80%">🔄 auto-compact sẽ chạy ở lượt kế</div>` : ""}
+    <div class="ac-row"><span class="ac-k">bộ nhớ</span><span class="ac-v${memStale ? " ac-stale" : ""}">${memTime}${memStale ? " ⚠" : ""}</span></div>
+    ${memStale ? `<div class="ac-warn">⚠ hoạt động gần đây nhưng chưa ghi bộ nhớ</div>` : ""}
     ${memHead ? `<div class="ac-headline" title="${memHead}">${memHead}</div>` : ""}
+    ${stats.plan ? `<div class="ac-row"><span class="ac-k">plan</span><span class="ac-v">${stats.plan.done}/${stats.plan.total}${stats.plan.blocked ? " ⛔" : ""}</span></div>` : ""}
+    ${stats.plan && stats.plan.current ? `<div class="ac-headline" title="${escapeHtml(stats.plan.current)}">▸ ${escapeHtml(stats.plan.current)}</div>` : ""}
     <div class="ac-row"><span class="ac-k">hoạt động</span><span class="ac-v">${lastAct}</span></div>
     <div class="ac-row"><span class="ac-k">messages</span><span class="ac-v">${stats.message_count}</span></div>
     <div class="ac-row"><span class="ac-k">effort</span><span class="ac-v">${effort}</span></div>
@@ -947,9 +1064,11 @@ function bindChatWindow(w) {
 
   form.onsubmit = (e) => e.preventDefault();
 
+  const stopBtn = w.el.querySelector(".chat-stop");
+  if (stopBtn) stopBtn.onclick = (e) => { e.preventDefault(); stopChat(w); };
+
   sendBtn.onclick = async (e) => {
     e.preventDefault();
-    if (w.streaming) { stopChat(w); return; }
     const text = input.value.trim();
     if (!text) return;
     if (text.startsWith("/")) {
@@ -959,6 +1078,11 @@ function bindChatWindow(w) {
       return;
     }
     input.value = "";
+    hideCommandMenu(w);
+    // While a turn is streaming, a normal message goes into the per-window
+    // queue and is auto-sent when the current turn finishes — instead of the
+    // old behaviour where the button only meant "Stop".
+    if (w.streaming) { enqueueMessage(w, text); return; }
     await sendMessageInWindow(w, text);
   };
 
@@ -1022,10 +1146,54 @@ function bindChatWindow(w) {
 }
 
 function stopChat(w) {
+  // Stop = full halt: drop anything still queued, then abort the live turn.
+  // (Clearing first means the finally→drainQueue below sees an empty queue and
+  // does not auto-fire the next message.)
+  if (w.queue && w.queue.length) {
+    w.queue.forEach((q) => { if (q.el && q.el.parentNode) q.el.parentNode.removeChild(q.el); });
+    w.queue = [];
+  }
   if (w.abortController) {
     try { w.abortController.abort(); } catch {}
   }
   setChatStatus(w, "đang dừng…");
+}
+
+// ---------- Chat queue (send while streaming) ----------
+
+function enqueueMessage(w, text) {
+  if (!w.queue) w.queue = [];
+  const el = addBubble(w, "user", text);
+  el.classList.add("queued");
+  w.queue.push({ text, el });
+  renumberQueue(w);
+  updateQueueStatus(w);
+}
+
+function renumberQueue(w) {
+  (w.queue || []).forEach((q, i) => {
+    const role = q.el && q.el.querySelector(".role");
+    if (role) role.innerHTML = `user <span class="queue-tag">⏳ hàng chờ #${i + 1}</span>`;
+  });
+}
+
+function updateQueueStatus(w) {
+  const n = (w.queue || []).length;
+  if (w.streaming) {
+    setChatStatus(w, n
+      ? `đang chạy • ${n} trong hàng chờ (Esc/Stop để dừng tất cả)`
+      : "đang chạy... (Esc để dừng)");
+  }
+}
+
+function drainQueue(w) {
+  if (!w.queue || !w.queue.length) return;
+  const item = w.queue.shift();
+  if (item.el && item.el.parentNode) item.el.parentNode.removeChild(item.el);
+  renumberQueue(w);
+  // Fire the next turn. Its own finally calls drainQueue again, chaining until
+  // the queue is empty. Not awaited — let it run as the next streaming turn.
+  sendMessageInWindow(w, item.text);
 }
 
 // ---------- Slash commands ----------
@@ -1034,6 +1202,7 @@ function stopChat(w) {
 const CHAT_COMMANDS = [
   { cmd: "/help",     adapter: "*",     hint: "",                                    desc: "danh sách commands",                                exec: cmdHelp },
   { cmd: "/clear",    adapter: "*",     hint: "",                                    desc: "tạo session mới (history cũ vẫn lưu trong db)",     exec: cmdClear },
+  { cmd: "/compact",  adapter: "*",     hint: "",                                    desc: "agent tóm tắt context → session mới seed bằng recap (giảm % context)", exec: cmdCompact },
   { cmd: "/model",    adapter: "*",     hint: "<...>",                               desc: "đổi model agent này",                              exec: cmdModel },
   { cmd: "/effort",   adapter: "*",     hint: "<default|low|medium|high|max>",       desc: "đổi effort agent này",                             exec: cmdEffort },
   { cmd: "/focus",    adapter: "*",     hint: "<AGENT_ID>",                          desc: "mở chat agent khác trong project",                 exec: cmdFocus },
@@ -1161,9 +1330,74 @@ async function cmdClear(w) {
   try {
     await fetch(`/api/projects/${slug}/agents/${agent}/clear`, { method: "POST" });
     await refreshChatSession(w);
+    ensureStats(slug, true);
     addSystemBubble(w, "✓ session mới đã tạo. History cũ vẫn còn trong db, không xoá vĩnh viễn.");
   } catch (err) {
     addSystemBubble(w, "lỗi khi tạo session mới: " + err.message);
+  }
+}
+
+async function cmdCompact(w) {
+  if (w.streaming) { addSystemBubble(w, "đang stream — gõ /stop trước khi compact."); return; }
+  const slug = w.projectSlug, agent = w.agentId;
+  addSystemBubble(w, "📦 Đang compact: agent tự tóm tắt context hiện tại…");
+  const b = addBubble(w, "assistant", "");
+  b.querySelector(".role").textContent = "compact • " + agent;
+  const contentEl = b.querySelector(".content");
+  let assembled = "";
+  w.streaming = true;
+  setSendBtn(w, "stop");
+  setChatStatus(w, "đang compact… (Esc để dừng)");
+  try {
+    w.abortController = new AbortController();
+    const resp = await fetch(`/api/projects/${slug}/agents/${agent}/compact`, {
+      method: "POST", headers: { "Content-Type": "application/json" }, body: "{}",
+      signal: w.abortController.signal,
+    });
+    if (!resp.ok || !resp.body) {
+      setContent(contentEl, `(lỗi backend ${resp.status})`);
+      return;
+    }
+    const reader = resp.body.getReader();
+    const dec = new TextDecoder();
+    let buf = "";
+    let ok = false;
+    while (true) {
+      const { value, done } = await reader.read();
+      if (done) break;
+      buf += dec.decode(value, { stream: true });
+      const parts = buf.split("\n\n");
+      buf = parts.pop() || "";
+      for (const chunk of parts) {
+        const line = chunk.trim();
+        if (!line.startsWith("data:")) continue;
+        let evt; try { evt = JSON.parse(line.slice(5).trim()); } catch { continue; }
+        if (evt.type === "delta") {
+          assembled += evt.text;
+          contentEl.textContent = assembled;
+          const m = w.el.querySelector(".messages"); m.scrollTop = m.scrollHeight;
+        } else if (evt.type === "compacted") {
+          ok = true;
+        } else if (evt.type === "error") {
+          addSystemBubble(w, "lỗi compact: " + (evt.message || ""));
+        }
+      }
+    }
+    if (ok) {
+      // The new seeded session is now active; reload it (shows the recap boundary).
+      await refreshChatSession(w);
+      ensureStats(slug, true);
+      addSystemBubble(w, "✓ Đã compact. Session mới seed bằng recap — lượt kế tiếp tiếp tục với context nhỏ. Session cũ vẫn lưu trong db.");
+    } else {
+      setContent(contentEl, assembled || "(compact không hoàn tất)");
+    }
+  } catch (err) {
+    if (err.name !== "AbortError") addSystemBubble(w, "lỗi compact: " + err.message);
+    else setChatStatus(w, "đã dừng");
+  } finally {
+    w.streaming = false;
+    w.abortController = null;
+    setSendBtn(w, "send");
   }
 }
 
@@ -1259,6 +1493,158 @@ async function cmdStop(w) {
 }
 
 // ---------- Add agent dialog ----------
+
+// ---------- New project dialog ----------
+
+function openNewProjectDialog() {
+  let overlay = document.getElementById("newProjectOverlay");
+  if (overlay) overlay.remove();
+  overlay = document.createElement("div");
+  overlay.id = "newProjectOverlay";
+  overlay.className = "modal-overlay";
+
+  overlay.innerHTML = `
+    <div class="modal">
+      <div class="modal-header">
+        <span>Tạo dự án mới</span>
+        <button class="modal-close" title="đóng">×</button>
+      </div>
+      <form class="modal-body" id="newProjectForm">
+        <div class="form-row">
+          <label class="full">Đường dẫn thư mục (tuyệt đối)
+            <input name="root" type="text" autocomplete="off" spellcheck="false"
+              placeholder="VD: /users/PGS0407/binben14/VietHuy/MyProject" />
+            <span class="hint" id="npPathHint">Thư mục code có sẵn hoặc tạo mới. shared/ + sync.sh + agent folders sẽ được scaffold vào đây.</span>
+          </label>
+        </div>
+        <div class="form-row">
+          <label>Tên dự án
+            <input name="name" type="text" placeholder="auto từ tên folder nếu trống" />
+          </label>
+          <label>Slug
+            <input name="slug" type="text" placeholder="auto" autocomplete="off" />
+          </label>
+        </div>
+        <div class="form-row">
+          <label class="full">Mô tả (1 dòng)
+            <input name="description" type="text" placeholder="VD: VLM benchmark trên dataset X" />
+          </label>
+        </div>
+
+        <div class="form-row">
+          <label class="full">Agents (định nghĩa graph — để trống nếu muốn thêm sau qua "+ agent")
+            <div id="npAgents" class="np-agents"></div>
+            <button type="button" class="btn-secondary" id="npAddAgent" style="margin-top:6px">+ thêm agent</button>
+            <span class="hint">Parents = ID (cách nhau dấu phẩy) của agent cha trong danh sách này. Agent không parent = orchestrator.</span>
+          </label>
+        </div>
+
+        <div class="modal-msg" id="newProjectMsg"></div>
+        <div class="modal-actions">
+          <button type="button" class="btn-secondary" id="cancelNewProject">Hủy</button>
+          <button type="submit" class="btn-primary">Tạo dự án</button>
+        </div>
+      </form>
+    </div>`;
+
+  document.body.appendChild(overlay);
+  const form = overlay.querySelector("#newProjectForm");
+  const msg = overlay.querySelector("#newProjectMsg");
+  const agentsBox = overlay.querySelector("#npAgents");
+  const pathHint = overlay.querySelector("#npPathHint");
+
+  function addAgentRow(preset) {
+    const row = document.createElement("div");
+    row.className = "np-agent-row";
+    row.innerHTML = `
+      <input class="np-id" placeholder="ID" pattern="[A-Z][A-Z0-9_]*" autocomplete="off"
+        value="${preset && preset.id ? escapeHtml(preset.id) : ""}" />
+      <input class="np-role" placeholder="role (1 dòng)"
+        value="${preset && preset.role ? escapeHtml(preset.role) : ""}" />
+      <select class="np-model">
+        <option value="claude" selected>claude</option>
+        <option value="grok">grok</option>
+      </select>
+      <input class="np-parents" placeholder="parents (CSV)"
+        value="${preset && preset.parents ? escapeHtml(preset.parents) : ""}" />
+      <button type="button" class="np-del" title="xoá">×</button>`;
+    row.querySelector(".np-del").onclick = () => row.remove();
+    agentsBox.appendChild(row);
+  }
+  // seed a sensible default orchestrator
+  addAgentRow({ id: "BOSS", role: "Orchestrator — phân tích yêu cầu, dispatch xuống agent con", parents: "" });
+  overlay.querySelector("#npAddAgent").onclick = () => addAgentRow();
+
+  // live path validation
+  const rootInput = form.querySelector('input[name="root"]');
+  let pathTimer = null;
+  rootInput.addEventListener("input", () => {
+    clearTimeout(pathTimer);
+    const p = rootInput.value.trim();
+    if (!p) { pathHint.textContent = "Thư mục code có sẵn hoặc tạo mới."; pathHint.className = "hint"; return; }
+    pathTimer = setTimeout(async () => {
+      try {
+        const r = await fetch(`/api/fs/validate?path=${encodeURIComponent(p)}`);
+        const j = await r.json();
+        if (j.is_project) { pathHint.textContent = "⚠ Thư mục đã là một AgentUI project."; pathHint.className = "hint err"; }
+        else if (!j.exists) { pathHint.textContent = j.parent_exists ? "✓ Sẽ tạo thư mục mới ở đây." : "⚠ Thư mục cha không tồn tại."; pathHint.className = j.parent_exists ? "hint ok" : "hint err"; }
+        else if (j.is_dir) { pathHint.textContent = j.non_empty ? "✓ Thư mục có sẵn (sẽ thêm scaffold, không xoá file)." : "✓ Thư mục trống."; pathHint.className = "hint ok"; }
+        else { pathHint.textContent = "⚠ Path tồn tại nhưng không phải thư mục."; pathHint.className = "hint err"; }
+      } catch { /* ignore */ }
+    }, 350);
+  });
+
+  function close() { overlay.remove(); }
+  overlay.querySelector(".modal-close").onclick = close;
+  overlay.querySelector("#cancelNewProject").onclick = close;
+  overlay.onclick = (e) => { if (e.target === overlay) close(); };
+  document.addEventListener("keydown", function esc(e) {
+    if (e.key === "Escape") { close(); document.removeEventListener("keydown", esc); }
+  });
+
+  form.onsubmit = async (e) => {
+    e.preventDefault();
+    msg.textContent = "";
+    const root = rootInput.value.trim();
+    if (!root) { msg.textContent = "Cần đường dẫn thư mục."; msg.className = "modal-msg err"; return; }
+    const agents = [];
+    for (const row of agentsBox.querySelectorAll(".np-agent-row")) {
+      const id = row.querySelector(".np-id").value.trim();
+      if (!id) continue;
+      const parents = row.querySelector(".np-parents").value.split(",").map((s) => s.trim()).filter(Boolean);
+      agents.push({
+        id,
+        role: row.querySelector(".np-role").value.trim(),
+        model: row.querySelector(".np-model").value,
+        parents,
+      });
+    }
+    const payload = {
+      root,
+      name: form.querySelector('input[name="name"]').value.trim() || null,
+      slug: form.querySelector('input[name="slug"]').value.trim() || null,
+      description: form.querySelector('input[name="description"]').value.trim(),
+      agents,
+    };
+    const btn = form.querySelector(".btn-primary");
+    btn.disabled = true; btn.textContent = "Đang tạo…";
+    try {
+      const r = await fetch("/api/projects/create", {
+        method: "POST", headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(payload),
+      });
+      const j = await r.json();
+      if (!r.ok) { msg.textContent = "Lỗi: " + (j.detail || r.status); msg.className = "modal-msg err"; btn.disabled = false; btn.textContent = "Tạo dự án"; return; }
+      state.projects = j.projects || state.projects;
+      renderProjectList();
+      close();
+      await openProject(j.slug);
+    } catch (err) {
+      msg.textContent = "network error: " + err.message; msg.className = "modal-msg err";
+      btn.disabled = false; btn.textContent = "Tạo dự án";
+    }
+  };
+}
 
 function openAddAgentDialog(slug) {
   const proj = state.projectCache[slug];
@@ -1708,17 +2094,14 @@ async function cmdResetNext(w) {
 }
 
 function setSendBtn(w, mode) {
+  const stopBtn = w.el.querySelector(".chat-stop");
+  if (stopBtn) stopBtn.hidden = (mode !== "stop");
   const btn = w.el.querySelector(".chat-send");
   if (!btn) return;
-  if (mode === "stop") {
-    btn.textContent = "Stop";
-    btn.classList.add("stop");
-    btn.disabled = false;
-  } else {
-    btn.textContent = "Gửi";
-    btn.classList.remove("stop");
-    btn.disabled = false;
-  }
+  btn.disabled = false;
+  btn.classList.remove("stop");
+  // The send button always sends; while a turn streams it adds to the queue.
+  btn.textContent = (mode === "stop") ? "+ hàng chờ" : "Gửi";
 }
 
 function setChatStatus(w, s) {
@@ -1774,6 +2157,7 @@ async function sendMessageInWindow(w, text) {
   w.streaming = true;
   setSendBtn(w, "stop");
   setChatStatus(w, "đang chạy... (Esc để dừng)");
+  updateQueueStatus(w);
   proj.statuses[rootAgent] = "running";
   rerenderGraphsForSlug(slug);
 
@@ -1828,6 +2212,8 @@ async function sendMessageInWindow(w, text) {
     w.streaming = false;
     w.abortController = null;
     setSendBtn(w, "send");
+    // If the user queued messages while this turn ran, fire the next one now.
+    drainQueue(w);
   }
 }
 
@@ -1915,6 +2301,29 @@ function handleEventInWindow(w, slug, evt, bubbleFor, rootAgent) {
       mirrorDispatchedMessages(slug, agent);
       break;
     }
+    case "plan_updated": {
+      setChatStatus(w, `📋 ${agent}: plan ${evt.total} bước — lưu vào state/plan.md`);
+      ensureStats(slug, true);
+      break;
+    }
+    case "plan_step": {
+      const ico = evt.status === "done" ? "✓" : (evt.status === "blocked" ? "⛔" : "▸");
+      setChatStatus(w, `📋 ${agent}: bước ${evt.n} ${ico} ${evt.status}`);
+      ensureStats(slug, true);
+      break;
+    }
+    case "compact_started": {
+      addSystemBubble(w, `📦 Context ${evt.pct || "?"}% — auto-compact trước khi chạy lượt này (agent tự tóm tắt rồi mở session mới)…`);
+      setChatStatus(w, "đang auto-compact…");
+      break;
+    }
+    case "compacted": {
+      ensureStats(slug, true);
+      if (evt.auto) {
+        addSystemBubble(w, "✓ Auto-compact xong — session mới đã seed recap. Lượt của bạn chạy tiếp bên dưới.");
+      }
+      break;
+    }
     case "dispatch_started": {
       state.activeDispatches.add(`${evt.source}->${evt.target}`);
       proj.statuses[evt.target] = "running";
@@ -1982,10 +2391,14 @@ async function initWorkspaceTree() {
     const j = await r.json();
     const t = _treeState();
     t.workspace_root = j.workspace_root || null;
+    // Write the label into the inner <span>, NOT the .sidebar-title itself —
+    // setting textContent on the title would wipe its children (the + project button).
     const titleEl = document.querySelector(".sidebar-title");
-    if (titleEl && t.workspace_root) {
-      titleEl.textContent = t.workspace_root.replace(/^\/Users\/[^/]+\//, "~/");
-      titleEl.title = t.workspace_root;
+    const labelEl = titleEl && titleEl.querySelector("span:first-child");
+    if (labelEl && t.workspace_root) {
+      const base = t.workspace_root.split("/").filter(Boolean).pop() || t.workspace_root;
+      labelEl.textContent = base + "/";
+      labelEl.title = t.workspace_root;
     }
   } catch {}
   await fetchTreeLevel("");
