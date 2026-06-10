@@ -918,6 +918,7 @@ function openChat(slug, agentId) {
 }
 
 const CLAUDE_MODELS = [
+  { value: "claude-fable-5",      label: "fable 5"    },
   { value: "claude-opus-4-8",     label: "opus 4.8"   },
   { value: "claude-opus-4-7",     label: "opus 4.7"   },
   { value: "claude-sonnet-4-6",   label: "sonnet 4.6" },
@@ -1226,7 +1227,7 @@ function _hintForCmd(c, adapter) {
   if (c.cmd === "/model") {
     return adapter === "grok"
       ? "<grok-build|grok-composer>"
-      : "<opus-4-8|opus-4-7|sonnet|haiku>";
+      : "<fable-5|opus-4-8|opus-4-7|sonnet|haiku>";
   }
   return c.hint;
 }
@@ -1402,6 +1403,8 @@ async function cmdCompact(w) {
 }
 
 const _CLAUDE_MODEL_ALIAS = {
+  "fable-5": "claude-fable-5",
+  "fable": "claude-fable-5",
   "opus-4-8": "claude-opus-4-8",
   "opus-4-7": "claude-opus-4-7",
   "opus": "claude-opus-4-8",
@@ -1427,7 +1430,7 @@ async function cmdModel(w, arg) {
   if (!arg) {
     addSystemBubble(w, isGrok
       ? "Cú pháp: `/model <grok-build|grok-composer>`"
-      : "Cú pháp: `/model <opus-4-8|opus-4-7|sonnet|haiku>`");
+      : "Cú pháp: `/model <fable-5|opus-4-8|opus-4-7|sonnet|haiku>`");
     return;
   }
 

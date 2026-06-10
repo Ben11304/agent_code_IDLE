@@ -113,7 +113,7 @@ Type `/` to open the command menu. Tab to insert, ↑↓ to navigate, Esc to clo
 |---|---|
 | `/help` | List all commands |
 | `/clear` | Create a fresh session (history kept in db) |
-| `/model <opus-4-8\|opus-4-7\|sonnet\|haiku>` | Change this agent's model |
+| `/model <fable-5\|opus-4-8\|opus-4-7\|sonnet\|haiku>` | Change this agent's model |
 | `/effort <default\|low\|medium\|high\|max>` | Change this agent's effort |
 | `/focus <AGENT_ID>` | Open another agent's chat window |
 | `/dispatch <AGENT_ID> <task>` | Open target's chat and send task immediately |
@@ -130,7 +130,7 @@ agents:
   - id: <UPPERCASE_ID>           # used in dispatch tags
     role: <one-line description>
     model: claude | grok          # adapter selector
-    claude_model: claude-opus-4-8 | claude-opus-4-7 | claude-sonnet-4-6 | claude-haiku-4-5
+    claude_model: claude-fable-5 | claude-opus-4-8 | claude-opus-4-7 | claude-sonnet-4-6 | claude-haiku-4-5
     grok_model: grok-build | grok-composer-2.5-fast       # only when model: grok
     effort: low | medium | high | xhigh | max   # optional
     system_prompt_file: <relative path to AGENT.md>
