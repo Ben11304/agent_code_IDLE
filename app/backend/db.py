@@ -65,6 +65,14 @@ def init_db() -> None:
                 consumed_by_session TEXT,
                 meta TEXT
             );
+            CREATE TABLE IF NOT EXISTS node_positions (
+                project_slug TEXT NOT NULL,
+                agent_id TEXT NOT NULL,
+                x REAL NOT NULL,
+                y REAL NOT NULL,
+                updated_at REAL NOT NULL,
+                PRIMARY KEY (project_slug, agent_id)
+            );
             CREATE INDEX IF NOT EXISTS idx_dr_source
                 ON dispatch_results(project_slug, source_agent, consumed_at, completed_at);
             CREATE INDEX IF NOT EXISTS idx_sessions_proj_agent
@@ -247,6 +255,36 @@ def list_agent_overrides(project_slug: str) -> dict[str, dict]:
         "grok_model": r["grok_model"],
         "effort": r["effort"],
     } for r in rows}
+
+
+def get_node_positions(project_slug: str) -> dict[str, dict]:
+    """Saved graph positions for this project. Layout source of truth: a node
+    present here was placed by hand (or by an explicit re-layout) and must
+    never be silently moved by auto-layout."""
+    with _conn() as c:
+        rows = c.execute(
+            "SELECT agent_id, x, y FROM node_positions WHERE project_slug=?",
+            (project_slug,),
+        ).fetchall()
+    return {r["agent_id"]: {"x": r["x"], "y": r["y"]} for r in rows}
+
+
+def set_node_positions(project_slug: str, positions: dict[str, dict]) -> None:
+    now = time.time()
+    with _conn() as c:
+        for agent_id, p in positions.items():
+            c.execute(
+                "INSERT INTO node_positions(project_slug, agent_id, x, y, updated_at) "
+                "VALUES (?, ?, ?, ?, ?) "
+                "ON CONFLICT(project_slug, agent_id) DO UPDATE SET "
+                "x=excluded.x, y=excluded.y, updated_at=excluded.updated_at",
+                (project_slug, agent_id, float(p["x"]), float(p["y"]), now),
+            )
+
+
+def clear_node_positions(project_slug: str) -> None:
+    with _conn() as c:
+        c.execute("DELETE FROM node_positions WHERE project_slug=?", (project_slug,))
 
 
 def record_dispatch_result(

@@ -12,6 +12,7 @@ const state = {
   activeDispatches: new Set(),
   viewBoxes: {},          // slug -> {x,y,w,h}
   graphBounds: {},        // slug -> {x,y,w,h}
+  nodePositions: {},      // slug -> {agentId: {x,y}} — manual layout, persisted in db
   tree: {},               // slug -> {expanded, cache, selectedAbs, flat}
   windows: [],            // [{id, projectSlug, type, agentId?, x, y, w, h, z, hidden, el, ...state}]
   zTop: 10,
@@ -24,7 +25,22 @@ const escapeHtml = (s) => (s || "").replace(/[&<>"']/g, (c) => ({
 
 // ---------- Init ----------
 
+function applyTheme(t) {
+  document.documentElement.dataset.theme = t;
+  localStorage.setItem("theme", t);
+  const btn = $("themeToggle");
+  if (btn) btn.textContent = t === "light" ? "◐" : "◑";
+}
+
+function bindThemeToggle() {
+  applyTheme(localStorage.getItem("theme") || "light");
+  const btn = $("themeToggle");
+  if (btn) btn.onclick = () =>
+    applyTheme(document.documentElement.dataset.theme === "light" ? "dark" : "light");
+}
+
 async function init() {
+  bindThemeToggle();
   await loadProjects();
   renderProjectList();
   if (state.projects.length) await openProject(state.projects[0].slug);
@@ -165,6 +181,7 @@ async function openProject(slug) {
   if (!state.projectCache[slug]) {
     const r = await fetch(`/api/projects/${slug}`);
     state.projectCache[slug] = await r.json();
+    state.nodePositions[slug] = { ...(state.projectCache[slug].positions || {}) };
   }
   renderTabs();
   renderProjectList();
@@ -231,9 +248,13 @@ function applyTabVisibility() {
 function nextZ() { state.zTop += 1; return state.zTop; }
 
 function focusWindow(w) {
+  if (w.type === "graph") return; // canvas layer: always at the bottom, never raised
   w.z = nextZ();
   w.el.style.zIndex = w.z;
-  for (const x of state.windows) x.el.classList.toggle("focused", x === w);
+  for (const x of state.windows) {
+    if (x.type === "graph") continue;
+    x.el.classList.toggle("focused", x === w);
+  }
 }
 
 function hideWindow(w) {
@@ -294,6 +315,18 @@ function windowTitle(w) {
 
 function createWindowDom(w) {
   const root = $("windowsRoot");
+  // The graph is not a floating window: it is the workspace canvas itself,
+  // full-bleed behind every other window, with no chrome.
+  if (w.type === "graph") {
+    const el = document.createElement("div");
+    el.className = "graph-canvas";
+    el.dataset.id = w.id;
+    root.appendChild(el);
+    w.el = el;
+    w.contentEl = el;
+    renderWindowContent(w);
+    return;
+  }
   const el = document.createElement("div");
   el.className = "window focused";
   el.dataset.id = w.id;
@@ -397,7 +430,8 @@ function renderWindowContent(w) {
       <div class="zoom-controls">
         <button data-z="in" title="zoom in (Ctrl/Cmd+scroll)">+</button>
         <button data-z="out" title="zoom out">−</button>
-        <button data-z="fit" title="fit">⌖</button>
+        <button data-z="fit" title="fit — zoom vừa khung, không đổi vị trí node">⌖</button>
+        <button data-z="relayout" title="re-layout — xếp lại tự động toàn bộ node">⟲</button>
         <span class="zoom-level"></span>
       </div>`;
     bindGraphWindow(w);
@@ -479,35 +513,41 @@ function layoutAgents(agents) {
 }
 
 function renderGraphInWindow(w) {
+  // An SSE event mid-drag would rebuild the svg and detach the dragged node;
+  // skip and let _endNodeDrag re-render when the drag finishes.
+  if (_nodeDrag && _nodeDrag.gw === w) { _nodeDrag.rerenderPending = true; return; }
   const svg = w.el.querySelector(".graph-svg");
   if (!svg) return;
   svg.innerHTML = "";
   const proj = state.projectCache[w.projectSlug];
   if (!proj) return;
 
-  const W = svg.clientWidth || w.w - 20;
-  const H = svg.clientHeight || w.h - 50;
-  const { layers } = layoutAgents(proj.agents);
-  const layerKeys = Object.keys(layers).map(Number).sort((a, b) => a - b);
+  const W = svg.clientWidth || 760;
+  const saved = state.nodePositions[proj.slug] || (state.nodePositions[proj.slug] = {});
 
-  const nodeW = 150, nodeH = 56, vGap = 80, hGap = 26;
-  const positions = {};
-  const yStart = 50;
-  layerKeys.forEach((lvl, li) => {
-    const row = layers[lvl];
-    const totalW = row.length * nodeW + (row.length - 1) * hGap;
-    const xStart = Math.max(30, (W - totalW) / 2);
-    row.forEach((id, i) => {
-      positions[id] = { x: xStart + i * (nodeW + hGap), y: yStart + li * (nodeH + vGap) };
-    });
+  const nodeW = 150, nodeH = 56;
+  // Auto-layout only seeds nodes that were never placed by hand — a saved
+  // position is layout truth and is never silently overridden.
+  const unplaced = proj.agents.filter((a) => !saved[a.id]);
+  if (unplaced.length) {
+    const auto = autoLayoutPositions(proj.agents, W, nodeW, nodeH);
+    unplaced.forEach((a) => { saved[a.id] = auto[a.id] || { x: 30, y: 30 }; });
+  }
+
+  const sizes = {};
+  proj.agents.forEach((a) => {
+    const expanded = state.expandedNodes.has(`${proj.slug}:${a.id}`);
+    sizes[a.id] = expanded ? { w: PANEL_W, h: PANEL_H } : { w: nodeW, h: nodeH };
   });
+  w._sizes = sizes;
 
-  const allPos = Object.values(positions);
+  const allPos = proj.agents.filter((a) => saved[a.id])
+    .map((a) => ({ ...saved[a.id], ...sizes[a.id] }));
   if (allPos.length) {
-    const minX = Math.min(...allPos.map((p) => p.x)) - 24;
-    const minY = Math.min(...allPos.map((p) => p.y)) - 24;
-    const maxX = Math.max(...allPos.map((p) => p.x + nodeW)) + 24;
-    const maxY = Math.max(...allPos.map((p) => p.y + nodeH)) + 24;
+    const minX = Math.min(...allPos.map((p) => p.x)) - 40;
+    const minY = Math.min(...allPos.map((p) => p.y)) - 40;
+    const maxX = Math.max(...allPos.map((p) => p.x + p.w)) + 40;
+    const maxY = Math.max(...allPos.map((p) => p.y + p.h)) + 40;
     state.graphBounds[proj.slug] = { x: minX, y: minY, w: maxX - minX, h: maxY - minY };
   }
 
@@ -515,30 +555,32 @@ function renderGraphInWindow(w) {
   const defs = document.createElementNS(ns, "defs");
   defs.innerHTML = `<marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5"
       markerWidth="8" markerHeight="8" orient="auto-start-reverse">
-      <path d="M0,0 L10,5 L0,10 z" fill="#5a6280"/></marker>`;
+      <path class="arrow-head" d="M0,0 L10,5 L0,10 z"/></marker>`;
   svg.appendChild(defs);
 
+  // Edges: bezier between border anchors, direction-agnostic. A↔B pairs get
+  // opposite perpendicular bends so the two curves don't overlap.
+  const edgeSet = new Set(proj.edges.map((e) => `${e.source}->${e.target}`));
+  w._edges = [];
   proj.edges.forEach((e) => {
-    const s = positions[e.source], t = positions[e.target];
-    if (!s || !t) return;
-    const x1 = s.x + nodeW / 2, y1 = s.y + nodeH;
-    const x2 = t.x + nodeW / 2, y2 = t.y;
-    const my = (y1 + y2) / 2;
+    if (!saved[e.source] || !saved[e.target]) return;
     const path = document.createElementNS(ns, "path");
     let edgeCls = "edge";
     if (state.activeDispatches.has(`${e.source}->${e.target}`)) edgeCls += " edge-active";
     path.setAttribute("class", edgeCls);
-    path.setAttribute("d", `M ${x1} ${y1} C ${x1} ${my}, ${x2} ${my}, ${x2} ${y2}`);
+    const bend = edgeSet.has(`${e.target}->${e.source}`) ? 16 : 0;
+    path.setAttribute("d", edgePathD(saved[e.source], sizes[e.source], saved[e.target], sizes[e.target], bend));
     svg.appendChild(path);
+    w._edges.push({ el: path, source: e.source, target: e.target, bend });
   });
 
   // Expanded panels are painted last so they overlay neighbouring nodes/edges
   // instead of being clipped behind them.
   const deferred = [];
   proj.agents.forEach((a) => {
-    const pos = positions[a.id];
+    const pos = saved[a.id];
     if (!pos) return;
-    const g = buildAgentNode(proj, a, pos, nodeW, nodeH);
+    const g = buildAgentNode(proj, a, pos, nodeW, nodeH, w);
     if (state.expandedNodes.has(`${proj.slug}:${a.id}`)) deferred.push(g);
     else svg.appendChild(g);
   });
@@ -547,10 +589,59 @@ function renderGraphInWindow(w) {
   applyViewBox(svg, proj.slug, w);
 }
 
+function autoLayoutPositions(agents, W, nodeW, nodeH) {
+  const { layers } = layoutAgents(agents);
+  const layerKeys = Object.keys(layers).map(Number).sort((a, b) => a - b);
+  const vGap = 80, hGap = 26, yStart = 50;
+  const out = {};
+  layerKeys.forEach((lvl, li) => {
+    const row = layers[lvl];
+    const totalW = row.length * nodeW + (row.length - 1) * hGap;
+    const xStart = Math.max(30, (W - totalW) / 2);
+    row.forEach((id, i) => {
+      out[id] = { x: xStart + i * (nodeW + hGap), y: yStart + li * (nodeH + vGap) };
+    });
+  });
+  return out;
+}
+
+// Point on the border of rect (pos,size) from its centre toward (tx,ty).
+function rectAnchor(pos, size, tx, ty) {
+  const cx = pos.x + size.w / 2, cy = pos.y + size.h / 2;
+  const dx = tx - cx, dy = ty - cy;
+  if (!dx && !dy) return { x: cx, y: cy };
+  const sx = dx ? (size.w / 2) / Math.abs(dx) : Infinity;
+  const sy = dy ? (size.h / 2) / Math.abs(dy) : Infinity;
+  const s = Math.min(sx, sy);
+  return { x: cx + dx * s, y: cy + dy * s };
+}
+
+function edgePathD(sPos, sSize, tPos, tSize, bend) {
+  const scx = sPos.x + sSize.w / 2, scy = sPos.y + sSize.h / 2;
+  const tcx = tPos.x + tSize.w / 2, tcy = tPos.y + tSize.h / 2;
+  const a1 = rectAnchor(sPos, sSize, tcx, tcy);
+  const a2 = rectAnchor(tPos, tSize, scx, scy);
+  const dx = a2.x - a1.x, dy = a2.y - a1.y;
+  const len = Math.hypot(dx, dy) || 1;
+  const px = (-dy / len) * bend, py = (dx / len) * bend;
+  const c1 = { x: a1.x + dx / 3 + px, y: a1.y + dy / 3 + py };
+  const c2 = { x: a2.x - dx / 3 + px, y: a2.y - dy / 3 + py };
+  return `M ${a1.x} ${a1.y} C ${c1.x} ${c1.y}, ${c2.x} ${c2.y}, ${a2.x} ${a2.y}`;
+}
+
+function updateEdgesLive(w) {
+  const saved = state.nodePositions[w.projectSlug] || {};
+  const sizes = w._sizes || {};
+  (w._edges || []).forEach(({ el, source, target, bend }) => {
+    if (!saved[source] || !saved[target] || !sizes[source] || !sizes[target]) return;
+    el.setAttribute("d", edgePathD(saved[source], sizes[source], saved[target], sizes[target], bend));
+  });
+}
+
 // Expanded-panel geometry (viewBox units, matches collapsed node width baseline).
 const PANEL_W = 212, PANEL_H = 284; // headroom for warn rows + plan progress rows
 
-function buildAgentNode(proj, a, pos, nodeW, nodeH) {
+function buildAgentNode(proj, a, pos, nodeW, nodeH, gw) {
   const ns = "http://www.w3.org/2000/svg";
   const status = (proj.statuses && proj.statuses[a.id]) || "idle";
   const isOrchestrator = (a.parents || []).length === 0;
@@ -578,6 +669,9 @@ function buildAgentNode(proj, a, pos, nodeW, nodeH) {
     `<div xmlns="http://www.w3.org/1999/xhtml" class="${cls}" style="min-height:${nodeH}px">`
     + nodeCardHtml(a, status, expanded, stats) + `</div>`;
   g.appendChild(fo);
+
+  const card = fo.querySelector(".agent-card");
+  if (card && gw) card.addEventListener("mousedown", (e) => onNodeMouseDown(e, gw, proj, a, fo));
 
   const chev = fo.querySelector(".ac-expand");
   if (chev) chev.onclick = (e) => { e.stopPropagation(); toggleNode(proj.slug, a.id); };
@@ -650,6 +744,81 @@ function toggleNode(slug, id) {
     if (!state.statsCache[slug]) ensureStats(slug);
   }
   rerenderGraphsForSlug(slug);
+}
+
+// ---------- Node drag (rearrange agents on canvas, persisted in db) ----------
+
+const NODE_DRAG_THRESHOLD = 4; // px on screen — below this it's a click, not a drag
+let _nodeDrag = null;
+
+function onNodeMouseDown(e, gw, proj, a, fo) {
+  if (e.button !== 0) return;
+  if (e.target.closest(".ac-expand, .ac-open, button, a, textarea, input, select")) return;
+  const svg = gw.el.querySelector(".graph-svg");
+  const vb = state.viewBoxes[proj.slug];
+  const pos = (state.nodePositions[proj.slug] || {})[a.id];
+  if (!svg || !vb || !pos) return;
+  const rect = svg.getBoundingClientRect();
+  _nodeDrag = {
+    gw, slug: proj.slug, id: a.id, fo,
+    sx: e.clientX, sy: e.clientY,
+    x0: pos.x, y0: pos.y,
+    scaleX: vb.w / rect.width, scaleY: vb.h / rect.height,
+    moved: false,
+  };
+  e.stopPropagation();
+  document.addEventListener("mousemove", _onNodeDragMove);
+  document.addEventListener("mouseup", _endNodeDrag);
+}
+
+function _onNodeDragMove(e) {
+  const d = _nodeDrag;
+  if (!d) return;
+  const dxs = e.clientX - d.sx, dys = e.clientY - d.sy;
+  if (!d.moved && Math.hypot(dxs, dys) < NODE_DRAG_THRESHOLD) return;
+  if (!d.moved) {
+    d.moved = true;
+    const card = d.fo.querySelector(".agent-card");
+    if (card) card.classList.add("node-dragging");
+  }
+  e.preventDefault();
+  const pos = state.nodePositions[d.slug][d.id];
+  pos.x = d.x0 + dxs * d.scaleX;
+  pos.y = d.y0 + dys * d.scaleY;
+  d.fo.setAttribute("x", pos.x);
+  d.fo.setAttribute("y", pos.y);
+  updateEdgesLive(d.gw);
+}
+
+function _endNodeDrag() {
+  const d = _nodeDrag;
+  if (!d) return;
+  _nodeDrag = null;
+  document.removeEventListener("mousemove", _onNodeDragMove);
+  document.removeEventListener("mouseup", _endNodeDrag);
+  const card = d.fo.querySelector(".agent-card");
+  if (card) card.classList.remove("node-dragging");
+  if (d.moved) {
+    // swallow the click that follows mouseup so it doesn't open the chat;
+    // disarm on next tick in case no click fires (released off-element)
+    const swallow = (ce) => { ce.stopPropagation(); ce.preventDefault(); };
+    document.addEventListener("click", swallow, { capture: true, once: true });
+    setTimeout(() => document.removeEventListener("click", swallow, { capture: true }), 0);
+    schedulePositionSave(d.slug);
+  }
+  if (d.rerenderPending) renderGraphInWindow(d.gw);
+}
+
+const _posSaveTimers = {};
+function schedulePositionSave(slug) {
+  clearTimeout(_posSaveTimers[slug]);
+  _posSaveTimers[slug] = setTimeout(() => {
+    fetch(`/api/projects/${slug}/positions`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ positions: state.nodePositions[slug] || {} }),
+    }).catch(() => {});
+  }, 600);
 }
 
 async function ensureStats(slug, force) {
@@ -805,6 +974,12 @@ function bindGraphWindow(w) {
       if (act === "in") zoomBy(w, 0.9);
       else if (act === "out") zoomBy(w, 1.111);
       else if (act === "fit") {
+        delete state.viewBoxes[w.projectSlug];
+        renderGraphInWindow(w);
+      } else if (act === "relayout") {
+        if (!confirm("Xếp lại tự động toàn bộ node? Vị trí đã kéo tay sẽ mất.")) return;
+        fetch(`/api/projects/${w.projectSlug}/positions`, { method: "DELETE" }).catch(() => {});
+        state.nodePositions[w.projectSlug] = {};
         delete state.viewBoxes[w.projectSlug];
         renderGraphInWindow(w);
       }
@@ -2544,7 +2719,7 @@ function bindGlobalKeys() {
     }
     // Cmd+W — close focused window
     if (e.metaKey && (e.key === "w" || e.key === "W")) {
-      const focused = state.windows.filter((w) => !w.hidden && w.projectSlug === state.activeTab)
+      const focused = state.windows.filter((w) => !w.hidden && w.type !== "graph" && w.projectSlug === state.activeTab)
         .sort((a, b) => b.z - a.z)[0];
       if (focused) { e.preventDefault(); closeWindow(focused); }
     }

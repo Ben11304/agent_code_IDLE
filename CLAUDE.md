@@ -9,7 +9,7 @@ This file is read on session start. Follow it.
 - **Subscription wrappers, not API**. Every agent call goes through a local CLI (`claude -p` for Claude nodes, `aas ask` for Grok). No `ANTHROPIC_API_KEY` is read, no token billing on top of subscription.
 - **Agents live in Python, not CLI processes**. The "living" agent is the Python session row + SQLite history + persisted `claude_session_id`. Each turn spawns `claude -p --resume <id>` then exits. Do not bet on a long-running stream-json input mode; it is undocumented and brittle.
 - **Dispatch is verifiable on the graph**. Orchestrator emits `<dispatch agent="ID">task</dispatch>`. Backend parses live, fires a background worker chat, and emits `dispatch_started` / `dispatch_complete` SSE events. UI animates edge + worker node. If the model only narrates "I will dispatch" without the tag, the graph does not move — the user sees the lie immediately.
-- **Floating windows, not panels**. The workspace is a VSCode-like desktop with draggable, resizable, hidable windows. Graph and each agent chat are independent windows. Multiple agents can chat simultaneously.
+- **Graph is the canvas; chats float above it**. The graph is no longer a window — it is the full-bleed workspace background itself (`.graph-canvas`, z-index 0, no chrome). Chat/file windows are draggable, resizable, hidable floating windows on top. Multiple agents can chat simultaneously. Nodes are draggable with positions persisted in SQLite (`node_positions`) — layout is not derived from hierarchy, so non-top-down topologies (cycles, peer mesh, multi-root) render fine.
 - **Streaming integrity matters**. Claude CLI is Node; piped stdout is block-buffered. We attach stdout to a PTY (raw termios) so each JSON event arrives line-by-line in real time. Touch `adapters.py:claude_stream` carefully.
 
 ## File map
@@ -20,11 +20,11 @@ app/
 │   ├── main.py          FastAPI: /api/projects*, /tree, /file + /raw, /workspace/*, SSE chat with dispatch parsing + ledger enrichment + auto-continuation
 │   ├── adapters.py      claude_stream (PTY) + grok_stream (PTY, streaming-json, --resume, --best-of-n, --check, --memory)
 │   ├── projects.py      registry + project.yaml loader, graph edges, workspace_root, agent bootstrap templates + create_agent atomic
-│   └── db.py            SQLite sessions, messages, agent_overrides, dispatch_results; cleanup_stale_running on startup
+│   └── db.py            SQLite sessions, messages, agent_overrides, dispatch_results, node_positions; cleanup_stale_running on startup
 ├── frontend/
 │   ├── index.html       Loads marked + DOMPurify from CDN, sidebar + workspace + taskbar
-│   ├── app.js           Vanilla JS, window manager, SVG graph, SSE parser, markdown render, slash commands
-│   └── styles.css       Dark theme, window chrome, edge/node animations, dispatch card, command menu
+│   ├── app.js           Vanilla JS, window manager, SVG graph canvas (drag nodes + persist), SSE parser, markdown render, slash commands
+│   └── styles.css       Theme tokens (dark + light via :root[data-theme]), window chrome, edge/node animations, dispatch card, command menu
 ├── registry.yaml        List of project root paths to scan
 ├── agentui.db           SQLite, auto-created on first run
 └── run.sh               venv bootstrap + uvicorn launcher
@@ -56,17 +56,24 @@ Port conflicts: `lsof -ti tcp:5174 | xargs kill -9`.
 
 - **Sidebar (left)**: project cards + **workspace-wide folder tree** (rooted at `workspace_root` from registry.yaml or the common parent of all registered projects; folders that are themselves registered projects get a diamond ◆ accent). Click any file to open it in a floating viewer window (markdown rendered, code in monospace, PDF + images via browser-native preview, binary fallback with a "tải về raw" link). ⌥⌘C copies absolute path of the selected file/folder.
 - **Tabs (top)**: open projects. Switch tabs to change the active project; windows from other projects are hidden but kept in memory.
-- **Workspace (center)**: floating windows. Graph window auto-opens per project. Click an agent node to open its chat window. Drag title bar, resize bottom-right corner, hide (minimize) to taskbar, close with × or Cmd+W.
+- **Workspace (center)**: the graph canvas is the background (auto-created per project); chat/file windows float above it. Click an agent node to open its chat window, drag a node to rearrange the graph. Drag title bar, resize bottom-right corner, hide (minimize) to taskbar, close with × or Cmd+W (the canvas itself can't be closed).
 - **Taskbar (bottom)**: minimized windows; click to restore.
 
-### Graph window
+### Graph canvas (the workspace background)
 
-- Click node → open / focus chat window for that agent
-- Scroll to zoom (anchored at cursor), drag empty area to pan
-- + / − / ⌖ buttons in the corner; ⌖ refits the graph
-- Node color: idle gray / running yellow pulse / ok green / error red
-- Edge: pulsing purple dash during active dispatch
-- Each node shows its current model in the badge (e.g. `opus-4-8`)
+- Click node → open / focus chat window for that agent. **Drag node → move it** (≥4px movement distinguishes drag from click; the trailing click is swallowed).
+- Node positions persist per project in the `node_positions` table: payload of `GET /api/projects/{slug}` includes `positions`; drags save via debounced (600ms) `POST /api/projects/{slug}/positions`; `DELETE` clears all.
+- Auto-layout (layered by `parents`) only **seeds nodes that have no saved position** — a hand-placed node is never silently moved.
+- Edges are direction-agnostic beziers between border anchors (`edgePathD` + `rectAnchor`), arrowhead via `.arrow-head` CSS class; A↔B pairs bend apart. During a node drag, `updateEdgesLive` rewrites only the `d` attributes.
+- Scroll to zoom (anchored at cursor), drag empty area to pan.
+- Corner buttons: + / − zoom, ⌖ **fit** (viewBox only, positions untouched), ⟲ **re-layout** (confirm → wipe saved positions → re-seed auto-layout).
+- Node color: idle gray / running yellow pulse / ok green / error red.
+- Edge: pulsing purple dash during active dispatch.
+- Each node shows its current model in the badge (e.g. `opus-4-8`).
+
+### Theme
+
+Light (default) / dark toggle — ◐ button in the sidebar title, persisted in `localStorage.theme`, applied as `data-theme` on `<html>`. All colors in `styles.css` are CSS custom properties; the light palette lives in `:root[data-theme="light"]`. When adding UI, never hard-code colors — use the tokens (`--bg-code`, `--hover`, `--glass`, `--accent-border`, `--edge`, `--orch-bg`, …).
 
 ### Chat window
 

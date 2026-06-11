@@ -211,7 +211,38 @@ def api_project(slug: str):
         if "effort" in ov:
             a["effort"] = ov["effort"]
     out["statuses"] = statuses
+    out["positions"] = db.get_node_positions(slug)
     return out
+
+
+class NodePositions(BaseModel):
+    positions: dict[str, dict]
+
+
+@app.post("/api/projects/{slug}/positions")
+def api_save_positions(slug: str, body: NodePositions):
+    p = projects.get_project(slug)
+    if not p:
+        raise HTTPException(404, "project not found")
+    valid_ids = {a["id"] for a in p["agents"]}
+    clean = {}
+    for agent_id, pos in body.positions.items():
+        if agent_id not in valid_ids:
+            continue
+        try:
+            clean[agent_id] = {"x": float(pos["x"]), "y": float(pos["y"])}
+        except (KeyError, TypeError, ValueError):
+            raise HTTPException(400, f"invalid position for {agent_id}")
+    db.set_node_positions(slug, clean)
+    return {"saved": sorted(clean.keys())}
+
+
+@app.delete("/api/projects/{slug}/positions")
+def api_clear_positions(slug: str):
+    if not projects.get_project(slug):
+        raise HTTPException(404, "project not found")
+    db.clear_node_positions(slug)
+    return {"cleared": True}
 
 
 # Approximate context-window sizes per adapter family. Used only to render the
