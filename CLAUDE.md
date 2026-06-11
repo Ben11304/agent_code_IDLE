@@ -54,7 +54,7 @@ Port conflicts: `lsof -ti tcp:5174 | xargs kill -9`.
 
 ## UI overview
 
-- **Sidebar (left)**: project cards + **workspace-wide folder tree** (rooted at `workspace_root` from registry.yaml or the common parent of all registered projects; folders that are themselves registered projects get a diamond ◆ accent). Click any file to open it in a floating viewer window (markdown rendered, code in monospace, PDF + images via browser-native preview, binary fallback with a "tải về raw" link). ⌥⌘C copies absolute path of the selected file/folder.
+- **Sidebar (left)**: project cards + **workspace-wide folder tree** (rooted at `workspace_root` from registry.yaml or the common parent of all registered projects; folders that are themselves registered projects get a diamond ◆ accent). Click any file to open it in a floating viewer window (markdown rendered, code in monospace, PDF + images via browser-native preview, binary fallback with a "download raw" link). ⌥⌘C copies absolute path of the selected file/folder.
 - **Tabs (top)**: open projects. Switch tabs to change the active project; windows from other projects are hidden but kept in memory.
 - **Workspace (center)**: the graph canvas is the background (auto-created per project); chat/file windows float above it. Click an agent node to open its chat window, drag a node to rearrange the graph. Drag title bar, resize bottom-right corner, hide (minimize) to taskbar, close with × or Cmd+W (the canvas itself can't be closed).
 - **Taskbar (bottom)**: minimized windows; click to restore.
@@ -79,8 +79,8 @@ Light (default) / dark toggle — ◐ button in the sidebar title, persisted in 
 
 - Header: agent name, role, current model + effort (text only — change via `/model` / `/effort`)
 - Messages: full markdown rendering (marked + DOMPurify); dispatch tags become collapsed cards
-- Input: Enter sends, Shift+Enter newlines, Esc stops streaming, gồm slash commands
-- "Gửi" button toggles to red "Stop" while streaming
+- Input: Enter sends, Shift+Enter newlines, Esc stops streaming, plus slash commands
+- "Send" button toggles to red "Stop" while streaming
 
 ### Add agent (UI form + parent-generated bootstrap)
 
@@ -95,10 +95,10 @@ Click `+ agent` on the graph window. The form collects:
 - `cwd` (relative; if blank → `<ID>`)
 - `parents` (multi-select from existing agents)
 - **Bootstrap mode** — radio:
-  - **Sinh từ parent** (default if a parent is selected): the system sends a `[CONTROL-PLANE BOOTSTRAP REQUEST]` to the first parent in the list (e.g. BOSS). The parent emits 5 `<file path="...">...</file>` blocks based on its project knowledge. The modal streams that output live; on `bootstrap_done` the parsed files become the preview.
+  - **Generate from parent** (default if a parent is selected): the system sends a `[CONTROL-PLANE BOOTSTRAP REQUEST]` to the first parent in the list (e.g. BOSS). The parent emits 5 `<file path="...">...</file>` blocks based on its project knowledge. The modal streams that output live; on `bootstrap_done` the parsed files become the preview.
   - **Template generic**: render a static skeleton (used if no parent, or for fast iteration without burning quota).
 
-Both modes lead to the same **preview pane** — collapsible blocks of each file's content + warnings (missing required file, path outside agent folder, `shared/` absent in project, etc.). Click `← Quay lại sửa` to edit the form, or `✓ Tạo agent` to write.
+Both modes lead to the same **preview pane** — collapsible blocks of each file's content + warnings (missing required file, path outside agent folder, `shared/` absent in project, etc.). Click `← Back to edit` to edit the form, or `✓ Create agent` to write.
 
 Writing is atomic: backend creates `<project_root>/<ID>/`, writes every file, then appends to `project.yaml` via ruamel.yaml (preserves comments). Any failure rolls back the folder. On success, the graph rerenders, the folder tree refreshes, and the new node is dispatchable from any orchestrator that lists it as a child.
 
@@ -204,7 +204,7 @@ When editing the dispatch prompt, remember the user verifies on the graph. Keep 
 | `start` | `agent` | Stream opened. |
 | `agent_status` | `agent`, `status` | Node color update (`running` mid-turn, etc). |
 | `meta` | `agent`, `data` | Includes `claude_session_id`. Persisted for `--resume`. |
-| `status` | `agent`, `status=thinking\|responding` | Drives the "đang suy nghĩ…" indicator. |
+| `status` | `agent`, `status=thinking\|responding` | Drives the "thinking…" indicator. |
 | `thinking` | `agent`, `text` | Recent thinking chunk (visible in indicator). |
 | `delta` | `agent`, `text` | Assistant text delta. Appended to bubble. |
 | `dispatch_started` | `source`, `target`, `task` | Animate edge, mark target running. |
@@ -269,7 +269,7 @@ Template generation lives in `projects.py:_AGENT_FILE_TEMPLATES` (5 templates) +
 - **Dispatch contract verify.** `_dispatched_run` snapshots the worker's `outputs/manifest.md` (mtime + version) before/after; an unchanged manifest on an ok dispatch appends a `[control-plane verify]` warning into the ledger text so the orchestrator demands a manifest bump before consuming artifact-producing work.
 - **Tab close cancels SSE**. Dispatched workers can be killed mid-turn if the browser disconnects (driver cascades cancel). On startup the orphan reaper marks any leftover `running` sessions as `cancelled` so the UI is never permanently stuck.
 - **Resume guard**. `--resume` is only used when `last_status == "ok"`. Any prior turn that was `running` / `cancelled` / `error` is treated as torn (claude server state may be mid-reply); next turn starts a fresh CLI session. This avoids the "agent silently returns nothing" failure mode after a stop / orphan.
-- **SSE heartbeat**. The chat stream emits `: keepalive` every 15s of quiet. Required because Opus extended thinking can sit 10–30s without bytes — without the heartbeat, browsers and proxies close the SSE and the UI shows "đã dừng" with no response.
+- **SSE heartbeat**. The chat stream emits `: keepalive` every 15s of quiet. Required because Opus extended thinking can sit 10–30s without bytes — without the heartbeat, browsers and proxies close the SSE and the UI shows "stopped" with no response.
 - **Add-agent is creation-only**. Edit and delete (with archive) are Sprint 1. To remove an agent today: stop the server, delete the folder + remove the yaml entry by hand, restart.
 
 If you implement any of these, update this section.

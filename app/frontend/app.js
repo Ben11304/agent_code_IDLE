@@ -78,7 +78,7 @@ function renderSkills() {
   if (!root) return;
   root.innerHTML = "";
   if (!state.skills.length) {
-    root.innerHTML = `<div class="skills-empty">Không tìm thấy skill trong ~/.claude/skills</div>`;
+    root.innerHTML = `<div class="skills-empty">No skills found in ~/.claude/skills</div>`;
     return;
   }
   state.skills.forEach((s) => {
@@ -88,10 +88,10 @@ function renderSkills() {
     row.innerHTML = `
       <div class="skill-top">
         <span class="skill-name">${escapeHtml(s.name)}</span>
-        <button class="skill-expand" title="${expanded ? "thu gọn" : "xem đầy đủ"}">${expanded ? "▾" : "▸"}</button>
+        <button class="skill-expand" title="${expanded ? "collapse" : "show full"}">${expanded ? "▾" : "▸"}</button>
       </div>
-      <div class="skill-desc">${escapeHtml(s.description || "(không có mô tả)")}</div>
-      <div class="skill-actions"><button class="skill-use">Dùng ↗</button></div>`;
+      <div class="skill-desc">${escapeHtml(s.description || "(no description)")}</div>
+      <div class="skill-actions"><button class="skill-use">Use ↗</button></div>`;
     row.querySelector(".skill-expand").onclick = () => {
       if (state.expandedSkills.has(s.name)) state.expandedSkills.delete(s.name);
       else state.expandedSkills.add(s.name);
@@ -110,15 +110,15 @@ function focusedChatWindow() {
 
 function useSkill(name) {
   const w = focusedChatWindow();
-  if (!w) { flashHint("Mở chat một agent trước đã (click node trong graph)."); return; }
+  if (!w) { flashHint("Open an agent chat first (click a node in the graph)."); return; }
   const input = w.el.querySelector(".chat-input");
   if (!input) return;
   const prefix = input.value.trim() ? input.value.trim() + "\n" : "";
-  input.value = `${prefix}Dùng skill \`${name}\` cho: `;
+  input.value = `${prefix}Use skill \`${name}\` for: `;
   focusWindow(w);
   input.focus();
   input.setSelectionRange(input.value.length, input.value.length);
-  flashHint(`đã chèn lệnh gọi \`${name}\` vào chat ${w.agentId} — sửa & gửi`);
+  flashHint(`inserted \`${name}\` call into ${w.agentId} chat — edit & send`);
 }
 
 function bindSidebarResizer() {
@@ -288,7 +288,7 @@ function renderTaskbar() {
     const it = document.createElement("div");
     it.className = "taskbar-item";
     it.innerHTML = `<span>${escapeHtml(windowTitle(w))}</span>
-      <span class="close" title="đóng">×</span>`;
+      <span class="close" title="close">×</span>`;
     it.onclick = (e) => {
       if (e.target.classList.contains("close")) {
         e.stopPropagation();
@@ -339,8 +339,8 @@ function createWindowDom(w) {
     <div class="window-titlebar">
       <span class="window-title">${escapeHtml(windowTitle(w))}<span class="badge">${w.type}</span></span>
       <div class="window-controls">
-        <button class="window-btn hide" title="ẩn (minimize)">—</button>
-        <button class="window-btn close" title="đóng">×</button>
+        <button class="window-btn hide" title="hide (minimize)">—</button>
+        <button class="window-btn close" title="close">×</button>
       </div>
     </div>
     <div class="window-content"></div>
@@ -425,13 +425,13 @@ function renderWindowContent(w) {
   if (w.type === "graph") {
     c.innerHTML = `<svg class="graph-svg" xmlns="http://www.w3.org/2000/svg"></svg>
       <div class="graph-toolbar">
-        <button class="toolbar-btn add-agent-btn" title="thêm agent vào project">+ agent</button>
+        <button class="toolbar-btn add-agent-btn" title="add agent to project">+ agent</button>
       </div>
       <div class="zoom-controls">
         <button data-z="in" title="zoom in (Ctrl/Cmd+scroll)">+</button>
         <button data-z="out" title="zoom out">−</button>
-        <button data-z="fit" title="fit — zoom vừa khung, không đổi vị trí node">⌖</button>
-        <button data-z="relayout" title="re-layout — xếp lại tự động toàn bộ node">⟲</button>
+        <button data-z="fit" title="fit — zoom to fit, node positions unchanged">⌖</button>
+        <button data-z="relayout" title="re-layout — auto-arrange all nodes">⟲</button>
         <span class="zoom-level"></span>
       </div>`;
     bindGraphWindow(w);
@@ -444,7 +444,7 @@ function renderWindowContent(w) {
         <button class="toolbar-btn file-reload" title="reload">⟳</button>
         <button class="toolbar-btn file-copy" title="copy abs path">⌘</button>
       </div>
-      <div class="file-body">đang tải…</div>`;
+      <div class="file-body">loading…</div>`;
     c.querySelector(".file-path").textContent = w.rel_path || "";
     c.querySelector(".file-path").title = w.abs_path || "";
     c.querySelector(".file-reload").onclick = () => loadFileContent(w);
@@ -461,9 +461,9 @@ function renderWindowContent(w) {
         <div class="chatbox-label">Chat session</div>
         <form class="chat-form">
           <textarea class="chat-input" rows="2"
-            placeholder="Enter để gửi (Shift+Enter xuống dòng)"></textarea>
+            placeholder="Enter to send (Shift+Enter for newline)"></textarea>
           <button class="chat-stop" type="button" hidden>Stop</button>
-          <button class="chat-send" type="submit">Gửi</button>
+          <button class="chat-send" type="submit">Send</button>
         </form>
         <div class="chat-status"></div>
       </div>`;
@@ -691,7 +691,7 @@ function nodeCardHtml(a, status, expanded, stats) {
     <div class="ac-head">
       <span class="ac-dot" style="background:${statusColor(status)}"></span>
       <span class="ac-id">${escapeHtml(a.id)}</span>
-      <span class="ac-expand" title="${expanded ? "thu gọn" : "mở rộng"}">${chev}</span>
+      <span class="ac-expand" title="${expanded ? "collapse" : "expand"}">${chev}</span>
     </div>
     <div class="ac-model">${escapeHtml(modelLabel(a))}</div>`;
   if (expanded) html += `<div class="ac-body">${nodeBodyHtml(a, stats)}</div>`;
@@ -699,7 +699,7 @@ function nodeCardHtml(a, status, expanded, stats) {
 }
 
 function nodeBodyHtml(a, stats) {
-  if (!stats) return `<div class="ac-loading">đang tải số liệu…</div>`;
+  if (!stats) return `<div class="ac-loading">loading stats…</div>`;
   const pct = stats.context_pct || 0;
   const barCls = pct > 80 ? "hot" : (pct > 50 ? "warm" : "");
   const mem = stats.memory;
@@ -714,7 +714,7 @@ function nodeBodyHtml(a, stats) {
     : "fresh";
   const exact = stats.token_source === "exact";
   const tokK = exact ? "tokens" : "≈ tokens";
-  const ctxTitle = exact ? "số token thật từ CLI (lượt gần nhất)" : "ước lượng chars/4 — chưa có lượt hoàn tất";
+  const ctxTitle = exact ? "actual token count from CLI (latest turn)" : "chars/4 estimate — no completed turn yet";
   return `
     <div class="ac-row ac-ctx" title="${ctxTitle}">
       <span class="ac-k">context${exact ? "" : " ≈"}</span>
@@ -722,17 +722,17 @@ function nodeBodyHtml(a, stats) {
       <span class="ac-v">${pct}%</span>
     </div>
     <div class="ac-row"><span class="ac-k">${tokK}</span><span class="ac-v">${fmtTokens(stats.context_tokens)} / ${fmtTokens(stats.context_window)}</span></div>
-    ${pct >= 80 ? `<div class="ac-warn" title="ngưỡng auto-compact: 80%">🔄 auto-compact sẽ chạy ở lượt kế</div>` : ""}
-    <div class="ac-row"><span class="ac-k">bộ nhớ</span><span class="ac-v${memStale ? " ac-stale" : ""}">${memTime}${memStale ? " ⚠" : ""}</span></div>
-    ${memStale ? `<div class="ac-warn">⚠ hoạt động gần đây nhưng chưa ghi bộ nhớ</div>` : ""}
+    ${pct >= 80 ? `<div class="ac-warn" title="auto-compact threshold: 80%">🔄 auto-compact will run next turn</div>` : ""}
+    <div class="ac-row"><span class="ac-k">memory</span><span class="ac-v${memStale ? " ac-stale" : ""}">${memTime}${memStale ? " ⚠" : ""}</span></div>
+    ${memStale ? `<div class="ac-warn">⚠ recent activity but memory not written</div>` : ""}
     ${memHead ? `<div class="ac-headline" title="${memHead}">${memHead}</div>` : ""}
     ${stats.plan ? `<div class="ac-row"><span class="ac-k">plan</span><span class="ac-v">${stats.plan.done}/${stats.plan.total}${stats.plan.blocked ? " ⛔" : ""}</span></div>` : ""}
     ${stats.plan && stats.plan.current ? `<div class="ac-headline" title="${escapeHtml(stats.plan.current)}">▸ ${escapeHtml(stats.plan.current)}</div>` : ""}
-    <div class="ac-row"><span class="ac-k">hoạt động</span><span class="ac-v">${lastAct}</span></div>
+    <div class="ac-row"><span class="ac-k">activity</span><span class="ac-v">${lastAct}</span></div>
     <div class="ac-row"><span class="ac-k">messages</span><span class="ac-v">${stats.message_count}</span></div>
     <div class="ac-row"><span class="ac-k">effort</span><span class="ac-v">${effort}</span></div>
     <div class="ac-row"><span class="ac-k">session</span><span class="ac-v">${sessTxt}</span></div>
-    <div class="ac-actions"><button class="ac-open">mở chat ↗</button></div>`;
+    <div class="ac-actions"><button class="ac-open">open chat ↗</button></div>`;
 }
 
 function toggleNode(slug, id) {
@@ -840,13 +840,13 @@ function fmtRelTime(epochSec) {
   if (!epochSec) return "—";
   let d = Date.now() / 1000 - epochSec;
   if (d < 0) d = 0;
-  if (d < 45) return "vừa xong";
-  if (d < 90) return "1 phút trước";
-  if (d < 3600) return Math.round(d / 60) + " phút trước";
-  if (d < 7200) return "1 giờ trước";
-  if (d < 86400) return Math.round(d / 3600) + " giờ trước";
-  if (d < 172800) return "hôm qua";
-  return Math.round(d / 86400) + " ngày trước";
+  if (d < 45) return "just now";
+  if (d < 90) return "1 min ago";
+  if (d < 3600) return Math.round(d / 60) + " min ago";
+  if (d < 7200) return "1 hr ago";
+  if (d < 86400) return Math.round(d / 3600) + " hr ago";
+  if (d < 172800) return "yesterday";
+  return Math.round(d / 86400) + " d ago";
 }
 
 function modelLabel(a) {
@@ -912,12 +912,12 @@ async function loadFileContent(w) {
   body.style.padding = "";
 
   // Text / markdown: go through /file (UTF-8 decode + size cap)
-  body.textContent = "đang tải…";
+  body.textContent = "loading…";
   try {
     const r = await fetch(`/api/workspace/file?path=${encodeURIComponent(w.rel_path)}`);
     const j = await r.json();
     if (!r.ok) {
-      body.textContent = `lỗi ${r.status}: ${j.detail || ""}`;
+      body.textContent = `error ${r.status}: ${j.detail || ""}`;
       if (info) info.textContent = "";
       return;
     }
@@ -925,7 +925,7 @@ async function loadFileContent(w) {
     if (j.is_binary) {
       body.innerHTML = `<div class="file-binary">
         ${escapeHtml(j.content)}<br>
-        <a href="${rawUrl}" target="_blank" rel="noopener">tải về raw</a>
+        <a href="${rawUrl}" target="_blank" rel="noopener">download raw</a>
       </div>`;
       return;
     }
@@ -977,7 +977,7 @@ function bindGraphWindow(w) {
         delete state.viewBoxes[w.projectSlug];
         renderGraphInWindow(w);
       } else if (act === "relayout") {
-        if (!confirm("Xếp lại tự động toàn bộ node? Vị trí đã kéo tay sẽ mất.")) return;
+        if (!confirm("Auto-arrange all nodes? Hand-dragged positions will be lost.")) return;
         fetch(`/api/projects/${w.projectSlug}/positions`, { method: "DELETE" }).catch(() => {});
         state.nodePositions[w.projectSlug] = {};
         delete state.viewBoxes[w.projectSlug];
@@ -1126,7 +1126,7 @@ function renderChatHeader(w) {
     <div class="header-meta">
       <span class="meta-model">${escapeHtml(modelText)}</span>
       ${effortText ? `<span class="meta-effort">${escapeHtml(effortText)}</span>` : ""}
-      <span class="meta-hint">gõ <code>/</code> để xem lệnh</span>
+      <span class="meta-hint">type <code>/</code> for commands</span>
       <span class="save-hint"></span>
     </div>`;
 }
@@ -1135,7 +1135,7 @@ async function updateAgentSettings(w, claudeModel, grokModel, effort) {
   const slug = w.projectSlug;
   const agentId = w.agentId;
   const hint = w.el.querySelector(".save-hint");
-  if (hint) { hint.textContent = "lưu…"; hint.style.color = "var(--text-dim)"; }
+  if (hint) { hint.textContent = "saving…"; hint.style.color = "var(--text-dim)"; }
   try {
     const r = await fetch(`/api/projects/${slug}/agents/${agentId}/settings`, {
       method: "POST",
@@ -1155,13 +1155,13 @@ async function updateAgentSettings(w, claudeModel, grokModel, effort) {
       .filter((x) => x.type === "chat" && x.projectSlug === slug && x.agentId === agentId)
       .forEach((x) => renderChatHeader(x));
     if (hint) {
-      hint.textContent = "✓ áp dụng lượt sau";
+      hint.textContent = "✓ applies next turn";
       hint.style.color = "var(--ok)";
       clearTimeout(updateAgentSettings._t);
       updateAgentSettings._t = setTimeout(() => { hint.textContent = ""; }, 2500);
     }
   } catch (err) {
-    if (hint) { hint.textContent = "lỗi"; hint.style.color = "var(--err)"; }
+    if (hint) { hint.textContent = "error"; hint.style.color = "var(--err)"; }
   }
 }
 
@@ -1222,7 +1222,7 @@ function renderMessage(text) {
 }
 
 function dispatchCardHtml(card) {
-  const status = card.complete ? "đã gửi" : "đang viết tag…";
+  const status = card.complete ? "sent" : "writing tag…";
   const body = escapeHtml(card.body.trim());
   const preview = card.body.trim().split("\n")[0].slice(0, 80);
   return `<div class="dispatch-card">
@@ -1332,7 +1332,7 @@ function stopChat(w) {
   if (w.abortController) {
     try { w.abortController.abort(); } catch {}
   }
-  setChatStatus(w, "đang dừng…");
+  setChatStatus(w, "stopping…");
 }
 
 // ---------- Chat queue (send while streaming) ----------
@@ -1349,7 +1349,7 @@ function enqueueMessage(w, text) {
 function renumberQueue(w) {
   (w.queue || []).forEach((q, i) => {
     const role = q.el && q.el.querySelector(".role");
-    if (role) role.innerHTML = `user <span class="queue-tag">⏳ hàng chờ #${i + 1}</span>`;
+    if (role) role.innerHTML = `user <span class="queue-tag">⏳ queue #${i + 1}</span>`;
   });
 }
 
@@ -1357,8 +1357,8 @@ function updateQueueStatus(w) {
   const n = (w.queue || []).length;
   if (w.streaming) {
     setChatStatus(w, n
-      ? `đang chạy • ${n} trong hàng chờ (Esc/Stop để dừng tất cả)`
-      : "đang chạy... (Esc để dừng)");
+      ? `running • ${n} queued (Esc/Stop to stop all)`
+      : "running... (Esc to stop)");
   }
 }
 
@@ -1376,20 +1376,20 @@ function drainQueue(w) {
 
 // adapter: "*" = both, "claude" / "grok" = adapter-specific
 const CHAT_COMMANDS = [
-  { cmd: "/help",     adapter: "*",     hint: "",                                    desc: "danh sách commands",                                exec: cmdHelp },
-  { cmd: "/clear",    adapter: "*",     hint: "",                                    desc: "tạo session mới (history cũ vẫn lưu trong db)",     exec: cmdClear },
-  { cmd: "/compact",  adapter: "*",     hint: "",                                    desc: "agent tóm tắt context → session mới seed bằng recap (giảm % context)", exec: cmdCompact },
-  { cmd: "/model",    adapter: "*",     hint: "<...>",                               desc: "đổi model agent này",                              exec: cmdModel },
-  { cmd: "/effort",   adapter: "*",     hint: "<default|low|medium|high|max>",       desc: "đổi effort agent này",                             exec: cmdEffort },
-  { cmd: "/focus",    adapter: "*",     hint: "<AGENT_ID>",                          desc: "mở chat agent khác trong project",                 exec: cmdFocus },
-  { cmd: "/dispatch", adapter: "*",     hint: "<AGENT_ID> <task>",                   desc: "mở chat agent đích và gửi task ngay",              exec: cmdDispatch },
-  { cmd: "/stop",     adapter: "*",     hint: "",                                    desc: "dừng stream hiện tại",                             exec: cmdStop },
-  { cmd: "/status",   adapter: "*",     hint: "",                                    desc: "trạng thái session, model, effort, next-options",  exec: cmdStatus },
+  { cmd: "/help",     adapter: "*",     hint: "",                                    desc: "list commands",                                exec: cmdHelp },
+  { cmd: "/clear",    adapter: "*",     hint: "",                                    desc: "new session (old history kept in db)",     exec: cmdClear },
+  { cmd: "/compact",  adapter: "*",     hint: "",                                    desc: "agent summarizes context → new session seeded with recap (reduces context %)", exec: cmdCompact },
+  { cmd: "/model",    adapter: "*",     hint: "<...>",                               desc: "change this agent's model",                              exec: cmdModel },
+  { cmd: "/effort",   adapter: "*",     hint: "<default|low|medium|high|max>",       desc: "change this agent's effort",                             exec: cmdEffort },
+  { cmd: "/focus",    adapter: "*",     hint: "<AGENT_ID>",                          desc: "open another agent's chat in this project",                 exec: cmdFocus },
+  { cmd: "/dispatch", adapter: "*",     hint: "<AGENT_ID> <task>",                   desc: "open target agent's chat and send the task now",              exec: cmdDispatch },
+  { cmd: "/stop",     adapter: "*",     hint: "",                                    desc: "stop the current stream",                             exec: cmdStop },
+  { cmd: "/status",   adapter: "*",     hint: "",                                    desc: "session, model, effort, next-options status",  exec: cmdStatus },
   // grok-only one-shot modifiers (consumed by next message)
-  { cmd: "/best-of",  adapter: "grok",  hint: "<2..5>",                              desc: "lượt KẾ: chạy N attempts song song, pick best",    exec: cmdBestOf },
-  { cmd: "/check",    adapter: "grok",  hint: "",                                    desc: "lượt KẾ: thêm self-verification loop",             exec: cmdCheck },
-  { cmd: "/memory",   adapter: "grok",  hint: "<on|off>",                            desc: "lượt KẾ: bật/tắt cross-session memory",            exec: cmdMemory },
-  { cmd: "/reset-next", adapter: "*",   hint: "",                                    desc: "huỷ next-options đã set (best-of, check, memory)",  exec: cmdResetNext },
+  { cmd: "/best-of",  adapter: "grok",  hint: "<2..5>",                              desc: "NEXT turn: run N attempts in parallel, pick best",    exec: cmdBestOf },
+  { cmd: "/check",    adapter: "grok",  hint: "",                                    desc: "NEXT turn: add self-verification loop",             exec: cmdCheck },
+  { cmd: "/memory",   adapter: "grok",  hint: "<on|off>",                            desc: "NEXT turn: toggle cross-session memory",            exec: cmdMemory },
+  { cmd: "/reset-next", adapter: "*",   hint: "",                                    desc: "cancel next-options already set (best-of, check, memory)",  exec: cmdResetNext },
 ];
 
 function _agentAdapter(w) {
@@ -1472,7 +1472,7 @@ async function executeChatCommand(w, text) {
   const arg = space === -1 ? "" : text.slice(space + 1).trim();
   const handler = CHAT_COMMANDS.find((c) => c.cmd === cmd);
   if (!handler) {
-    addSystemBubble(w, `❓ command không hợp lệ: \`${cmd}\`. Gõ \`/help\` để xem danh sách.`);
+    addSystemBubble(w, `❓ invalid command: \`${cmd}\`. Type \`/help\` for the list.`);
     return;
   }
   await handler.exec(w, arg);
@@ -1497,7 +1497,7 @@ async function cmdHelp(w) {
     const sig = hint ? `\`${c.cmd}\` \`${hint}\`` : `\`${c.cmd}\``;
     lines.push(`- ${sig} — ${c.desc}`);
   }
-  lines.push("", "Phím tắt trong input: Tab chọn lệnh, ↑↓ duyệt, Esc đóng menu / dừng stream.");
+  lines.push("", "Input shortcuts: Tab to pick a command, ↑↓ to browse, Esc to close the menu / stop the stream.");
   addSystemBubble(w, lines.join("\n"));
 }
 
@@ -1507,23 +1507,23 @@ async function cmdClear(w) {
     await fetch(`/api/projects/${slug}/agents/${agent}/clear`, { method: "POST" });
     await refreshChatSession(w);
     ensureStats(slug, true);
-    addSystemBubble(w, "✓ session mới đã tạo. History cũ vẫn còn trong db, không xoá vĩnh viễn.");
+    addSystemBubble(w, "✓ new session created. Old history remains in db, not deleted permanently.");
   } catch (err) {
-    addSystemBubble(w, "lỗi khi tạo session mới: " + err.message);
+    addSystemBubble(w, "error creating new session: " + err.message);
   }
 }
 
 async function cmdCompact(w) {
-  if (w.streaming) { addSystemBubble(w, "đang stream — gõ /stop trước khi compact."); return; }
+  if (w.streaming) { addSystemBubble(w, "streaming — type /stop before compacting."); return; }
   const slug = w.projectSlug, agent = w.agentId;
-  addSystemBubble(w, "📦 Đang compact: agent tự tóm tắt context hiện tại…");
+  addSystemBubble(w, "📦 Compacting: agent is summarizing its current context…");
   const b = addBubble(w, "assistant", "");
   b.querySelector(".role").textContent = "compact • " + agent;
   const contentEl = b.querySelector(".content");
   let assembled = "";
   w.streaming = true;
   setSendBtn(w, "stop");
-  setChatStatus(w, "đang compact… (Esc để dừng)");
+  setChatStatus(w, "compacting… (Esc to stop)");
   try {
     w.abortController = new AbortController();
     const resp = await fetch(`/api/projects/${slug}/agents/${agent}/compact`, {
@@ -1531,7 +1531,7 @@ async function cmdCompact(w) {
       signal: w.abortController.signal,
     });
     if (!resp.ok || !resp.body) {
-      setContent(contentEl, `(lỗi backend ${resp.status})`);
+      setContent(contentEl, `(backend error ${resp.status})`);
       return;
     }
     const reader = resp.body.getReader();
@@ -1555,7 +1555,7 @@ async function cmdCompact(w) {
         } else if (evt.type === "compacted") {
           ok = true;
         } else if (evt.type === "error") {
-          addSystemBubble(w, "lỗi compact: " + (evt.message || ""));
+          addSystemBubble(w, "compact error: " + (evt.message || ""));
         }
       }
     }
@@ -1563,13 +1563,13 @@ async function cmdCompact(w) {
       // The new seeded session is now active; reload it (shows the recap boundary).
       await refreshChatSession(w);
       ensureStats(slug, true);
-      addSystemBubble(w, "✓ Đã compact. Session mới seed bằng recap — lượt kế tiếp tiếp tục với context nhỏ. Session cũ vẫn lưu trong db.");
+      addSystemBubble(w, "✓ Compacted. New session seeded with recap — the next turn continues with a smaller context. Old session still kept in db.");
     } else {
-      setContent(contentEl, assembled || "(compact không hoàn tất)");
+      setContent(contentEl, assembled || "(compact incomplete)");
     }
   } catch (err) {
-    if (err.name !== "AbortError") addSystemBubble(w, "lỗi compact: " + err.message);
-    else setChatStatus(w, "đã dừng");
+    if (err.name !== "AbortError") addSystemBubble(w, "compact error: " + err.message);
+    else setChatStatus(w, "stopped");
   } finally {
     w.streaming = false;
     w.abortController = null;
@@ -1604,30 +1604,30 @@ async function cmdModel(w, arg) {
 
   if (!arg) {
     addSystemBubble(w, isGrok
-      ? "Cú pháp: `/model <grok-build|grok-composer>`"
-      : "Cú pháp: `/model <fable-5|opus-4-8|opus-4-7|sonnet|haiku>`");
+      ? "Syntax: `/model <grok-build|grok-composer>`"
+      : "Syntax: `/model <fable-5|opus-4-8|opus-4-7|sonnet|haiku>`");
     return;
   }
 
   const eff = agent.effort ?? "";
   if (isGrok) {
     const target = _GROK_MODEL_ALIAS[arg.toLowerCase()] || (arg.startsWith("grok-") ? arg : null);
-    if (!target) { addSystemBubble(w, `model grok không hợp lệ: \`${arg}\``); return; }
+    if (!target) { addSystemBubble(w, `invalid grok model: \`${arg}\``); return; }
     await updateAgentSettings(w, null, target, eff);
-    addSystemBubble(w, `✓ grok_model → \`${target}\` (áp dụng lượt chat tiếp theo)`);
+    addSystemBubble(w, `✓ grok_model → \`${target}\` (applies from the next chat turn)`);
     return;
   }
 
   const target = _CLAUDE_MODEL_ALIAS[arg.toLowerCase()] || (arg.startsWith("claude-") ? arg : null);
-  if (!target) { addSystemBubble(w, `model claude không hợp lệ: \`${arg}\``); return; }
+  if (!target) { addSystemBubble(w, `invalid claude model: \`${arg}\``); return; }
   await updateAgentSettings(w, target, null, eff);
-  addSystemBubble(w, `✓ claude_model → \`${target}\` (áp dụng lượt chat tiếp theo)`);
+  addSystemBubble(w, `✓ claude_model → \`${target}\` (applies from the next chat turn)`);
 }
 
 async function cmdEffort(w, arg) {
   const allowed = ["default", "low", "medium", "high", "xhigh", "max"];
   if (!arg || !allowed.includes(arg.toLowerCase())) {
-    addSystemBubble(w, "Cú pháp: `/effort default|low|medium|high|xhigh|max`");
+    addSystemBubble(w, "Syntax: `/effort default|low|medium|high|xhigh|max`");
     return;
   }
   const eff = arg.toLowerCase() === "default" ? "" : arg.toLowerCase();
@@ -1642,31 +1642,31 @@ async function cmdEffort(w, arg) {
 }
 
 async function cmdFocus(w, arg) {
-  if (!arg) { addSystemBubble(w, "Cú pháp: `/focus <AGENT_ID>`"); return; }
+  if (!arg) { addSystemBubble(w, "Syntax: `/focus <AGENT_ID>`"); return; }
   const proj = state.projectCache[w.projectSlug];
   const agent = proj.agents.find((a) => a.id.toUpperCase() === arg.toUpperCase());
-  if (!agent) { addSystemBubble(w, `không thấy agent: \`${arg}\``); return; }
+  if (!agent) { addSystemBubble(w, `agent not found: \`${arg}\``); return; }
   openChat(w.projectSlug, agent.id);
 }
 
 async function cmdDispatch(w, arg) {
   const space = arg.indexOf(" ");
   if (space === -1) {
-    addSystemBubble(w, "Cú pháp: `/dispatch <AGENT_ID> <task>`");
+    addSystemBubble(w, "Syntax: `/dispatch <AGENT_ID> <task>`");
     return;
   }
   const targetId = arg.slice(0, space).trim();
   const task = arg.slice(space + 1).trim();
   const proj = state.projectCache[w.projectSlug];
   const agent = proj.agents.find((a) => a.id.toUpperCase() === targetId.toUpperCase());
-  if (!agent) { addSystemBubble(w, `không thấy agent: \`${targetId}\``); return; }
+  if (!agent) { addSystemBubble(w, `agent not found: \`${targetId}\``); return; }
   const tw = openChat(w.projectSlug, agent.id);
   // small delay so the new window has bound its DOM before we call into it
   setTimeout(() => sendMessageInWindow(tw, task), 50);
 }
 
 async function cmdStop(w) {
-  if (!w.streaming) { addSystemBubble(w, "không có stream nào đang chạy."); return; }
+  if (!w.streaming) { addSystemBubble(w, "no stream is running."); return; }
   stopChat(w);
 }
 
@@ -1684,43 +1684,43 @@ function openNewProjectDialog() {
   overlay.innerHTML = `
     <div class="modal">
       <div class="modal-header">
-        <span>Tạo dự án mới</span>
-        <button class="modal-close" title="đóng">×</button>
+        <span>Create new project</span>
+        <button class="modal-close" title="close">×</button>
       </div>
       <form class="modal-body" id="newProjectForm">
         <div class="form-row">
-          <label class="full">Đường dẫn thư mục (tuyệt đối)
+          <label class="full">Folder path (absolute)
             <input name="root" type="text" autocomplete="off" spellcheck="false"
               placeholder="VD: /users/PGS0407/binben14/VietHuy/MyProject" />
-            <span class="hint" id="npPathHint">Thư mục code có sẵn hoặc tạo mới. shared/ + sync.sh + agent folders sẽ được scaffold vào đây.</span>
+            <span class="hint" id="npPathHint">Existing code folder or a new one. shared/ + sync.sh + agent folders will be scaffolded here.</span>
           </label>
         </div>
         <div class="form-row">
-          <label>Tên dự án
-            <input name="name" type="text" placeholder="auto từ tên folder nếu trống" />
+          <label>Project name
+            <input name="name" type="text" placeholder="auto from folder name if empty" />
           </label>
           <label>Slug
             <input name="slug" type="text" placeholder="auto" autocomplete="off" />
           </label>
         </div>
         <div class="form-row">
-          <label class="full">Mô tả (1 dòng)
-            <input name="description" type="text" placeholder="VD: VLM benchmark trên dataset X" />
+          <label class="full">Description (1 line)
+            <input name="description" type="text" placeholder="e.g. VLM benchmark on dataset X" />
           </label>
         </div>
 
         <div class="form-row">
-          <label class="full">Agents (định nghĩa graph — để trống nếu muốn thêm sau qua "+ agent")
+          <label class="full">Agents (graph definition — leave empty to add later via "+ agent")
             <div id="npAgents" class="np-agents"></div>
-            <button type="button" class="btn-secondary" id="npAddAgent" style="margin-top:6px">+ thêm agent</button>
-            <span class="hint">Parents = ID (cách nhau dấu phẩy) của agent cha trong danh sách này. Agent không parent = orchestrator.</span>
+            <button type="button" class="btn-secondary" id="npAddAgent" style="margin-top:6px">+ add agent</button>
+            <span class="hint">Parents = comma-separated IDs of parent agents in this list. An agent with no parent = orchestrator.</span>
           </label>
         </div>
 
         <div class="modal-msg" id="newProjectMsg"></div>
         <div class="modal-actions">
-          <button type="button" class="btn-secondary" id="cancelNewProject">Hủy</button>
-          <button type="submit" class="btn-primary">Tạo dự án</button>
+          <button type="button" class="btn-secondary" id="cancelNewProject">Cancel</button>
+          <button type="submit" class="btn-primary">Create project</button>
         </div>
       </form>
     </div>`;
@@ -1737,7 +1737,7 @@ function openNewProjectDialog() {
     row.innerHTML = `
       <input class="np-id" placeholder="ID" pattern="[A-Z][A-Z0-9_]*" autocomplete="off"
         value="${preset && preset.id ? escapeHtml(preset.id) : ""}" />
-      <input class="np-role" placeholder="role (1 dòng)"
+      <input class="np-role" placeholder="role (1 line)"
         value="${preset && preset.role ? escapeHtml(preset.role) : ""}" />
       <select class="np-model">
         <option value="claude" selected>claude</option>
@@ -1745,12 +1745,12 @@ function openNewProjectDialog() {
       </select>
       <input class="np-parents" placeholder="parents (CSV)"
         value="${preset && preset.parents ? escapeHtml(preset.parents) : ""}" />
-      <button type="button" class="np-del" title="xoá">×</button>`;
+      <button type="button" class="np-del" title="delete">×</button>`;
     row.querySelector(".np-del").onclick = () => row.remove();
     agentsBox.appendChild(row);
   }
   // seed a sensible default orchestrator
-  addAgentRow({ id: "BOSS", role: "Orchestrator — phân tích yêu cầu, dispatch xuống agent con", parents: "" });
+  addAgentRow({ id: "BOSS", role: "Orchestrator — analyze requests, dispatch to child agents", parents: "" });
   overlay.querySelector("#npAddAgent").onclick = () => addAgentRow();
 
   // live path validation
@@ -1759,15 +1759,15 @@ function openNewProjectDialog() {
   rootInput.addEventListener("input", () => {
     clearTimeout(pathTimer);
     const p = rootInput.value.trim();
-    if (!p) { pathHint.textContent = "Thư mục code có sẵn hoặc tạo mới."; pathHint.className = "hint"; return; }
+    if (!p) { pathHint.textContent = "Existing code folder or a new one."; pathHint.className = "hint"; return; }
     pathTimer = setTimeout(async () => {
       try {
         const r = await fetch(`/api/fs/validate?path=${encodeURIComponent(p)}`);
         const j = await r.json();
-        if (j.is_project) { pathHint.textContent = "⚠ Thư mục đã là một AgentUI project."; pathHint.className = "hint err"; }
-        else if (!j.exists) { pathHint.textContent = j.parent_exists ? "✓ Sẽ tạo thư mục mới ở đây." : "⚠ Thư mục cha không tồn tại."; pathHint.className = j.parent_exists ? "hint ok" : "hint err"; }
-        else if (j.is_dir) { pathHint.textContent = j.non_empty ? "✓ Thư mục có sẵn (sẽ thêm scaffold, không xoá file)." : "✓ Thư mục trống."; pathHint.className = "hint ok"; }
-        else { pathHint.textContent = "⚠ Path tồn tại nhưng không phải thư mục."; pathHint.className = "hint err"; }
+        if (j.is_project) { pathHint.textContent = "⚠ Folder is already an AgentUI project."; pathHint.className = "hint err"; }
+        else if (!j.exists) { pathHint.textContent = j.parent_exists ? "✓ Will create a new folder here." : "⚠ Parent folder does not exist."; pathHint.className = j.parent_exists ? "hint ok" : "hint err"; }
+        else if (j.is_dir) { pathHint.textContent = j.non_empty ? "✓ Folder exists (scaffold will be added, no files deleted)." : "✓ Folder is empty."; pathHint.className = "hint ok"; }
+        else { pathHint.textContent = "⚠ Path exists but is not a folder."; pathHint.className = "hint err"; }
       } catch { /* ignore */ }
     }, 350);
   });
@@ -1784,7 +1784,7 @@ function openNewProjectDialog() {
     e.preventDefault();
     msg.textContent = "";
     const root = rootInput.value.trim();
-    if (!root) { msg.textContent = "Cần đường dẫn thư mục."; msg.className = "modal-msg err"; return; }
+    if (!root) { msg.textContent = "Folder path is required."; msg.className = "modal-msg err"; return; }
     const agents = [];
     for (const row of agentsBox.querySelectorAll(".np-agent-row")) {
       const id = row.querySelector(".np-id").value.trim();
@@ -1805,21 +1805,21 @@ function openNewProjectDialog() {
       agents,
     };
     const btn = form.querySelector(".btn-primary");
-    btn.disabled = true; btn.textContent = "Đang tạo…";
+    btn.disabled = true; btn.textContent = "Creating…";
     try {
       const r = await fetch("/api/projects/create", {
         method: "POST", headers: { "Content-Type": "application/json" },
         body: JSON.stringify(payload),
       });
       const j = await r.json();
-      if (!r.ok) { msg.textContent = "Lỗi: " + (j.detail || r.status); msg.className = "modal-msg err"; btn.disabled = false; btn.textContent = "Tạo dự án"; return; }
+      if (!r.ok) { msg.textContent = "Error: " + (j.detail || r.status); msg.className = "modal-msg err"; btn.disabled = false; btn.textContent = "Create project"; return; }
       state.projects = j.projects || state.projects;
       renderProjectList();
       close();
       await openProject(j.slug);
     } catch (err) {
       msg.textContent = "network error: " + err.message; msg.className = "modal-msg err";
-      btn.disabled = false; btn.textContent = "Tạo dự án";
+      btn.disabled = false; btn.textContent = "Create project";
     }
   };
 }
@@ -1845,8 +1845,8 @@ function openAddAgentDialog(slug) {
   overlay.innerHTML = `
     <div class="modal">
       <div class="modal-header">
-        <span>Thêm agent vào <strong>${escapeHtml(proj.name)}</strong></span>
-        <button class="modal-close" title="đóng">×</button>
+        <span>Add agent to <strong>${escapeHtml(proj.name)}</strong></span>
+        <button class="modal-close" title="close">×</button>
       </div>
       <form class="modal-body" id="addAgentForm">
         <div class="form-row">
@@ -1854,7 +1854,7 @@ function openAddAgentDialog(slug) {
             <input name="id" type="text" required pattern="[A-Z][A-Z0-9_]*"
               placeholder="VD: REVIEWER" autocomplete="off" />
           </label>
-          <label>Role (mô tả 1 dòng)
+          <label>Role (1-line description)
             <input name="role" type="text"
               placeholder="VD: Adversarial code reviewer." />
           </label>
@@ -1894,7 +1894,7 @@ function openAddAgentDialog(slug) {
         <div class="form-row">
           <label>System prompt file (relative)
             <input name="system_prompt_file" type="text"
-              placeholder="VD: REVIEWER/AGENT.md (có thể để trống)" />
+              placeholder="e.g. REVIEWER/AGENT.md (may be left empty)" />
           </label>
           <label>cwd (relative)
             <input name="cwd" type="text" value="." />
@@ -1902,30 +1902,30 @@ function openAddAgentDialog(slug) {
         </div>
 
         <div class="form-row">
-          <label class="full">Parents (orchestrators có thể dispatch tới agent này)
+          <label class="full">Parents (orchestrators that can dispatch to this agent)
             <select name="parents" multiple size="${Math.min(6, Math.max(3, existing.length))}">
               ${parentOpts}
             </select>
-            <span class="hint">Ctrl/Cmd+click để chọn nhiều. Để trống nếu agent này là root.</span>
+            <span class="hint">Ctrl/Cmd+click to select multiple. Leave empty if this agent is a root.</span>
           </label>
         </div>
 
         <div class="form-row">
-          <label class="full">Cách sinh file bootstrap
+          <label class="full">How to generate the bootstrap files
             <div class="radio-group">
               <label class="radio-inline"><input type="radio" name="bootstrap_mode" value="from_parent" checked>
-                <span>Để parent agent đầu tiên tự viết (dựa trên context project mà parent biết)</span></label>
+                <span>Let the first parent agent write them (based on the project context the parent knows)</span></label>
               <label class="radio-inline"><input type="radio" name="bootstrap_mode" value="template">
-                <span>Dùng template generic (nhanh, không tốn quota)</span></label>
+                <span>Use a generic template (fast, no quota cost)</span></label>
             </div>
-            <span class="hint">Parent sẽ stream output realtime; bạn duyệt rồi mới ghi đĩa.</span>
+            <span class="hint">The parent streams output in realtime; you review before anything is written to disk.</span>
           </label>
         </div>
 
         <div class="modal-msg" id="addAgentMsg"></div>
         <div class="modal-actions">
-          <button type="button" class="btn-secondary" id="cancelAddAgent">Hủy</button>
-          <button type="submit" class="btn-primary">Tạo agent</button>
+          <button type="button" class="btn-secondary" id="cancelAddAgent">Cancel</button>
+          <button type="submit" class="btn-primary">Create agent</button>
         </div>
       </form>
     </div>`;
@@ -1982,10 +1982,10 @@ function openAddAgentDialog(slug) {
   function showPreview(data) {
     stage = "preview";
     previewFiles = data.files || [];
-    submitBtn.textContent = "✓ Tạo agent";
+    submitBtn.textContent = "✓ Create agent";
     submitBtn.disabled = false;
     const cancelBtn = overlay.querySelector("#cancelAddAgent");
-    cancelBtn.textContent = "← Quay lại sửa";
+    cancelBtn.textContent = "← Back to edit";
 
     form.querySelectorAll(".form-row").forEach((row) => row.style.display = "none");
     const genPanel = form.querySelector(".gen-panel");
@@ -2016,10 +2016,10 @@ function openAddAgentDialog(slug) {
 
   function backToForm() {
     stage = "form";
-    submitBtn.textContent = "Sinh / Xem trước →";
+    submitBtn.textContent = "Generate / Preview →";
     submitBtn.disabled = false;
     const cancelBtn = overlay.querySelector("#cancelAddAgent");
-    cancelBtn.textContent = "Hủy";
+    cancelBtn.textContent = "Cancel";
     form.querySelectorAll(".form-row").forEach((row) => row.style.display = "");
     const preview = form.querySelector(".agent-preview");
     if (preview) preview.remove();
@@ -2032,10 +2032,10 @@ function openAddAgentDialog(slug) {
 
   function showGenerating(parentId) {
     stage = "generating";
-    submitBtn.textContent = "đang sinh…";
+    submitBtn.textContent = "generating…";
     submitBtn.disabled = true;
     const cancelBtn = overlay.querySelector("#cancelAddAgent");
-    cancelBtn.textContent = "Dừng & quay lại";
+    cancelBtn.textContent = "Stop & go back";
     form.querySelectorAll(".form-row").forEach((row) => row.style.display = "none");
     let panel = form.querySelector(".gen-panel");
     if (panel) panel.remove();
@@ -2043,7 +2043,7 @@ function openAddAgentDialog(slug) {
     panel.className = "gen-panel";
     panel.innerHTML = `
       <div class="gen-header">
-        <strong>${escapeHtml(parentId)}</strong> đang sinh file bootstrap…
+        <strong>${escapeHtml(parentId)}</strong> is generating the bootstrap files…
       </div>
       <pre class="gen-output"></pre>`;
     msg.parentNode.insertBefore(panel, msg);
@@ -2055,7 +2055,7 @@ function openAddAgentDialog(slug) {
 
   // Override cancel button to support back-from-preview
   const cancelBtn = overlay.querySelector("#cancelAddAgent");
-  cancelBtn.textContent = "Hủy";
+  cancelBtn.textContent = "Cancel";
   cancelBtn.onclick = () => {
     if (stage === "preview") backToForm();
     else if (stage === "generating") { abortGen(); backToForm(); }
@@ -2063,7 +2063,7 @@ function openAddAgentDialog(slug) {
   };
 
   // Initial submit label
-  submitBtn.textContent = "Sinh / Xem trước →";
+  submitBtn.textContent = "Generate / Preview →";
 
   async function streamFromParent(body) {
     showGenerating(body.parents[0]);
@@ -2080,7 +2080,7 @@ function openAddAgentDialog(slug) {
       });
       if (!resp.ok || !resp.body) {
         const t = await resp.text();
-        msg.textContent = "lỗi: " + (resp.status) + " " + t.slice(0, 200);
+        msg.textContent = "error: " + (resp.status) + " " + t.slice(0, 200);
         msg.className = "modal-msg error";
         backToForm();
         return;
@@ -2109,7 +2109,7 @@ function openAddAgentDialog(slug) {
           } else if (evt.type === "thinking") {
             outEl.dataset.thinking = "1";
           } else if (evt.type === "error") {
-            msg.textContent = "parent lỗi: " + (evt.message || "unknown");
+            msg.textContent = "parent error: " + (evt.message || "unknown");
             msg.className = "modal-msg error";
           } else if (evt.type === "bootstrap_done") {
             done = evt;
@@ -2119,14 +2119,14 @@ function openAddAgentDialog(slug) {
       if (done) {
         msg.textContent = "";
         if (!done.files || !done.files.length) {
-          msg.textContent = "parent không emit file block nào. Thử lại hoặc dùng template.";
+          msg.textContent = "parent emitted no file blocks. Retry or use the template.";
           msg.className = "modal-msg error";
           backToForm();
           return;
         }
         showPreview(done);
       } else {
-        msg.textContent = "stream kết thúc nhưng không nhận bootstrap_done.";
+        msg.textContent = "stream ended without receiving bootstrap_done.";
         msg.className = "modal-msg error";
         backToForm();
       }
@@ -2149,7 +2149,7 @@ function openAddAgentDialog(slug) {
       if (useParent) {
         await streamFromParent(currentBody);
       } else {
-        msg.textContent = "đang sinh template…";
+        msg.textContent = "generating template…";
         msg.className = "modal-msg working";
         try {
           const r = await fetch(`/api/projects/${slug}/agents/preview`, {
@@ -2159,7 +2159,7 @@ function openAddAgentDialog(slug) {
           });
           const j = await r.json();
           if (!r.ok) {
-            msg.textContent = "lỗi: " + (j.detail || r.statusText);
+            msg.textContent = "error: " + (j.detail || r.statusText);
             msg.className = "modal-msg error";
             return;
           }
@@ -2173,7 +2173,7 @@ function openAddAgentDialog(slug) {
       return;
     }
     // stage === "preview" — actually create
-    msg.textContent = "đang ghi folder + yaml…";
+    msg.textContent = "writing folder + yaml…";
     msg.className = "modal-msg working";
     submitBtn.disabled = true;
     const payload = { ...currentBody, custom_files: previewFiles };
@@ -2186,7 +2186,7 @@ function openAddAgentDialog(slug) {
       });
       const j = await r.json();
       if (!r.ok) {
-        msg.textContent = "lỗi: " + (j.detail || r.statusText);
+        msg.textContent = "error: " + (j.detail || r.statusText);
         msg.className = "modal-msg error";
         submitBtn.disabled = false;
         return;
@@ -2198,7 +2198,7 @@ function openAddAgentDialog(slug) {
       t.cache = {};
       await fetchTreeLevel("");
       renderTree();
-      msg.textContent = "✓ đã tạo " + currentBody.id;
+      msg.textContent = "✓ created " + currentBody.id;
       msg.className = "modal-msg ok";
       setTimeout(close, 700);
     } catch (err) {
@@ -2237,38 +2237,38 @@ async function cmdStatus(w) {
 async function cmdBestOf(w, arg) {
   const n = parseInt(arg, 10);
   if (!n || n < 2 || n > 5) {
-    addSystemBubble(w, "Cú pháp: `/best-of <2..5>`");
+    addSystemBubble(w, "Syntax: `/best-of <2..5>`");
     return;
   }
   w.nextOptions = w.nextOptions || {};
   w.nextOptions.best_of_n = n;
-  addSystemBubble(w, `✓ lượt KẾ sẽ chạy \`best-of ${n}\` (consumed sau khi gửi)`);
+  addSystemBubble(w, `✓ NEXT turn will run \`best-of ${n}\` (consumed after send)`);
 }
 
 async function cmdCheck(w) {
   w.nextOptions = w.nextOptions || {};
   w.nextOptions.check_loop = true;
-  addSystemBubble(w, "✓ lượt KẾ sẽ thêm self-verification loop (consumed sau khi gửi)");
+  addSystemBubble(w, "✓ NEXT turn will add a self-verification loop (consumed after send)");
 }
 
 async function cmdMemory(w, arg) {
   const v = (arg || "").trim().toLowerCase();
   if (v !== "on" && v !== "off") {
-    addSystemBubble(w, "Cú pháp: `/memory <on|off>`");
+    addSystemBubble(w, "Syntax: `/memory <on|off>`");
     return;
   }
   w.nextOptions = w.nextOptions || {};
   w.nextOptions.memory_mode = v;
-  addSystemBubble(w, `✓ lượt KẾ memory \`${v}\` (consumed sau khi gửi)`);
+  addSystemBubble(w, `✓ NEXT turn memory \`${v}\` (consumed after send)`);
 }
 
 async function cmdResetNext(w) {
   if (!w.nextOptions) {
-    addSystemBubble(w, "không có next-options nào để huỷ.");
+    addSystemBubble(w, "no next-options to cancel.");
     return;
   }
   w.nextOptions = null;
-  addSystemBubble(w, "✓ đã huỷ next-options.");
+  addSystemBubble(w, "✓ next-options cancelled.");
 }
 
 function setSendBtn(w, mode) {
@@ -2279,7 +2279,7 @@ function setSendBtn(w, mode) {
   btn.disabled = false;
   btn.classList.remove("stop");
   // The send button always sends; while a turn streams it adds to the queue.
-  btn.textContent = (mode === "stop") ? "+ hàng chờ" : "Gửi";
+  btn.textContent = (mode === "stop") ? "+ queue" : "Send";
 }
 
 function setChatStatus(w, s) {
@@ -2304,7 +2304,7 @@ async function sendMessageInWindow(w, text) {
     thinkBlock.innerHTML = `
       <div class="think-header">
         <span class="think-toggle">▶</span>
-        <span class="think-label">đang chờ phản hồi…</span>
+        <span class="think-label">waiting for response…</span>
         <span class="think-count"></span>
       </div>
       <div class="think-body"></div>`;
@@ -2334,7 +2334,7 @@ async function sendMessageInWindow(w, text) {
   }
   w.streaming = true;
   setSendBtn(w, "stop");
-  setChatStatus(w, "đang chạy... (Esc để dừng)");
+  setChatStatus(w, "running... (Esc to stop)");
   updateQueueStatus(w);
   proj.statuses[rootAgent] = "running";
   rerenderGraphsForSlug(slug);
@@ -2355,7 +2355,7 @@ async function sendMessageInWindow(w, text) {
     if (!resp.ok || !resp.body) {
       const t = await resp.text();
       const b = bubbleFor(rootAgent);
-      setContent(b.contentEl, `(lỗi backend ${resp.status}) ${t}`);
+      setContent(b.contentEl, `(backend error ${resp.status}) ${t}`);
       proj.statuses[rootAgent] = "error";
       rerenderGraphsForSlug(slug);
       return;
@@ -2382,7 +2382,7 @@ async function sendMessageInWindow(w, text) {
     setChatStatus(w, "xong");
   } catch (err) {
     if (err.name === "AbortError") {
-      setChatStatus(w, "đã dừng");
+      setChatStatus(w, "stopped");
     } else {
       setChatStatus(w, "network error: " + err.message);
     }
@@ -2411,7 +2411,7 @@ function handleEventInWindow(w, slug, evt, bubbleFor, rootAgent) {
         b.streamingStarted = true;
         // collapse thinking label since we're now in response phase
         if (b.thinkAccum) {
-          b.thinkLabel.textContent = `thinking xong (${b.thinkAccum.length}c) — click để xem`;
+          b.thinkLabel.textContent = `thinking done (${b.thinkAccum.length}c) — click to view`;
         } else {
           // no thinking at all — hide the block to save space
           b.thinkBlock.style.display = "none";
@@ -2428,7 +2428,7 @@ function handleEventInWindow(w, slug, evt, bubbleFor, rootAgent) {
       b.thinkBody.textContent = b.thinkAccum;
       b.thinkCount.textContent = `${b.thinkAccum.length}c`;
       if (!b.streamingStarted) {
-        b.thinkLabel.textContent = "đang suy nghĩ…";
+        b.thinkLabel.textContent = "thinking…";
       }
       if (!b.thinkBlock.classList.contains("collapsed")) {
         b.thinkBody.scrollTop = b.thinkBody.scrollHeight;
@@ -2440,11 +2440,11 @@ function handleEventInWindow(w, slug, evt, bubbleFor, rootAgent) {
     case "status": {
       const b = bubbleFor(agent);
       if (evt.status === "thinking" && !b.streamingStarted) {
-        b.thinkLabel.textContent = "đang suy nghĩ…";
+        b.thinkLabel.textContent = "thinking…";
       } else if (evt.status === "responding") {
         b.streamingStarted = true;
         if (b.thinkAccum) {
-          b.thinkLabel.textContent = `thinking xong (${b.thinkAccum.length}c) — click để xem`;
+          b.thinkLabel.textContent = `thinking done (${b.thinkAccum.length}c) — click to view`;
         } else {
           b.thinkBlock.style.display = "none";
         }
@@ -2457,7 +2457,7 @@ function handleEventInWindow(w, slug, evt, bubbleFor, rootAgent) {
       if (evt.status === "running") {
         const b = bubbleFor(agent);
         if (!b.streamingStarted && !b.thinkAccum) {
-          b.thinkLabel.textContent = "đang chờ phản hồi…";
+          b.thinkLabel.textContent = "waiting for response…";
         }
       }
       break;
@@ -2470,7 +2470,7 @@ function handleEventInWindow(w, slug, evt, bubbleFor, rootAgent) {
       setContent(b.contentEl, finalText);
       // freeze thinking label final
       if (b.thinkAccum) {
-        b.thinkLabel.textContent = `thinking (${b.thinkAccum.length}c) — click để xem`;
+        b.thinkLabel.textContent = `thinking (${b.thinkAccum.length}c) — click to view`;
       } else {
         b.thinkBlock.style.display = "none";
       }
@@ -2480,25 +2480,25 @@ function handleEventInWindow(w, slug, evt, bubbleFor, rootAgent) {
       break;
     }
     case "plan_updated": {
-      setChatStatus(w, `📋 ${agent}: plan ${evt.total} bước — lưu vào state/plan.md`);
+      setChatStatus(w, `📋 ${agent}: plan ${evt.total} steps — saved to state/plan.md`);
       ensureStats(slug, true);
       break;
     }
     case "plan_step": {
       const ico = evt.status === "done" ? "✓" : (evt.status === "blocked" ? "⛔" : "▸");
-      setChatStatus(w, `📋 ${agent}: bước ${evt.n} ${ico} ${evt.status}`);
+      setChatStatus(w, `📋 ${agent}: step ${evt.n} ${ico} ${evt.status}`);
       ensureStats(slug, true);
       break;
     }
     case "compact_started": {
-      addSystemBubble(w, `📦 Context ${evt.pct || "?"}% — auto-compact trước khi chạy lượt này (agent tự tóm tắt rồi mở session mới)…`);
-      setChatStatus(w, "đang auto-compact…");
+      addSystemBubble(w, `📦 Context ${evt.pct || "?"}% — auto-compacting before this turn runs (agent summarizes itself, then a new session opens)…`);
+      setChatStatus(w, "auto-compacting…");
       break;
     }
     case "compacted": {
       ensureStats(slug, true);
       if (evt.auto) {
-        addSystemBubble(w, "✓ Auto-compact xong — session mới đã seed recap. Lượt của bạn chạy tiếp bên dưới.");
+        addSystemBubble(w, "✓ Auto-compact done — new session seeded with the recap. Your turn continues below.");
       }
       break;
     }
@@ -2521,7 +2521,7 @@ function handleEventInWindow(w, slug, evt, bubbleFor, rootAgent) {
       break;
     }
     case "dispatch_rejected": {
-      setChatStatus(w, `dispatch ${evt.target} bị từ chối: ${evt.reason}`);
+      setChatStatus(w, `dispatch ${evt.target} rejected: ${evt.reason}`);
       break;
     }
     case "error": {
@@ -2615,7 +2615,7 @@ function renderTree() {
   root.innerHTML = "";
   const t = _treeState();
   buildFlatTree();
-  if (!t.flat.length) { root.innerHTML = '<div class="tree-empty">(trống)</div>'; return; }
+  if (!t.flat.length) { root.innerHTML = '<div class="tree-empty">(empty)</div>'; return; }
   for (const item of t.flat) {
     const node = document.createElement("div");
     node.className = "tree-node " + item.type;
@@ -2663,11 +2663,11 @@ function selectedTreeItem() {
 
 async function copySelectedPath() {
   const item = selectedTreeItem();
-  if (!item) { flashHint("chưa chọn file/folder nào"); return; }
+  if (!item) { flashHint("no file/folder selected"); return; }
   try {
     await navigator.clipboard.writeText(item.abs_path);
     flashHint("copied: " + item.abs_path);
-  } catch { flashHint("clipboard bị chặn, path: " + item.abs_path); }
+  } catch { flashHint("clipboard blocked, path: " + item.abs_path); }
 }
 
 function flashHint(msg) {

@@ -1,15 +1,15 @@
 # Handoff Schema — Manifest format (shared)
 
-Manifest là **contract** giữa các agent. Mọi artifact đi qua manifest, không
-agent nào được đọc internals của agent khác.
+A manifest is the **contract** between agents. Every artifact passes through a manifest;
+no agent may read another agent's internals.
 
 ## File location
 - Producer: `<PRODUCER>/outputs/manifest.md`
-- Consumer: đọc qua `<CONSUMER>/inputs/manifest.md` (+ copy `inputs/<PRODUCER>.md`)
-- Sync bằng `bash sync.sh <CONSUMER>` (xem `sync.sh` ở project root).
+- Consumer: reads via `<CONSUMER>/inputs/manifest.md` (+ copy `inputs/<PRODUCER>.md`)
+- Sync with `bash sync.sh <CONSUMER>` (see `sync.sh` at the project root).
 
-Topology (ai produce cho ai) suy ra từ `parents` trong `.agentui/project.yaml`
-và được chốt trong `scope_decisions.md`.
+Topology (who produces for whom) is derived from `parents` in `.agentui/project.yaml`
+and locked in `scope_decisions.md`.
 
 ## Format
 
@@ -30,24 +30,24 @@ YYYY-MM-DD by <agent/run-id>
 ## Artifacts
 
 ### <artifact-name> @ <version>
-- **Path**: absolute hoặc repo-relative
+- **Path**: absolute or repo-relative
 - **Format**: py-module | parquet | json | yaml | csv | md | ...
-- **Schema**: link tới ABC / pydantic model / parquet schema
-- **Source**: file:line nơi định nghĩa
+- **Schema**: link to ABC / pydantic model / parquet schema
+- **Source**: file:line where defined
 - **Status**: ready | partial | deprecated
-- **Notes**: edge case, [VERIFY] nếu chưa kiểm
+- **Notes**: edge cases, [VERIFY] if unchecked
 
 ## Removed/Deprecated
-- <artifact-name> @ <version> — lý do
+- <artifact-name> @ <version> — reason
 ```
 
-## Quy tắc
+## Rules
 
-1. **Append-only thực tế**: artifact bỏ → chuyển section "Removed/Deprecated"
-   thay vì xoá entry (giữ lịch sử).
-2. **Bump version mỗi commit có thay đổi contract**. Consumer kiểm version
-   trước khi chạy.
-3. **Schema/contract mismatch** → consumer DỪNG, escalate producer. KHÔNG tự
-   fix downstream.
-4. Manifest CHỈ trỏ đường (path + version), KHÔNG copy data/code.
-5. Khi bump **major** → ping user để consumer được trigger sync.
+1. **Effectively append-only**: a dropped artifact moves to the "Removed/Deprecated"
+   section instead of being deleted (keep the history).
+2. **Bump the version on every commit that changes the contract**. Consumers check the
+   version before running.
+3. **Schema/contract mismatch** → consumer STOPS, escalates to the producer. Do NOT
+   fix it downstream.
+4. A manifest ONLY points the way (path + version); it does NOT copy data/code.
+5. On a **major** bump → ping the user so consumers get triggered to sync.

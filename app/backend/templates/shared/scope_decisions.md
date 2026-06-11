@@ -1,35 +1,35 @@
 # Scope Decisions (shared, frozen)
 
-Các quyết định scope đã đóng. Subagent KHÔNG được tự lật. Lật → escalate user.
+Closed scope decisions. Subagents must NOT overturn them on their own. To overturn → escalate to the user.
 
-## {{date}} — Khởi tạo agent system cho {{project_name}}
-- Các agent: {{agent_ids_csv}}.
-- Mỗi agent là **context boundary tự đủ**. Giao tiếp duy nhất qua manifest
+## {{date}} — Agent system initialized for {{project_name}}
+- Agents: {{agent_ids_csv}}.
+- Each agent is a **self-contained context boundary**. Communication happens only via manifests
   (`<producer>/outputs/manifest.md` ↔ `<consumer>/inputs/manifest.md`).
-- KHÔNG đọc internals của nhau. Phát hiện vấn đề ngoài scope → escalate.
-- Topology (cha-con) khai trong `.agentui/project.yaml` field `parents`.
+- Do NOT read each other's internals. Found an issue outside your scope → escalate.
+- Topology (parent-child) is declared in `.agentui/project.yaml` field `parents`.
 
-> Mỗi khi đóng một quyết định scope mới (tách agent, chuyển ownership, lock
-> vertical slice...), PREPEND một mục `## YYYY-MM-DD — <headline>` vào đây kèm
-> lý do + ranh giới mới. Đây là bộ nhớ scope của cả dự án.
+> Whenever a new scope decision is closed (splitting an agent, transferring ownership, locking
+> a vertical slice...), PREPEND a `## YYYY-MM-DD — <headline>` entry here with the
+> reasoning + the new boundaries. This is the project-wide scope memory.
 
-## Boundaries giữa các agent
-- (Điền khi topology chốt: agent X sở hữu gì, KHÔNG đụng gì.)
+## Boundaries between agents
+- (Fill in once the topology is locked: what agent X owns, what it must NOT touch.)
 
 ## Authoritative names
-Xem `glossary.md`. Tránh nhầm tên dataset/model/task/module.
+See `glossary.md`. Avoid confusing dataset/model/task/module names.
 
-## Frozen rules (không lật không escalate)
-1. **No orphan artifact**: agent KHÔNG tạo file code / spec / config mới nếu
-   contract tương ứng chưa được pin trong `inputs/manifest.md` của chính agent
-   đó. Task cần contract chưa có → escalate **producer agent** trước, KHÔNG
-   patch tại agent của mình.
-2. **Pre-flight sync bắt buộc**: mỗi session, agent consumer chạy pre-flight
-   (block PRE-FLIGHT đầu `AGENT.md`) để verify `inputs/manifest.md` version khớp
-   producer trước khi action. Mismatch → sync hoặc escalate, KHÔNG bypass.
-3. **No cross-scope destructive git/fs ops**: KHÔNG `git checkout/stash/clean/
-   reset --hard/restore .`, `git rm -rf`, `rm -rf <ngoài scope>`. Cần → escalate
-   user (xem `tool_conventions.md`).
-4. **Không mock / fabricate** data, prediction, GT để "pipeline chạy được".
-   Block thì block, escalate.
-5. (Thêm frozen rule đặc thù dự án ở đây khi cần.)
+## Frozen rules (no overturning without escalation)
+1. **No orphan artifact**: an agent must NOT create a new code / spec / config file if
+   the corresponding contract is not yet pinned in that agent's own `inputs/manifest.md`.
+   A task needing a missing contract → escalate to the **producer agent** first; do NOT
+   patch it inside your own agent.
+2. **Mandatory pre-flight sync**: every session, a consumer agent runs the pre-flight
+   (the PRE-FLIGHT block at the top of `AGENT.md`) to verify `inputs/manifest.md` matches the
+   producer's version before acting. Mismatch → sync or escalate, do NOT bypass.
+3. **No cross-scope destructive git/fs ops**: no `git checkout/stash/clean/
+   reset --hard/restore .`, `git rm -rf`, `rm -rf <outside scope>`. If needed → escalate
+   to the user (see `tool_conventions.md`).
+4. **No mocking / fabricating** data, predictions, or GT to make "the pipeline run".
+   If blocked, stay blocked and escalate.
+5. (Add project-specific frozen rules here as needed.)

@@ -1,26 +1,26 @@
 # Manifest — {{id}} → downstream
 
 ## Version
-0.1.0  (bootstrap; chưa có artifact)
+0.1.0  (bootstrap; no artifacts yet)
 
 ## Bump rule
-- Schema/contract của artifact đổi → **major**.
-- Thêm artifact mới (same schema) hoặc cập nhật artifact → **minor**.
-- Metadata-only (doc, tag, fix typo) → **patch**.
+- Artifact schema/contract change → **major**.
+- New artifact (same schema) or artifact update → **minor**.
+- Metadata-only (doc, tag, typo fix) → **patch**.
 
 ## Last updated
 {{date}} by {{id}} (bootstrap)
 
 ## History
-- 0.0.0 → 0.1.0 ({{date}}): manifest bootstrapped via AgentUI. Chưa có artifact.
+- 0.0.0 → 0.1.0 ({{date}}): manifest bootstrapped via AgentUI. No artifacts yet.
 
 ## Artifacts
 | Artifact path | Consumer agents | Version | Updated | Status / note |
 |---|---|---|---|---|
-| (TBD: artifact đầu tiên) | (TBD) | unset | — | |
+| (TBD: first artifact) | (TBD) | unset | — | |
 
-> Khi tạo artifact mới: thêm 1 dòng (path, ai consume, version, date, status),
-> bump Version ở trên + thêm History entry.
+> When creating a new artifact: add one row (path, consumers, version, date, status),
+> bump the Version above + add a History entry.
 
 ## Removed/Deprecated
 - (none)

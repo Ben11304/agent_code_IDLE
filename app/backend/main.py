@@ -59,15 +59,15 @@ _PLAN_STATUS_MARK = {"pending": " ", "doing": "~", "done": "x", "blocked": "!"}
 _MARK_TO_STATUS = {" ": "pending", "~": "doing", "x": "done", "!": "blocked"}
 
 _PLAN_INSTRUCTIONS = (
-    "\n\n## Step-by-step protocol (control-plane parsed — BẮT BUỘC cho task nhiều bước)\n"
-    "Task có ≥2 bước rõ rệt: emit kế hoạch TRƯỚC khi bắt tay làm, dạng tag:\n"
-    "<plan>\n1. bước một\n2. bước hai\n</plan>\n"
-    "Rồi NGAY SAU KHI xong/bắt đầu/kẹt mỗi bước, emit:\n"
-    "<step n=\"1\" status=\"done\">ghi chú 1 dòng (tùy chọn)</step>\n"
-    "status hợp lệ: doing | done | blocked. Control-plane parse tag realtime, persist vào "
-    "`state/plan.md` (sống qua session) và hiện tiến độ trên graph — kể lể bước mà không emit "
-    "tag là VÔ HÌNH với user. Khi thức dậy ở session mới mà `state/plan.md` còn bước dở → "
-    "TIẾP TỤC từ bước đó, KHÔNG re-plan trừ khi user yêu cầu."
+    "\n\n## Step-by-step protocol (control-plane parsed — MANDATORY for multi-step tasks)\n"
+    "If the task has ≥2 distinct steps: emit the plan BEFORE starting work, as a tag:\n"
+    "<plan>\n1. step one\n2. step two\n</plan>\n"
+    "Then IMMEDIATELY AFTER finishing/starting/getting stuck on each step, emit:\n"
+    "<step n=\"1\" status=\"done\">one-line note (optional)</step>\n"
+    "Valid status: doing | done | blocked. The control plane parses the tags in real time, persists them to "
+    "`state/plan.md` (survives sessions) and shows progress on the graph — narrating steps without emitting "
+    "the tag is INVISIBLE to the user. When you wake up in a new session and `state/plan.md` still has an "
+    "unfinished step → CONTINUE from that step; do NOT re-plan unless the user asks."
 )
 
 
@@ -84,7 +84,7 @@ def _write_plan_file(path: Path, agent_id: str, steps: list[str]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     lines = [
         f"# Plan — {agent_id}",
-        "_(control-plane managed — cập nhật qua tag `<plan>`/`<step>`, không sửa tay)_",
+        "_(control-plane managed — updated via `<plan>`/`<step>` tags, do not edit by hand)_",
         "",
     ]
     lines += [f"{i}. [ ] {s}" for i, s in enumerate(steps, 1)]
@@ -649,7 +649,7 @@ def _bootstrap_prompt(slug: str, body: "NewAgent", parent_id: str) -> str:
         "injects current children at runtime.\n"
         "- `inputs/manifest.md` — YAML frontmatter (`schema_version: 1`, `agent`, "
         "`direction: inputs`, `updated`) + a table with columns: Source agent | Synced "
-        "version | Artifact / path | Dùng cho phần nào. One row per upstream artifact this "
+        "version | Artifact / path | Used for which section. One row per upstream artifact this "
         "agent depends on. If you know specific upstream artifacts this agent will consume "
         "(based on the parent's domain knowledge), fill them in concretely; else `(TBD)`.\n"
         "- `outputs/manifest.md` — YAML frontmatter (`direction: outputs`) + sections in "
@@ -686,10 +686,10 @@ def _validate_bootstrap_files(files: list, agent_id: str) -> list[str]:
         f"{agent_id}/context/code_map.md",
     ]:
         if required not in paths:
-            warnings.append(f"Thiếu file `{required}` — parent không emit. Bạn có thể tạo sau.")
+            warnings.append(f"Missing file `{required}` — the parent did not emit it. You can create it later.")
     for f in files:
         if not f["path"].startswith(f"{agent_id}/"):
-            warnings.append(f"`{f['path']}` không nằm trong folder `{agent_id}/` — bị từ chối lúc ghi.")
+            warnings.append(f"`{f['path']}` is not inside the `{agent_id}/` folder — it will be rejected at write time.")
     return warnings
 
 
@@ -697,7 +697,7 @@ def _validate_bootstrap_files(files: list, agent_id: str) -> list[str]:
 async def api_preview_from_parent(slug: str, body: NewAgent):
     _validate_new_agent(slug, body)
     if not body.parents:
-        raise HTTPException(400, "Cần chọn ít nhất 1 parent để sinh từ parent. Hoặc dùng template preview.")
+        raise HTTPException(400, "At least 1 parent must be selected to generate from a parent. Or use the template preview.")
     parent_id = body.parents[0]
 
     queue: asyncio.Queue = asyncio.Queue()
@@ -813,17 +813,17 @@ def api_fs_validate(path: str):
 def _validate_project_agents(agents: list) -> None:
     ids = [a.get("id") for a in agents]
     if len(ids) != len(set(ids)):
-        raise HTTPException(400, "trùng agent id trong danh sách")
+        raise HTTPException(400, "duplicate agent id in the list")
     for a in agents:
         if not _AGENT_ID_RE.match(a.get("id") or ""):
-            raise HTTPException(400, f"agent id không hợp lệ (UPPERCASE): {a.get('id')}")
+            raise HTTPException(400, f"invalid agent id (must be UPPERCASE): {a.get('id')}")
         if a.get("model", "claude") not in ("claude", "grok"):
-            raise HTTPException(400, f"model phải claude|grok: {a.get('id')}")
+            raise HTTPException(400, f"model must be claude|grok: {a.get('id')}")
         for p in a.get("parents") or []:
             if p not in ids:
-                raise HTTPException(400, f"parent '{p}' không có trong project (agent {a.get('id')})")
+                raise HTTPException(400, f"parent '{p}' is not in the project (agent {a.get('id')})")
         if a.get("id") in (a.get("parents") or []):
-            raise HTTPException(400, f"agent không thể là parent của chính nó: {a.get('id')}")
+            raise HTTPException(400, f"agent cannot be its own parent: {a.get('id')}")
 
 
 @app.post("/api/projects/preview-create")
@@ -835,7 +835,7 @@ def api_preview_create(body: NewProject):
 @app.post("/api/projects/create")
 def api_create_project(body: NewProject):
     if not body.root or not body.root.strip():
-        raise HTTPException(400, "thiếu đường dẫn thư mục dự án")
+        raise HTTPException(400, "missing project folder path")
     _validate_project_agents(body.agents or [])
     ok, msg, slug = projects.create_project(body.model_dump())
     if not ok:
@@ -1090,17 +1090,17 @@ def _dispatch_instructions(children: list[str]) -> str:
         "  • the shared/ files they must read on pre-flight,\n"
         "  • their tool conventions, manifest schema, integrity rules,\n"
         "  • everything from their prior turns in this session.\n\n"
-        "Do NOT repeat any of these in the dispatch task. No \"Bạn là X agent\", no reading lists, "
+        "Do NOT repeat any of these in the dispatch task. No \"You are agent X\", no reading lists, "
         "no path references to shared/*, no pre-flight reminders. Those are wasted tokens and the worker already has them.\n\n"
         "The dispatch task should be ONE concise statement of what to do this turn, often 1–3 sentences. "
         "If the worker's session is fresh, you may include the agent folder path "
         "(e.g. \".claude/AGENT/<NAME>/\") once as the only orientation hint. Nothing more.\n\n"
         "Examples of correct dispatch task body:\n"
-        "  • \"List tất cả references cite trong paper ASCE 2027, group theo hazard. Đọc documentation/REFERENCES.md, paper/REFERENCES.md, paper/latex/references.bib.\"\n"
-        "  • \"Verify câu BOSS vừa nói về formula vulnerability 0.40/0.30/0.30 trong vulnerability/energy_vulnerability_analyzer.py. Report line evidence.\"\n"
-        "  • \"Continue: bổ sung thêm bullet về Cascadia exposure vào bản report bạn vừa làm.\"\n\n"
+        "  • \"List all references cited in the ASCE 2027 paper, grouped by hazard. Read documentation/REFERENCES.md, paper/REFERENCES.md, paper/latex/references.bib.\"\n"
+        "  • \"Verify what BOSS just said about the vulnerability formula 0.40/0.30/0.30 in vulnerability/energy_vulnerability_analyzer.py. Report line evidence.\"\n"
+        "  • \"Continue: add more bullets on Cascadia exposure to the report you just produced.\"\n\n"
         "Examples of INCORRECT (do not produce):\n"
-        "  • \"Bạn là DOCS agent. Đọc theo thứ tự bắt buộc: 1. shared/research_integrity.md 2. ...\"\n"
+        "  • \"You are the DOCS agent. Read in mandatory order: 1. shared/research_integrity.md 2. ...\"\n"
         "  • Reading lists, role briefings, pre-flight blocks.\n\n"
         "The system parses tags in real time and runs the worker; the user verifies your orchestration by watching "
         "the graph light up. Narrating \"I will dispatch\" without emitting the tag is a lie — user sees nothing happen.\n\n"
@@ -1120,7 +1120,7 @@ def _read_capped(p: Path, max_chars: int) -> str:
         return ""
     txt = txt.strip()
     if len(txt) > max_chars:
-        txt = txt[:max_chars].rstrip() + "\n[… cắt bớt — đọc file đầy đủ nếu cần]"
+        txt = txt[:max_chars].rstrip() + "\n[… truncated — read the full file if needed]"
     return txt
 
 
@@ -1139,7 +1139,7 @@ def _progress_excerpt(p: Path, max_sections: int = 2, max_chars: int = 2600) -> 
                 break
         out.append(ln)
         if sum(len(x) + 1 for x in out) > max_chars:
-            out.append("[… cắt bớt]")
+            out.append("[… truncated]")
             break
     return "\n".join(out).strip()
 
@@ -1160,14 +1160,14 @@ def _session_preamble(project_root: str, agent: dict, cwd_abs: str) -> str:
     if prog.is_file():
         ex = _progress_excerpt(prog)
         if ex:
-            parts.append(f"### Bộ nhớ của bạn (`state/progress.md`, mới nhất trước)\n{ex}")
+            parts.append(f"### Your memory (`state/progress.md`, newest first)\n{ex}")
 
     plan_p = adir / "state" / "plan.md"
     if plan_p.is_file() and _read_plan(plan_p):
         ex = _read_capped(plan_p, 1200)
         if ex:
             parts.append(
-                "### Plan đang dở (`state/plan.md`) — TIẾP TỤC từ bước dở, đừng re-plan\n" + ex
+                "### Unfinished plan (`state/plan.md`) — CONTINUE from the unfinished step, do not re-plan\n" + ex
             )
 
     roll = adir / "state" / "children_status.json"
@@ -1179,12 +1179,12 @@ def _session_preamble(project_root: str, agent: dict, cwd_abs: str) -> str:
                 stale = " ⚠ STALE-MEMORY" if c.get("stale_memory") else ""
                 rows.append(
                     f"- {cid}: {c.get('status')}, ctx {c.get('context_pct')}%, "
-                    f"hoạt động {c.get('last_activity_iso') or '—'}, "
+                    f"active {c.get('last_activity_iso') or '—'}, "
                     f"memory {c.get('memory_updated_iso') or '—'}{stale}"
                     + (f" — {c['memory_headline']}" if c.get("memory_headline") else "")
                 )
             if rows:
-                parts.append("### Trạng thái các worker của bạn (derived, read-only)\n" + "\n".join(rows))
+                parts.append("### Status of your workers (derived, read-only)\n" + "\n".join(rows))
         except (OSError, ValueError):
             pass
 
@@ -1197,8 +1197,8 @@ def _session_preamble(project_root: str, agent: dict, cwd_abs: str) -> str:
     if not parts:
         return ""
     return (
-        "[CONTROL-PLANE COLD-START] Phiên CLI mới (không resume được phiên trước). "
-        "Dưới đây là trạng thái bền vững của bạn — đọc trước khi làm:\n\n"
+        "[CONTROL-PLANE COLD-START] New CLI session (the previous session could not be resumed). "
+        "Below is your persistent state — read it before acting:\n\n"
         + "\n\n".join(parts)
     )
 
@@ -1252,8 +1252,8 @@ async def _run_agent(
     seed_text = sess.get("seed")
     if seed_text:
         message = (
-            "[COMPACTED CONTEXT] Recap của session trước (đã compact để giảm context). "
-            "Dùng làm nền để tiếp tục liền mạch:\n\n"
+            "[COMPACTED CONTEXT] Recap of the previous session (compacted to reduce context). "
+            "Use it as the basis to continue seamlessly:\n\n"
             + seed_text + "\n\n---\n\n" + message
         )
     # ----- END SEED ENRICHMENT -----
@@ -1512,14 +1512,14 @@ async def _dispatched_run(slug, source_id, target_id, task, emit, tracker, chain
         after = _manifest_snapshot(slug, target_id)
         if after and after["mtime"] == manifest_before["mtime"]:
             result_text = (result_text or "") + (
-                f"\n\n[control-plane verify] outputs/manifest.md của {target_id} KHÔNG đổi "
-                f"trong dispatch này (vẫn version {after.get('version') or '?'}). Nếu task "
-                "tạo/sửa artifact downstream → kết quả CHƯA công bố đúng contract; yêu cầu "
-                "worker bump manifest trước khi consume."
+                f"\n\n[control-plane verify] outputs/manifest.md of {target_id} did NOT change "
+                f"during this dispatch (still version {after.get('version') or '?'}). If the task "
+                "created/modified a downstream artifact → the result is NOT yet published per contract; "
+                "require the worker to bump the manifest before consuming."
             )
         elif after:
             result_text = (result_text or "") + (
-                f"\n\n[control-plane verify] outputs/manifest.md đã cập nhật "
+                f"\n\n[control-plane verify] outputs/manifest.md was updated "
                 f"(version {manifest_before.get('version') or '?'} → {after.get('version') or '?'})."
             )
 
@@ -1581,8 +1581,8 @@ async def _auto_compact_if_needed(slug: str, agent_id: str, emit) -> bool:
         db.set_session_seed(new_sess["id"], summary)
         db.add_message(
             new_sess["id"], "assistant",
-            f"📦 **Auto-compact @ {pct}% context** — session mới được seed bằng recap dưới đây. "
-            "Lượt kế tiếp tiếp tục từ recap này.\n\n---\n\n" + summary,
+            f"📦 **Auto-compact @ {pct}% context** — new session seeded with the recap below. "
+            "The next turn continues from this recap.\n\n---\n\n" + summary,
         )
     else:
         # Summary turn failed (likely the old session was too overloaded to
@@ -1590,8 +1590,8 @@ async def _auto_compact_if_needed(slug: str, agent_id: str, emit) -> bool:
         # The cold-start preamble (state/progress.md) covers recovery.
         db.add_message(
             new_sess["id"], "assistant",
-            f"📦 **Auto-compact @ {pct}% context** — recap rỗng (session cũ quá tải?); "
-            "session mới sẽ khởi động bằng cold-start preamble từ `state/progress.md`.",
+            f"📦 **Auto-compact @ {pct}% context** — recap empty (old session overloaded?); "
+            "the new session will start from the cold-start preamble built from `state/progress.md`.",
         )
     db.update_session_status(new_sess["id"], "ok")
     await emit({"type": "compacted", "agent": agent_id, "new_session_id": new_sess["id"], "auto": True})
@@ -1677,9 +1677,9 @@ async def api_chat(slug: str, agent_id: str, body: ChatBody):
                     # 15s timeout keeps the socket alive during long quiet
                     # phases (Opus extended thinking can sit 10-30s without
                     # emitting any byte). Without this, browsers + proxies
-                    # silently close the SSE and the chat appears to hang as
-                    # "đã dừng" with no response. The comment line is not a
-                    # data event, so the frontend ignores it.
+                    # silently close the SSE and the chat appears to hang,
+                    # showing the "stopped" label with no response. The comment
+                    # line is not a data event, so the frontend ignores it.
                     evt = await asyncio.wait_for(queue.get(), timeout=15.0)
                 except asyncio.TimeoutError:
                     yield ": keepalive\n\n"
@@ -1704,12 +1704,12 @@ async def api_chat(slug: str, agent_id: str, body: ChatBody):
 
 
 _COMPACT_PROMPT = (
-    "[CONTROL-PLANE COMPACT — không phải task thường] Tóm tắt toàn bộ công việc & hội thoại "
-    "của session này thành một bản RECAP ngắn gọn để CHÍNH BẠN tiếp tục ở session mới với ít "
-    "context hơn. Bao gồm: trạng thái hiện tại, các quyết định đã chốt + lý do ngắn, artifact/version "
-    "đang dùng (path + version), việc đang dở, câu hỏi mở / chờ user. KHÔNG lặp nguyên văn — chỉ giữ "
-    "thông tin tối thiểu cần để tiếp tục liền mạch. KHÔNG dispatch. Output CHỈ bản recap (markdown), "
-    "không lời dẫn."
+    "[CONTROL-PLANE COMPACT — not a normal task] Summarise all of this session's work & conversation "
+    "into one concise RECAP so that YOU YOURSELF can continue in a new session with less "
+    "context. Include: current state, decisions locked in + brief reasons, artifacts/versions "
+    "in use (path + version), work in progress, open questions / items waiting on the user. Do NOT repeat "
+    "verbatim — keep only the minimum information needed to continue seamlessly. Do NOT dispatch. "
+    "Output ONLY the recap (markdown), no preamble."
 )
 
 
@@ -1737,14 +1737,14 @@ async def api_compact(slug: str, agent_id: str):
             summary = (summary or "").strip()
             if not summary:
                 await queue.put({"type": "error", "agent": agent_id,
-                                 "message": "compact: recap rỗng — không tạo session mới"})
+                                 "message": "compact: recap empty — no new session created"})
             else:
                 new_sess = db.new_session(slug, agent_id)
                 db.set_session_seed(new_sess["id"], summary)
                 db.add_message(
                     new_sess["id"], "assistant",
-                    "📦 **Context compacted** — session mới được seed bằng recap dưới đây. "
-                    "Lượt kế tiếp sẽ tiếp tục từ recap này (context nhỏ lại).\n\n---\n\n" + summary,
+                    "📦 **Context compacted** — new session seeded with the recap below. "
+                    "The next turn continues from this recap (smaller context).\n\n---\n\n" + summary,
                 )
                 db.update_session_status(new_sess["id"], "ok")
                 await queue.put({"type": "compacted", "agent": agent_id,

@@ -1,5 +1,5 @@
 <!doctype html>
-<html lang="vi">
+<html lang="en">
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width,initial-scale=1" />
@@ -11,8 +11,8 @@
     <aside class="sidebar">
       <div class="sidebar-title">
         <span>VietHuy/</span>
-        <button id="themeToggle" class="theme-toggle" title="đổi giao diện sáng / tối">◐</button>
-        <button id="newProjectBtn" class="new-project-btn" title="tạo dự án mới">+ project</button>
+        <button id="themeToggle" class="theme-toggle" title="toggle light / dark theme">◐</button>
+        <button id="newProjectBtn" class="new-project-btn" title="create new project">+ project</button>
       </div>
       <nav id="projectList" class="project-list"></nav>
       <div class="sidebar-divider"></div>
@@ -22,24 +22,24 @@
       </div>
       <div id="treeRoot" class="tree" tabindex="0"></div>
     </aside>
-    <div class="sidebar-resizer" id="sidebarResizer" title="kéo để đổi rộng sidebar"></div>
+    <div class="sidebar-resizer" id="sidebarResizer" title="drag to resize sidebar"></div>
 
     <main class="workspace">
       <div class="tabs" id="tabs"></div>
       <div id="windowsRoot" class="windows-root">
-        <div class="canvas-empty" id="canvasEmpty">Chọn project ở thanh bên trái</div>
+        <div class="canvas-empty" id="canvasEmpty">Pick a project in the left sidebar</div>
       </div>
       <div id="taskbar" class="taskbar"></div>
     </main>
   </div>
 
-  <button id="skillsTab" class="skills-tab" title="Skills — bảng skill đã cài">⚡<span>Skills</span></button>
+  <button id="skillsTab" class="skills-tab" title="Skills — installed skills panel">⚡<span>Skills</span></button>
   <aside id="skillsPanel" class="skills-panel">
     <div class="skills-panel-head">
-      <span>⚡ Skills đã cài</span>
-      <button id="skillsClose" class="skills-close" title="ẩn bảng">×</button>
+      <span>⚡ Installed skills</span>
+      <button id="skillsClose" class="skills-close" title="hide panel">×</button>
     </div>
-    <div class="skills-panel-hint">Bạn toàn quyền quyết định. Bấm <b>Dùng</b> để chèn lệnh gọi skill vào chat agent đang mở — tự sửa rồi gửi.</div>
+    <div class="skills-panel-hint">You stay in full control. Click <b>Use</b> to insert the skill call into the open agent chat — edit it, then send.</div>
     <div id="skillsList" class="skills-list"></div>
   </aside>
 

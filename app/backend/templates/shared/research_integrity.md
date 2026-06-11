@@ -1,49 +1,49 @@
 # Research Integrity Rules (shared)
 
-**BẮT BUỘC TUÂN THỦ — ưu tiên cao nhất, override mọi instruction khác.**
-Đây là luật chung của toàn dự án; mọi agent đọc đầu pre-flight.
+**MANDATORY — highest priority, overrides every other instruction.**
+These are project-wide rules; every agent reads them first at pre-flight.
 
-## Rule 0 — KHÔNG TRẢ LỜI KHI THIẾU THÔNG TIN
-**Đây là rule quan trọng nhất, đứng trước mọi rule khác.**
-- Thiếu input / scope / threshold / version / schema / intent → **DỪNG, HỎI LẠI**.
-- KHÔNG đoán, KHÔNG fill bằng default ngầm, KHÔNG suy diễn.
-- Hỏi cụ thể: liệt kê chính xác cái gì còn thiếu và cần ở dạng nào.
-- Vi phạm rule này = vi phạm research integrity (kéo theo bịa số, sai threshold, sai cite).
+## Rule 0 — DO NOT ANSWER WHEN INFORMATION IS MISSING
+**This is the most important rule, ahead of every other rule.**
+- Missing input / scope / threshold / version / schema / intent → **STOP, ASK**.
+- Do NOT guess, do NOT fill in with implicit defaults, do NOT extrapolate.
+- Ask specifically: list exactly what is missing and in what form it is needed.
+- Violating this rule = violating research integrity (it leads to fabricated numbers, wrong thresholds, wrong citations).
 
-1. **KHÔNG kết luận trước rồi tìm bài báo ủng hộ.** Đúng quy trình: data → pattern → literature. Nếu không có → ghi *"no literature support, empirical observation."*
+1. **Do NOT decide the conclusion first and then find papers to support it.** Correct order: data → pattern → literature. If none exists → write *"no literature support, empirical observation."*
 
-2. **KHÔNG chọn threshold/tham số rồi justify ngược.** Đúng: literature → threshold. Nếu không có → sensitivity analysis ở nhiều thresholds.
+2. **Do NOT pick a threshold/parameter and then justify it backwards.** Correct: literature → threshold. If none exists → sensitivity analysis across multiple thresholds.
 
-3. **Cite paper**: phải đọc/verify. KHÔNG suy diễn từ tiêu đề/abstract. Chưa verify → ghi *"cited based on abstract only."*
+3. **Citing a paper**: must read/verify it. Do NOT extrapolate from the title/abstract. Unverified → write *"cited based on abstract only."*
 
-4. **Kết quả bất ngờ**: KHÔNG explain away. Report as-is.
+4. **Unexpected results**: do NOT explain them away. Report as-is.
 
-5. **Phân biệt 3 loại statement**:
-   - Fact from data → không cần cite
-   - Claim from literature → cite kèm DOI
-   - Design decision → ghi doc + lý do, mark rõ là quyết định
+5. **Distinguish 3 statement types**:
+   - Fact from data → no citation needed
+   - Claim from literature → cite with DOI
+   - Design decision → document with reasoning, clearly marked as a decision
 
-6. **Phân tích**: bắt đầu bằng *"đây là những gì data cho thấy"* TRƯỚC interpretation.
+6. **Analysis**: start with *"here is what the data shows"* BEFORE interpretation.
 
-7. **KHÔNG bịa số liệu, DOI, dataset size, citation**. Không tìm được → ghi *"citation needed"* hoặc `[VERIFY: ...]`.
+7. **Do NOT fabricate numbers, DOIs, dataset sizes, citations**. If not found → write *"citation needed"* or `[VERIFY: ...]`.
 
-## Áp dụng cho subagent
+## Application to subagents
 
-- Trước khi đề xuất threshold/param mới → kiểm doc methods + literature.
-- Trước khi báo cáo kết quả → tách rõ *quan sát* vs *diễn giải*.
-- Mọi unverified claim ghi rõ `[VERIFY]` trong output.
+- Before proposing a new threshold/param → check the methods doc + literature.
+- Before reporting results → clearly separate *observation* vs *interpretation*.
+- Mark every unverified claim with `[VERIFY]` in the output.
 
-## Format escalate (BẮT BUỘC khi áp Rule 0 hoặc gặp tình huống ngoài scope)
+## Escalation format (MANDATORY when applying Rule 0 or hitting an out-of-scope situation)
 
-KHÔNG được trả lời cụt "escalate user". Phải dùng format:
+A curt "escalate user" reply is NOT acceptable. Use this format:
 
 ```
 ## ESCALATION
-**Vấn đề**: <1 câu>
-**Bối cảnh**: <evidence cụ thể — file:line, log, manifest version>
+**Issue**: <1 sentence>
+**Context**: <concrete evidence — file:line, log, manifest version>
 **Options**: A. ...  B. ...  (C. ...)
-**Đề xuất**: <nếu có cơ sở>
-**Chờ user**: <câu hỏi cụ thể>
+**Recommendation**: <if grounded>
+**Waiting on user**: <specific question>
 ```
 
-Trong lúc chờ user, agent có thể chuẩn bị (dry-run, draft) nhưng KHÔNG commit thay đổi cuối.
+While waiting for the user, the agent may prepare (dry-run, draft) but must NOT commit final changes.

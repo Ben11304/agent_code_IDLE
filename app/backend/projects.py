@@ -230,18 +230,18 @@ def _agent_ctx(agent_id: str, role: str, parents: list[str],
     today = date.today().isoformat()
     if parents:
         input_rows = "\n".join(
-            f"- {p}: unset  (ch\u01b0a sync \u2014 ch\u1ea1y `sync.sh {agent_id}`)" for p in parents
+            f"- {p}: unset  (not synced yet \u2014 run `sync.sh {agent_id}`)" for p in parents
         )
     else:
-        input_rows = "- (none \u2014 root/orchestrator agent, kh\u00f4ng c\u00f3 producer)"
+        input_rows = "- (none \u2014 root/orchestrator agent, no producers)"
     ctx: dict[str, str] = {
         "id": agent_id,
-        "role": role or "_(m\u00f4 t\u1ea3 1 d\u00f2ng m\u1ee5c \u0111\u00edch agent n\u00e0y)_",
+        "role": role or "_(one-line description of this agent's purpose)_",
         "parents_csv": ", ".join(parents) if parents else "none",
         "input_rows": input_rows,
         "date": today,
-        "scope_in": "- (TBD: file/\u0111\u01b0\u1eddng d\u1eabn agent n\u00e0y \u0111\u01b0\u1ee3c ph\u00e9p \u0111\u1ecdc & s\u1eeda)",
-        "scope_out": "- Folder c\u1ee7a agent kh\u00e1c; `../shared/` (read-only).",
+        "scope_in": "- (TBD: files/paths this agent may read & modify)",
+        "scope_out": "- Other agents' folders; `../shared/` (read-only).",
         "deliverables": "",
         "escalation": "",
         "hard_rules": "",
@@ -282,10 +282,10 @@ def preview_agent(slug: str, agent: dict[str, Any]) -> dict[str, Any]:
 
     warnings: list[str] = []
     if target.exists():
-        warnings.append(f"Thư mục đã tồn tại: {target.name}. Tạo sẽ bị từ chối.")
+        warnings.append(f"Folder already exists: {target.name}. Creation will be rejected.")
     shared = root / "shared"
     if not shared.exists():
-        warnings.append("Project chưa có thư mục `shared/`. Các template tham chiếu `../shared/research_integrity.md` v.v. Bạn nên tạo `shared/` trước hoặc sửa lại template.")
+        warnings.append("Project has no `shared/` folder yet. The templates reference `../shared/research_integrity.md` etc. Create `shared/` first or adjust the templates.")
 
     return {
         "target_folder": str(target),
@@ -399,11 +399,11 @@ def _project_ctx(name: str, description: str, agents: list[dict], date_str: str)
         f"| {a['id']} | {a.get('role', '')} | {a.get('model', 'claude')} | "
         f"{', '.join(a.get('parents') or []) or '—'} |"
         for a in agents
-    ) or "| (chưa có agent) | | | |"
+    ) or "| (no agents yet) | | | |"
     return {
         "project_name": name,
         "project_description": description or "",
-        "agent_ids_csv": ", ".join(ids) if ids else "(chưa có)",
+        "agent_ids_csv": ", ".join(ids) if ids else "(none yet)",
         "agent_table": "| Agent | Role | Model | Parents |\n|---|---|---|---|\n" + rows,
         "date": date_str,
     }
@@ -458,12 +458,12 @@ def add_project_to_registry(root: Path) -> None:
 def validate_new_project(root_str: str, slug: str) -> tuple[bool, str]:
     root = Path(root_str).expanduser()
     if root.exists() and not root.is_dir():
-        return False, "path tồn tại nhưng không phải thư mục"
+        return False, "path exists but is not a directory"
     if (root / ".agentui" / "project.yaml").exists():
-        return False, "thư mục đã là một AgentUI project (.agentui/project.yaml tồn tại)"
+        return False, "folder is already an AgentUI project (.agentui/project.yaml exists)"
     existing = {p["slug"] for p in list_projects()}
     if slug in existing:
-        return False, f"slug đã tồn tại: {slug}"
+        return False, f"slug already exists: {slug}"
     return True, "ok"
 
 
@@ -483,7 +483,7 @@ def preview_project(payload: dict[str, Any]) -> dict[str, Any]:
 
     warnings: list[str] = []
     if root.exists() and any(root.iterdir()):
-        warnings.append(f"Thư mục `{root}` đã có nội dung — scaffold sẽ thêm vào (không xoá file sẵn có).")
+        warnings.append(f"Folder `{root}` already has content — the scaffold will add to it (existing files are not deleted).")
     ok, msg = validate_new_project(str(root), slug)
     if not ok:
         warnings.append(msg)

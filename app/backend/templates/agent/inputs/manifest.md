@@ -1,14 +1,14 @@
 # Manifest — input for {{id}}
 
-> Auto-synced bởi `bash ../sync.sh {{id}}`. Đừng sửa tay phần Pinned versions.
-> Producer manifest copies nằm cạnh file này dạng `<PRODUCER>.md`.
+> Auto-synced by `bash ../sync.sh {{id}}`. Do not hand-edit the Pinned versions section.
+> Producer manifest copies live next to this file as `<PRODUCER>.md`.
 
 ## Pinned versions
 {{input_rows}}
 
 ## Last sync
-{{date}} (bootstrap — chưa sync lần nào)
+{{date}} (bootstrap — never synced yet)
 
 ## Notes
-- Consumer PHẢI đọc `inputs/<PRODUCER>.md` cho contract chi tiết.
-- Version ở đây ≠ version producer hiện tại → re-run `sync.sh {{id}}`.
+- Consumer MUST read `inputs/<PRODUCER>.md` for the detailed contract.
+- Version here ≠ producer's current version → re-run `sync.sh {{id}}`.

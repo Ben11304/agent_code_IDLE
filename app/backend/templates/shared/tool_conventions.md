@@ -1,50 +1,50 @@
 # Tool Conventions (shared)
 
-Quy ước công cụ chung cho mọi agent trong dự án. Đọc ở pre-flight.
+Common tool conventions for every agent in the project. Read at pre-flight.
 
-## RTK — token-optimized CLI (đọc/khám phá file)
+## RTK — token-optimized CLI (file reading/exploration)
 
-Khi thao tác read-only trên filesystem, ưu tiên `rtk` thay cho lệnh thô
-(tiết kiệm token, output gọn):
+For read-only filesystem operations, prefer `rtk` over raw commands
+(saves tokens, compact output):
 
 ```bash
-rtk ls <path>          # thay ls / ls -la
-rtk read <file>        # thay cat / head / tail
-rtk grep <pat> <path>  # thay grep -n
-rtk find <path> ...    # thay find (KHÔNG hỗ trợ -not/-exec → dùng find thô khi cần)
-rtk git status         # thay git status
-rtk git diff           # thay git diff
-rtk git log            # thay git log
+rtk ls <path>          # instead of ls / ls -la
+rtk read <file>        # instead of cat / head / tail
+rtk grep <pat> <path>  # instead of grep -n
+rtk find <path> ...    # instead of find (does NOT support -not/-exec → use raw find when needed)
+rtk git status         # instead of git status
+rtk git diff           # instead of git diff
+rtk git log            # instead of git log
 rtk wc / du / df / ps / tree
 ```
 
-**Cho phép lệnh thô** khi rtk không cover: pipe phức tạp `a | b | c`,
-compound `&&`/`||`, redirect stderr cần exact, SLURM
+**Raw commands are allowed** when rtk does not cover them: complex pipes `a | b | c`,
+compound `&&`/`||`, exact stderr redirects, SLURM
 (`sbatch`/`squeue`/`sacct`/`scancel`/`scontrol`), `module load`,
-write ops (`mkdir`/`chmod`/`rm`/`mv`), `python -c` 1-shot, env exports.
+write ops (`mkdir`/`chmod`/`rm`/`mv`), one-shot `python -c`, env exports.
 
 ## AAS — Grok delegate (research / verify / survey)
 
-`aas` là CLI dùng Grok cho task Grok làm tốt hơn Claude: realtime web,
-fresh-eyes review, adversarial red-team, multi-source survey.
+`aas` is a CLI that uses Grok for tasks Grok does better than Claude: realtime web,
+fresh-eyes review, adversarial red-teaming, multi-source surveys.
 
 ```bash
-aas research "<query>"     # tìm paper, latest tech, realtime web + X
-aas verify "<claim>"       # cross-check technical claim (model độc lập)
+aas research "<query>"     # find papers, latest tech, realtime web + X
+aas verify "<claim>"       # cross-check a technical claim (independent model)
 aas survey "<topic>"       # 15-30 source literature survey
-aas redteam <path-or-desc> # adversarial critique design/spec
-aas review <path>          # code review từ góc nhìn khác
-aas reason "<question>"    # STEM/math hard reasoning (không cần web)
-aas ask "<prompt>"         # free-form, khi không fit cmd nào trên
+aas redteam <path-or-desc> # adversarial critique of a design/spec
+aas review <path>          # code review from another perspective
+aas reason "<question>"    # hard STEM/math reasoning (no web needed)
+aas ask "<prompt>"         # free-form, when none of the above fits
 ```
 
-Khi nào dùng: tìm paper/DOI, verify claim kỹ thuật, research latest, critique spec.
-Khi nào KHÔNG: thao tác file/code (Read/Edit/Bash), chạy experiment (Bash+SLURM).
-`aas` lỗi → chạy `aas doctor`.
+When to use: finding papers/DOIs, verifying technical claims, researching the latest, critiquing specs.
+When NOT to use: file/code operations (Read/Edit/Bash), running experiments (Bash+SLURM).
+`aas` failing → run `aas doctor`.
 
-## Git / filesystem an toàn (no cross-scope destructive ops)
+## Git / filesystem safety (no cross-scope destructive ops)
 
-Agent **KHÔNG** chạy lệnh có thể wipe working files của agent khác:
+Agents must **NOT** run commands that can wipe another agent's working files:
 `git checkout <branch>`, `git stash`, `git clean`, `git reset --hard`,
-`git restore .`, `git rm -rf`, `rm -rf <ngoài scope>`. Cần các thao tác này →
-**DỪNG, escalate user**. Lý do: branch/reset op không git-aware về scope.
+`git restore .`, `git rm -rf`, `rm -rf <outside scope>`. If these operations are needed →
+**STOP, escalate to the user**. Reason: branch/reset ops are not scope-aware.

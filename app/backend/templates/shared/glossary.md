@@ -1,10 +1,10 @@
 # Glossary (shared) — Authoritative names
 
-Tên chuẩn của dự án {{project_name}}. Dùng đúng tên ở đây trong code, manifest,
-doc, paper. Tránh nhầm biến thể.
+Canonical names for the {{project_name}} project. Use exactly these names in code,
+manifests, docs, and papers. Avoid confusing variants.
 
-> Điền khi dự án định hình. Mỗi entry: tên authoritative + alias hay nhầm + 1 dòng
-> mô tả + nguồn (path/URL/DOI).
+> Fill in as the project takes shape. Each entry: authoritative name + commonly confused
+> aliases + one-line description + source (path/URL/DOI).
 
 ## Datasets / data sources
 - (TBD)
@@ -18,5 +18,5 @@ doc, paper. Tránh nhầm biến thể.
 ## Modules / artifacts
 - (TBD)
 
-## Aliases hay nhầm (đừng dùng)
-- (TBD: tên sai → tên đúng)
+## Commonly confused aliases (do not use)
+- (TBD: wrong name → correct name)

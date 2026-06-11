@@ -1,20 +1,20 @@
 # {{id}} Code map
 
-Files/modules agent này sở hữu hoặc tham chiếu.
+Files/modules this agent owns or references.
 
-## Owned (agent là author/maintainer — được ghi)
-- `./AGENT.md` — role + contract (ít sửa).
-- `./inputs/manifest.md` — synced bởi `sync.sh`, không sửa tay.
-- `./outputs/manifest.md` — bump theo Bump rule sau mỗi artifact.
-- `./state/progress.md` — prepend mỗi turn có nghĩa.
-- `./context/code_map.md` — file này; cập nhật khi scope mở rộng.
+## Owned (agent is author/maintainer — may write)
+- `./AGENT.md` — role + contract (rarely edited).
+- `./inputs/manifest.md` — synced by `sync.sh`, do not edit by hand.
+- `./outputs/manifest.md` — bump per the Bump rule after each artifact.
+- `./state/progress.md` — prepend every meaningful turn.
+- `./context/code_map.md` — this file; update when scope expands.
 {{owned_extra}}
 
-## Read-only references (consume, không sửa)
+## Read-only references (consume, do not modify)
 - `../shared/` — research_integrity, tool_conventions, handoff_schema,
   scope_decisions, glossary.
-- Upstream agents liệt kê trong `./inputs/manifest.md`.
+- Upstream agents listed in `./inputs/manifest.md`.
 
-## Out of scope (KHÔNG đụng)
-- Folder của agent khác.
-- File config ở project root trừ khi liệt kê dưới Owned.
+## Out of scope (do NOT touch)
+- Other agents' folders.
+- Config files at the project root unless listed under Owned.

@@ -2,32 +2,32 @@
 
 {{project_description}}
 
-Hệ multi-agent điều phối qua AgentUI. Mỗi agent là context boundary tự đủ,
-giao tiếp qua manifest (không đọc internals của nhau).
+Multi-agent system orchestrated through AgentUI. Each agent is a self-contained
+context boundary, communicating via manifests (no reading each other's internals).
 
 ## Agents
 {{agent_table}}
 
-## Cấu trúc
+## Structure
 ```
 <project>/
-├── .agentui/project.yaml     # khai báo graph agent (id, role, model, parents)
-├── shared/                    # luật chung mọi agent đọc ở pre-flight
+├── .agentui/project.yaml     # agent graph declaration (id, role, model, parents)
+├── shared/                    # common rules every agent reads at pre-flight
 │   ├── research_integrity.md
 │   ├── tool_conventions.md    # rtk + aas
-│   ├── handoff_schema.md      # format manifest = contract giữa agent
-│   ├── scope_decisions.md     # quyết định scope đã đóng (frozen)
-│   └── glossary.md            # tên authoritative
+│   ├── handoff_schema.md      # manifest format = contract between agents
+│   ├── scope_decisions.md     # closed (frozen) scope decisions
+│   └── glossary.md            # authoritative names
 ├── sync.sh                    # pre-flight: copy producer/outputs → consumer/inputs
-└── <AGENT>/                   # mỗi agent
-    ├── AGENT.md               # system prompt (NOTICE→PRE-FLIGHT→Role→…→Quy tắc cứng)
-    ├── inputs/manifest.md     # contract nhận từ producer (synced)
-    ├── outputs/manifest.md    # artifact xuất cho downstream (versioned)
-    ├── context/code_map.md    # file agent sở hữu/tham chiếu
-    └── state/progress.md      # log mỗi turn (prepend)
+└── <AGENT>/                   # one folder per agent
+    ├── AGENT.md               # system prompt (NOTICE→PRE-FLIGHT→Role→…→Hard rules)
+    ├── inputs/manifest.md     # contract received from producers (synced)
+    ├── outputs/manifest.md    # artifacts published downstream (versioned)
+    ├── context/code_map.md    # files the agent owns/references
+    └── state/progress.md      # per-turn log (prepend)
 ```
 
-## Quy tắc vận hành
-- Giao tiếp duy nhất qua manifest; bump version khi đổi contract.
-- Pre-flight `bash sync.sh <AGENT>` mỗi session trước khi action.
-- Thiếu thông tin → DỪNG, escalate (xem `shared/research_integrity.md`).
+## Operating rules
+- Communicate only via manifests; bump the version on any contract change.
+- Pre-flight `bash sync.sh <AGENT>` every session before acting.
+- Missing information → STOP, escalate (see `shared/research_integrity.md`).
