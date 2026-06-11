@@ -187,6 +187,7 @@ async function openProject(slug) {
   renderProjectList();
   ensureGraphWindow(slug);
   applyTabVisibility();
+  reattachActiveRuns(slug);
 }
 
 function closeTab(slug) {
@@ -1166,6 +1167,10 @@ async function updateAgentSettings(w, claudeModel, grokModel, effort) {
 }
 
 async function refreshChatSession(w) {
+  // Never wipe the messages area mid-stream: live bubbles hold DOM references
+  // that a rebuild would orphan. (attachDetachedRun refreshes BEFORE it sets
+  // w.streaming, so its history render still goes through.)
+  if (w.streaming) return;
   try {
     const r = await fetch(`/api/projects/${w.projectSlug}/agents/${w.agentId}/session`);
     const j = await r.json();
@@ -1321,18 +1326,28 @@ function bindChatWindow(w) {
   });
 }
 
-function stopChat(w) {
-  // Stop = full halt: drop anything still queued, then abort the live turn.
-  // (Clearing first means the finally→drainQueue below sees an empty queue and
-  // does not auto-fire the next message.)
+async function stopChat(w) {
+  // Stop = full halt: drop anything still queued, then cancel the run ON THE
+  // SERVER. Since turns are detached from the SSE connection, aborting the
+  // local fetch alone would only stop *watching* — the turn would keep
+  // running. (Clearing the queue first means the finally→drainQueue sees an
+  // empty queue and does not auto-fire the next message.)
   if (w.queue && w.queue.length) {
     w.queue.forEach((q) => { if (q.el && q.el.parentNode) q.el.parentNode.removeChild(q.el); });
     w.queue = [];
   }
-  if (w.abortController) {
+  setChatStatus(w, "stopping…");
+  let stopped = false;
+  try {
+    const r = await fetch(`/api/projects/${w.projectSlug}/agents/${w.agentId}/stop`,
+      { method: "POST" });
+    if (r.ok) stopped = !!(await r.json()).stopped;
+  } catch {}
+  // Fallback for attached-style streams with no server run (e.g. /compact):
+  // abort the local reader.
+  if (!stopped && w.abortController) {
     try { w.abortController.abort(); } catch {}
   }
-  setChatStatus(w, "stopping…");
 }
 
 // ---------- Chat queue (send while streaming) ----------
@@ -2287,13 +2302,9 @@ function setChatStatus(w, s) {
   if (el) el.textContent = s;
 }
 
-async function sendMessageInWindow(w, text) {
-  const slug = w.projectSlug;
-  const rootAgent = w.agentId;
-  const proj = state.projectCache[slug];
-  addBubble(w, "user", text);
+function makeBubbleFactory(w) {
   const bubbles = {};
-  function bubbleFor(agentId) {
+  return function bubbleFor(agentId) {
     if (bubbles[agentId]) return bubbles[agentId];
     const b = addBubble(w, "assistant", "");
     b.querySelector(".role").textContent = "assistant • " + agentId;
@@ -2331,8 +2342,66 @@ async function sendMessageInWindow(w, text) {
       streamingStarted: false,
     };
     return bubbles[agentId];
+  };
+}
+
+// Read an SSE response into the window. Tracks w.lastSeq / w.sawComplete /
+// w.runId so a dropped connection can re-attach to the detached run and
+// resume from the next event.
+async function pumpSse(w, slug, rootAgent, resp, bubbleFor) {
+  const reader = resp.body.getReader();
+  const decoder = new TextDecoder();
+  let buf = "";
+  while (true) {
+    const { value, done } = await reader.read();
+    if (done) break;
+    buf += decoder.decode(value, { stream: true });
+    const parts = buf.split("\n\n");
+    buf = parts.pop() || "";
+    for (const chunk of parts) {
+      const line = chunk.trim();
+      if (!line.startsWith("data:")) continue;
+      const payload = line.slice(5).trim();
+      if (!payload) continue;
+      let evt;
+      try { evt = JSON.parse(payload); } catch { continue; }
+      if (evt.seq !== undefined) w.lastSeq = evt.seq;
+      if (evt.type === "start" && evt.run_id) w.runId = evt.run_id;
+      if (evt.type === "complete") w.sawComplete = true;
+      handleEventInWindow(w, slug, evt, bubbleFor, rootAgent);
+    }
   }
+}
+
+// The server keeps the run alive after a disconnect; try to re-attach and
+// resume from the last seen event. Bounded retries with a short backoff.
+async function reattachAfterDrop(w, slug, rootAgent, bubbleFor) {
+  for (let attempt = 0; attempt < 3 && !w.sawComplete; attempt++) {
+    await new Promise((r) => setTimeout(r, 1000 * (attempt + 1)));
+    try {
+      setChatStatus(w, `connection dropped — re-attaching (${attempt + 1}/3)…`);
+      const resp = await fetch(
+        `/api/projects/${slug}/agents/${rootAgent}/stream?since=${(w.lastSeq ?? -1) + 1}`,
+        { signal: w.abortController ? w.abortController.signal : undefined });
+      if (resp.status === 404) return; // run gone (server restart) — nothing to attach
+      if (!resp.ok || !resp.body) continue;
+      await pumpSse(w, slug, rootAgent, resp, bubbleFor);
+      if (w.sawComplete) return;
+    } catch (err) {
+      if (err.name === "AbortError") return;
+    }
+  }
+}
+
+async function sendMessageInWindow(w, text) {
+  const slug = w.projectSlug;
+  const rootAgent = w.agentId;
+  const proj = state.projectCache[slug];
+  addBubble(w, "user", text);
+  const bubbleFor = makeBubbleFactory(w);
   w.streaming = true;
+  w.sawComplete = false;
+  w.lastSeq = -1;
   setSendBtn(w, "stop");
   setChatStatus(w, "running... (Esc to stop)");
   updateQueueStatus(w);
@@ -2352,6 +2421,14 @@ async function sendMessageInWindow(w, text) {
       body: JSON.stringify(reqBody),
       signal: w.abortController.signal,
     });
+    if (resp.status === 409) {
+      // A detached run is already in flight for this agent (e.g. started
+      // before a page reload). Queue this message and attach to the live run.
+      addSystemBubble(w, "⏳ A turn is already running for this agent — message queued; re-attaching to the live stream…");
+      enqueueMessage(w, text);
+      await attachRunStream(w, slug, rootAgent, bubbleFor, 0);
+      return;
+    }
     if (!resp.ok || !resp.body) {
       const t = await resp.text();
       const b = bubbleFor(rootAgent);
@@ -2360,37 +2437,74 @@ async function sendMessageInWindow(w, text) {
       rerenderGraphsForSlug(slug);
       return;
     }
-    const reader = resp.body.getReader();
-    const decoder = new TextDecoder();
-    let buf = "";
-    while (true) {
-      const { value, done } = await reader.read();
-      if (done) break;
-      buf += decoder.decode(value, { stream: true });
-      const parts = buf.split("\n\n");
-      buf = parts.pop() || "";
-      for (const chunk of parts) {
-        const line = chunk.trim();
-        if (!line.startsWith("data:")) continue;
-        const payload = line.slice(5).trim();
-        if (!payload) continue;
-        let evt;
-        try { evt = JSON.parse(payload); } catch { continue; }
-        handleEventInWindow(w, slug, evt, bubbleFor, rootAgent);
-      }
-    }
-    setChatStatus(w, "xong");
+    await pumpSse(w, slug, rootAgent, resp, bubbleFor);
+    if (!w.sawComplete) await reattachAfterDrop(w, slug, rootAgent, bubbleFor);
+    setChatStatus(w, w.sawComplete ? "done" : "stream detached — turn continues on the server");
   } catch (err) {
     if (err.name === "AbortError") {
       setChatStatus(w, "stopped");
     } else {
-      setChatStatus(w, "network error: " + err.message);
+      if (!w.sawComplete) await reattachAfterDrop(w, slug, rootAgent, bubbleFor);
+      if (!w.sawComplete) setChatStatus(w, "network error: " + err.message);
+      else setChatStatus(w, "done");
     }
   } finally {
     w.streaming = false;
     w.abortController = null;
     setSendBtn(w, "send");
     // If the user queued messages while this turn ran, fire the next one now.
+    drainQueue(w);
+  }
+}
+
+async function attachRunStream(w, slug, rootAgent, bubbleFor, since) {
+  const resp = await fetch(
+    `/api/projects/${slug}/agents/${rootAgent}/stream?since=${since}`,
+    { signal: w.abortController ? w.abortController.signal : undefined });
+  if (!resp.ok || !resp.body) return false;
+  await pumpSse(w, slug, rootAgent, resp, bubbleFor);
+  return w.sawComplete;
+}
+
+// On project open: find turns that kept running while the browser was away
+// and re-attach their chat windows with full event replay.
+async function reattachActiveRuns(slug) {
+  let runs = [];
+  try {
+    const r = await fetch(`/api/projects/${slug}/runs`);
+    if (!r.ok) return;
+    runs = (await r.json()).runs || [];
+  } catch { return; }
+  for (const run of runs) {
+    const w = openChat(slug, run.agent_id);
+    if (w.streaming) continue; // this tab already follows it
+    attachDetachedRun(w, slug, run.agent_id);
+  }
+}
+
+async function attachDetachedRun(w, slug, rootAgent) {
+  const proj = state.projectCache[slug];
+  // Render db history first so replayed live bubbles append after it.
+  try { await refreshChatSession(w); } catch {}
+  const bubbleFor = makeBubbleFactory(w);
+  w.streaming = true;
+  w.sawComplete = false;
+  w.lastSeq = -1;
+  setSendBtn(w, "stop");
+  setChatStatus(w, "re-attached to a running turn (replaying)…");
+  if (proj) { proj.statuses[rootAgent] = "running"; rerenderGraphsForSlug(slug); }
+  try {
+    w.abortController = new AbortController();
+    await attachRunStream(w, slug, rootAgent, bubbleFor, 0);
+    if (!w.sawComplete) await reattachAfterDrop(w, slug, rootAgent, bubbleFor);
+    setChatStatus(w, w.sawComplete ? "done" : "stream detached — turn continues on the server");
+  } catch (err) {
+    if (err.name === "AbortError") setChatStatus(w, "stopped");
+    else setChatStatus(w, "network error: " + err.message);
+  } finally {
+    w.streaming = false;
+    w.abortController = null;
+    setSendBtn(w, "send");
     drainQueue(w);
   }
 }

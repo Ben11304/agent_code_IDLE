@@ -6,6 +6,7 @@ import json
 import os
 import re
 import time
+import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
@@ -1598,18 +1599,123 @@ async def _auto_compact_if_needed(slug: str, agent_id: str, emit) -> bool:
     return True
 
 
+# ---------- Detached runs (turn execution survives browser disconnect) ----------
+#
+# A chat turn runs as a server-side task that publishes events to an in-memory
+# per-run buffer plus live subscriber queues. The SSE response returned by
+# /chat is merely the FIRST subscriber: closing the browser only unsubscribes —
+# the turn keeps running to completion and persists its results (messages
+# table, dispatch ledger, plan.md) exactly as if the tab had stayed open.
+# Reopening the UI re-attaches via GET /stream with full event replay (seq 0).
+# Stopping is now an explicit POST /stop, never a side effect of disconnect.
+
+_RUN_KEEP_DONE_S = 600  # finished runs stay replayable this long
+
+
+class _Run:
+    def __init__(self, slug: str, agent_id: str):
+        self.id = uuid.uuid4().hex[:12]
+        self.slug = slug
+        self.agent_id = agent_id
+        self.started_at = time.time()
+        self.finished_at: Optional[float] = None
+        self.events: list[dict] = []          # every event, stamped with "seq"
+        self.subscribers: set[asyncio.Queue] = set()
+        self.done = False
+        self.task: Optional[asyncio.Task] = None
+
+    async def publish(self, evt: dict) -> None:
+        evt = dict(evt)
+        evt["seq"] = len(self.events)
+        self.events.append(evt)
+        for q in list(self.subscribers):
+            q.put_nowait(evt)
+
+    def finish(self) -> None:
+        self.done = True
+        self.finished_at = time.time()
+        for q in list(self.subscribers):
+            q.put_nowait(None)
+
+
+_RUNS: dict[str, _Run] = {}
+
+
+def _active_run(slug: str, agent_id: str) -> Optional[_Run]:
+    for r in _RUNS.values():
+        if r.slug == slug and r.agent_id == agent_id and not r.done:
+            return r
+    return None
+
+
+def _latest_run(slug: str, agent_id: str) -> Optional[_Run]:
+    cands = [r for r in _RUNS.values() if r.slug == slug and r.agent_id == agent_id]
+    return max(cands, key=lambda r: r.started_at) if cands else None
+
+
+def _prune_runs() -> None:
+    now = time.time()
+    for rid in [rid for rid, r in _RUNS.items()
+                if r.done and r.finished_at and now - r.finished_at > _RUN_KEEP_DONE_S]:
+        _RUNS.pop(rid, None)
+
+
+async def _run_subscriber_sse(run: _Run, since: int = 0):
+    """SSE generator attached to a run: replay buffered events from `since`,
+    then follow live. Subscribe BEFORE replaying so no event is missed; the
+    seq filter drops any duplicates that race in during replay. Disconnect
+    only removes the queue — the run task is untouched."""
+    q: asyncio.Queue = asyncio.Queue()
+    run.subscribers.add(q)
+    try:
+        yield _sse({"type": "start", "agent": run.agent_id, "run_id": run.id,
+                    "replay": max(0, since) < len(run.events)})
+        nxt = max(0, since)
+        while nxt < len(run.events):
+            yield _sse(run.events[nxt])
+            nxt += 1
+        if run.done:
+            yield _sse({"type": "complete"})
+            return
+        while True:
+            try:
+                # 15s timeout keeps the socket alive during long quiet phases
+                # (Opus extended thinking can sit 10-30s without a byte).
+                evt = await asyncio.wait_for(q.get(), timeout=15.0)
+            except asyncio.TimeoutError:
+                yield ": keepalive\n\n"
+                continue
+            if evt is None:
+                break
+            if evt["seq"] < nxt:
+                continue
+            nxt = evt["seq"] + 1
+            yield _sse(evt)
+        yield _sse({"type": "complete"})
+    finally:
+        run.subscribers.discard(q)
+
+
+_SSE_HEADERS = {
+    "Cache-Control": "no-cache, no-transform",
+    "X-Accel-Buffering": "no",
+    "Connection": "keep-alive",
+}
+
+
 @app.post("/api/projects/{slug}/agents/{agent_id}/chat")
 async def api_chat(slug: str, agent_id: str, body: ChatBody):
     found = projects.get_agent(slug, agent_id)
     if not found:
         raise HTTPException(404, "agent not found")
+    _prune_runs()
+    existing = _active_run(slug, agent_id)
+    if existing:
+        raise HTTPException(409, f"a turn is already running for {agent_id} (run {existing.id})")
 
-    queue: asyncio.Queue = asyncio.Queue()
-
-    async def emit(evt):
-        await queue.put(evt)
-
-    tracker: list = []
+    run = _Run(slug, agent_id)
+    _RUNS[run.id] = run
+    emit = run.publish
 
     grok_options = {
         "best_of_n": body.best_of_n,
@@ -1620,12 +1726,12 @@ async def api_chat(slug: str, agent_id: str, body: ChatBody):
     async def driver():
         # Multi-round continuation: after each wave of dispatches lands in the
         # ledger, the orchestrator gets another turn to react — synthesise, or
-        # chain follow-up dispatches — inside the SAME SSE response, up to
+        # chain follow-up dispatches — inside the SAME run, up to
         # _MAX_CONT_ROUNDS. Dispatches fired on the final round still run to
         # completion (results land in the ledger for the NEXT user turn); they
         # just don't trigger another continuation.
         all_tasks: list = []
-        cur: list = tracker
+        cur: list = []
         try:
             await _auto_compact_if_needed(slug, agent_id, emit)
             await _run_agent(slug, agent_id, body.message, emit, cur,
@@ -1662,45 +1768,63 @@ async def api_chat(slug: str, agent_id: str, body: ChatBody):
                 t.cancel()
             if all_tasks or cur:
                 await asyncio.gather(*(all_tasks + cur), return_exceptions=True)
-            raise
+            try:
+                await emit({"type": "error", "agent": agent_id,
+                            "message": "turn stopped by user"})
+            except Exception:
+                pass
         except Exception as e:
-            await queue.put({"type": "error", "agent": agent_id, "message": str(e)})
+            await emit({"type": "error", "agent": agent_id, "message": str(e)})
         finally:
-            await queue.put(None)
+            run.finish()
 
-    async def sse():
-        yield _sse({"type": "start", "agent": agent_id})
-        task = asyncio.create_task(driver())
-        try:
-            while True:
-                try:
-                    # 15s timeout keeps the socket alive during long quiet
-                    # phases (Opus extended thinking can sit 10-30s without
-                    # emitting any byte). Without this, browsers + proxies
-                    # silently close the SSE and the chat appears to hang,
-                    # showing the "stopped" label with no response. The comment
-                    # line is not a data event, so the frontend ignores it.
-                    evt = await asyncio.wait_for(queue.get(), timeout=15.0)
-                except asyncio.TimeoutError:
-                    yield ": keepalive\n\n"
-                    continue
-                if evt is None:
-                    break
-                yield _sse(evt)
-            yield _sse({"type": "complete"})
-        finally:
-            if not task.done():
-                task.cancel()
+    run.task = asyncio.create_task(driver())
 
     return StreamingResponse(
-        sse(),
+        _run_subscriber_sse(run, since=0),
         media_type="text/event-stream",
-        headers={
-            "Cache-Control": "no-cache, no-transform",
-            "X-Accel-Buffering": "no",
-            "Connection": "keep-alive",
-        },
+        headers=dict(_SSE_HEADERS),
     )
+
+
+@app.get("/api/projects/{slug}/runs")
+def api_runs(slug: str):
+    """Active (not yet done) runs for this project — the UI calls this on
+    project open to re-attach to turns that kept running while the browser
+    was closed."""
+    _prune_runs()
+    return {"runs": [
+        {"run_id": r.id, "agent_id": r.agent_id, "started_at": r.started_at,
+         "events": len(r.events)}
+        for r in _RUNS.values() if r.slug == slug and not r.done
+    ]}
+
+
+@app.get("/api/projects/{slug}/agents/{agent_id}/stream")
+async def api_stream(slug: str, agent_id: str, since: int = 0):
+    """Re-attach to this agent's run (active, or finished within the keep
+    window) with replay from `since`. 404 when there is nothing to attach."""
+    if not projects.get_agent(slug, agent_id):
+        raise HTTPException(404, "agent not found")
+    run = _active_run(slug, agent_id) or _latest_run(slug, agent_id)
+    if not run:
+        raise HTTPException(404, "no run to attach")
+    return StreamingResponse(
+        _run_subscriber_sse(run, since=since),
+        media_type="text/event-stream",
+        headers=dict(_SSE_HEADERS),
+    )
+
+
+@app.post("/api/projects/{slug}/agents/{agent_id}/stop")
+async def api_stop(slug: str, agent_id: str):
+    """Explicitly cancel the agent's active run. Since browser disconnect no
+    longer cancels anything, this is the ONLY way to stop a turn."""
+    run = _active_run(slug, agent_id)
+    if not run or not run.task or run.task.done():
+        return {"stopped": False, "reason": "no active run"}
+    run.task.cancel()
+    return {"stopped": True, "run_id": run.id}
 
 
 _COMPACT_PROMPT = (
