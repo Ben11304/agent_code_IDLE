@@ -250,7 +250,31 @@ def api_clear_positions(slug: str):
 # "context window" gauge in the expandable agent panel — token counts are
 # ESTIMATED (chars/4 over the active session + system prompt), not exact, since
 # the CLIs do not report usage in a form we persist. Labelled "≈" in the UI.
-_CONTEXT_WINDOWS = {"claude": 200_000, "grok": 256_000}
+# Real context window per MODEL — the denominator of the context gauge and the
+# auto-compact threshold. The numerator is the CLI's real reported token usage;
+# only this denominator is configuration, so it must match the model actually
+# being served. Source: Anthropic model catalog (2026-06): Fable 5, Opus
+# 4.7/4.8 and Sonnet 4.6 are 1M-context models; Haiku 4.5 is 200K. The user's
+# Claude Code subscription serves the 1M window (confirmed via /model:
+# "Opus 4.8 (1M context)"). Unknown models fall back to the adapter default —
+# deliberately conservative: compacting early is cheap, while a real overflow
+# fails the turn loudly (CLI returns a prompt-too-long error; resume guard +
+# cold-start preamble recover) — it does NOT silently hallucinate past the
+# limit.
+_MODEL_CONTEXT_WINDOWS = {
+    "claude-fable-5": 1_000_000,
+    "claude-opus-4-8": 1_000_000,
+    "claude-opus-4-7": 1_000_000,
+    "claude-sonnet-4-6": 1_000_000,
+    "claude-haiku-4-5": 200_000,
+}
+_CONTEXT_WINDOWS = {"claude": 200_000, "grok": 256_000}  # adapter fallback
+
+
+def _context_window_for(model_kind: str, model_id: Optional[str]) -> int:
+    if model_id and model_id in _MODEL_CONTEXT_WINDOWS:
+        return _MODEL_CONTEXT_WINDOWS[model_id]
+    return _CONTEXT_WINDOWS.get(model_kind, 200_000)
 
 
 def _usage_ctx_tokens(usage: dict) -> int:
@@ -271,7 +295,8 @@ def _usage_ctx_tokens(usage: dict) -> int:
     return _req_total(usage)
 
 
-def _session_context_pct(sess: Optional[dict], model_kind: str) -> float:
+def _session_context_pct(sess: Optional[dict], model_kind: str,
+                         model_id: Optional[str] = None) -> float:
     """Context % of a session's last completed turn, 0.0 when unknown (no usage
     recorded yet — fresh session, or a grok node which reports no usage)."""
     if not sess or not sess.get("usage"):
@@ -280,7 +305,7 @@ def _session_context_pct(sess: Optional[dict], model_kind: str) -> float:
         usage = json.loads(sess["usage"])
     except (ValueError, TypeError):
         return 0.0
-    window = _CONTEXT_WINDOWS.get(model_kind, 200_000)
+    window = _context_window_for(model_kind, model_id)
     if not window:
         return 0.0
     return round(_usage_ctx_tokens(usage) / window * 100.0, 1)
@@ -493,7 +518,7 @@ def api_project_stats(slug: str):
             eff_model = ov.get("claude_model") or a.get("claude_model") or "claude-sonnet-4-6"
         effort = ov.get("effort") if (ov and "effort" in ov) else a.get("effort")
 
-        window = _CONTEXT_WINDOWS.get(model_kind, 200_000)
+        window = _context_window_for(model_kind, eff_model)
         # Prefer the CLI's real token usage from the last turn. Context-window
         # occupancy = every input bucket (fresh + cache create + cache read) +
         # output. Fall back to a chars/4 estimate only when no usage is recorded
@@ -1568,7 +1593,13 @@ async def _auto_compact_if_needed(slug: str, agent_id: str, emit) -> bool:
     sess = sessions[0] if sessions else None
     if not sess or sess.get("last_status") != "ok" or not sess.get("claude_session_id"):
         return False
-    pct = _session_context_pct(sess, agent.get("model", "claude"))
+    model_kind = agent.get("model", "claude")
+    ov = db.get_agent_override(slug, agent_id) or {}
+    if model_kind == "grok":
+        eff_model = ov.get("grok_model") or agent.get("grok_model") or "grok-build"
+    else:
+        eff_model = ov.get("claude_model") or agent.get("claude_model") or "claude-sonnet-4-6"
+    pct = _session_context_pct(sess, model_kind, eff_model)
     if pct < _AUTO_COMPACT_PCT:
         return False
 

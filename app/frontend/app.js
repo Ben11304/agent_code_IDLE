@@ -833,6 +833,7 @@ async function ensureStats(slug, force) {
 
 function fmtTokens(n) {
   n = n || 0;
+  if (n >= 1000000) return (n / 1000000).toFixed(n >= 10000000 ? 0 : 1).replace(/\.0$/, "") + "M";
   if (n >= 1000) return (n / 1000).toFixed(n >= 10000 ? 0 : 1).replace(/\.0$/, "") + "k";
   return String(n);
 }
