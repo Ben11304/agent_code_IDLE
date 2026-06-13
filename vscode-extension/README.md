@@ -40,6 +40,45 @@ On macOS/Linux nothing is monkeypatched — the original PTY path runs as-is.
 First launch creates a managed Python venv and installs deps (one-time, ~30s).
 The graph window opens once the backend is healthy.
 
+## Using it (daily journey)
+
+```
+AgentUI: Open Workspace
+   │  (first run only: "setting up Python environment…" ~30s)
+   ▼
+Webview panel opens inside VSCode  →  sidebar projects + workspace folder tree
+   │
+   ├─ click a project          → graph window renders its agents
+   ├─ click an agent node       → floating chat window opens
+   │     ├─ send a task to the orchestrator → streams token-by-token
+   │     ├─ <dispatch> tags light the edge + run the worker node live
+   │     └─ slash commands: /model /effort /dispatch /focus /status /compact /clear
+   ├─ "+ agent"                 → create an agent (template or parent-bootstrapped)
+   ├─ "+ project"               → scaffold a new project (writes shared/, sync.sh, project.yaml)
+   ├─ click a file in the tree  → floating viewer (markdown / code / image / pdf)
+   └─ ⚡ Skills panel            → insert a skill call into the open chat
+```
+
+Same control plane as the standalone web app — now docked in VSCode, no browser,
+no `run.sh`. The new app features all work through the extension: detached-run
+re-attach (`/stream?since=`), per-model context gauge, `/stats` + children rollup,
+project/agent scaffolding, and manual/auto `/compact`.
+
+Lifecycle:
+
+| Action | Result |
+|---|---|
+| Close the webview tab (×) | Backend stops; child `claude`/`node` processes are killed |
+| Re-run **Open Workspace** | Fresh backend on a new free port |
+| Backend hung / errored | **AgentUI: Restart Backend** |
+| Debugging | **AgentUI: Show Backend Logs** (output channel) |
+| Close VSCode | `deactivate()` cleans up the backend |
+
+> **`registry.yaml`** ships pointing at macOS paths. On a new machine, edit
+> `app/registry.yaml` to your real project paths or the project list is empty.
+> `claude` must already be logged in (subscription) — the extension never touches auth.
+> Project scaffolding writes a `sync.sh` (bash) — run it via Git Bash/WSL on Windows.
+
 ## Configuration (Settings → AgentUI)
 
 | Setting | Default | Meaning |
@@ -57,16 +96,63 @@ Backend (installed into the managed venv from `pybridge/requirements.txt`):
 
 Requires the `claude` CLI (and optionally `grok`) on PATH, same as the standalone app.
 
-## Package as a .vsix
+## Distribute & publish
+
+### Before any distribution: bundle `app/`
+
+During development the extension references `../app`. That path does **not** exist
+on anyone else's machine, so a shared build must carry the backend + frontend
+inside the extension folder:
+
+```
+# from vscode-extension/
+cp -r ../app/backend  ./app/backend
+cp -r ../app/frontend ./app/frontend
+cp    ../app/registry.yaml ./app/registry.yaml   # then edit to portable paths
+# point the extension at the bundled copy:
+#   set "agentui.appPath" default, or change appRoot() in src/extension.js to
+#   path.join(extensionPath, "app")
+```
+
+Each user still needs, on their own machine: **Python 3.10+**, the **`claude` CLI
+logged in**, and **Node** (claude is a Node CLI). The extension builds the Python
+venv automatically on first run; it cannot provide the subscription login.
+
+### 1) Sideload a `.vsix` (recommended for personal / team use)
 
 ```
 npm install
-npx vsce package
+npx vsce package          # → agentui-0.1.0.vsix
 ```
 
-Note: packaging bundles only this folder. For a redistributable build, copy
-`app/backend` and `app/frontend` into the extension (or set `agentui.appPath` on
-the target machine). For personal local use the default `../app` reference is fine.
+Install: VSCode → Extensions panel → `…` menu → **Install from VSIX…**, or
+`code --install-extension agentui-0.1.0.vsix`. No marketplace account needed.
+This is the right path for a personal multi-agent tool.
+
+### 2) Publish to the VS Code Marketplace
+
+```
+# one-time setup
+npm install -g @vscode/vsce
+# create a publisher at https://marketplace.visualstudio.com/manage
+# create an Azure DevOps Personal Access Token (scope: Marketplace > Manage)
+vsce login <publisher>    # paste the PAT
+# then, from vscode-extension/
+vsce publish              # or: vsce publish minor / patch
+```
+
+Requirements the Marketplace enforces: a real `publisher` in `package.json`, an
+`icon`, a `repository` field, and a `LICENSE`. Add those before publishing.
+
+> ⚠️ **Consider before publishing publicly.** This tool wraps your personal
+> `claude`/`grok` **subscription** CLIs. CLAUDE.md is explicit that this is a
+> personal-use control plane and that hosting it against your login is effectively
+> reselling. Publishing the *extension* (which runs against each user's *own*
+> login) is fine in principle, but make sure the listing makes clear that users
+> bring their own subscription + CLI — and never embed your credentials or
+> session files. For a small team, the private `.vsix` route above avoids all of
+> this. Alternatively use **Open VSX** (`ovsx publish`) if targeting non-Microsoft
+> editors like Cursor / VSCodium.
 
 ## Verified
 
