@@ -1,0 +1,7 @@
+# Backend runtime deps for the AgentUI VSCode extension.
+# Mirrors app/backend/requirements.txt + pywinpty (ConPTY streaming on Windows).
+fastapi>=0.110
+uvicorn[standard]>=0.27
+pyyaml>=6.0
+ruamel.yaml>=0.17
+pywinpty>=2.0 ; sys_platform == "win32"

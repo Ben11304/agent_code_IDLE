@@ -1,0 +1,18 @@
+{
+  "permissions": {
+    "allow": [
+      "PowerShell(foreach \\($c in @\\('claude','grok','aas','node','python','py'\\)\\) { $cmd = Get-Command $c -ErrorAction SilentlyContinue; if \\($cmd\\) { \"{0,-8} -> {1} [{2}]\" -f $c, $cmd.Source, $cmd.CommandType } else { \"{0,-8} -> NOT FOUND\" -f $c } })",
+      "PowerShell($root='D:\\\\GitHub\\\\agent_code_IDLE\\\\vscode-extension'; New-Item -ItemType Directory -Force -Path \"$root\\\\src\",\"$root\\\\pybridge\",\"$root\\\\media\\\\vendor\" | Out-Null; $ProgressPreference='SilentlyContinue'; try { Invoke-WebRequest 'https://cdn.jsdelivr.net/npm/marked@12.0.0/marked.min.js' -OutFile \"$root\\\\media\\\\vendor\\\\marked.min.js\" -ErrorAction Stop; Invoke-WebRequest 'https://cdn.jsdelivr.net/npm/dompurify@3.0.9/dist/purify.min.js' -OutFile \"$root\\\\media\\\\vendor\\\\purify.min.js\" -ErrorAction Stop; \"vendor downloaded:\"; Get-ChildItem \"$root\\\\media\\\\vendor\" | Select-Object Name,Length | Format-Table -AutoSize } catch { \"DOWNLOAD FAILED: $\\($_.Exception.Message\\)\" })",
+      "PowerShell(python -c \"import importlib.util as u; mods=['fastapi','uvicorn','yaml','ruamel.yaml','winpty']; [print\\(f'{m}: {\\\\\"OK\\\\\" if u.find_spec\\(m\\) else \\\\\"MISSING\\\\\"}'\\) for m in mods]\"; \"py launcher:\"; \\(Get-Command py -ErrorAction SilentlyContinue\\).Source)",
+      "PowerShell($p = Start-Process -FilePath python -ArgumentList @\\('D:\\\\GitHub\\\\agent_code_IDLE\\\\vscode-extension\\\\pybridge\\\\server.py','--app-root','D:\\\\GitHub\\\\agent_code_IDLE\\\\app','--host','127.0.0.1','--port','5199'\\) -PassThru -RedirectStandardOutput \"$env:TEMP\\\\agentui_out.log\" -RedirectStandardError \"$env:TEMP\\\\agentui_err.log\"; Start-Sleep -Seconds 6; foreach \\($u in @\\('/api/projects','/','/styles.css','/app.js'\\)\\) { try { $r = Invoke-WebRequest \"http://127.0.0.1:5199$u\" -UseBasicParsing -TimeoutSec 5; \"GET $u -> $\\($r.StatusCode\\) \\(len $\\($r.Content.Length\\)\\)\" } catch { \"GET $u FAILED: $\\($_.Exception.Message\\)\" } }; Stop-Process -Id $p.Id -Force -ErrorAction SilentlyContinue; \"--- stdout ---\"; Get-Content \"$env:TEMP\\\\agentui_out.log\" -ErrorAction SilentlyContinue; \"--- stderr tail ---\"; Get-Content \"$env:TEMP\\\\agentui_err.log\" -Tail 8 -ErrorAction SilentlyContinue)",
+      "PowerShell(& \"C:\\\\Program Files\\\\nodejs\\\\node.exe\" \"D:\\\\GitHub\\\\agent_code_IDLE\\\\vscode-extension\\\\verify-html.js\")",
+      "PowerShell(& \"C:\\\\Program Files\\\\nodejs\\\\node.exe\" --check \"D:\\\\GitHub\\\\agent_code_IDLE\\\\vscode-extension\\\\src\\\\extension.js\" 2>&1)",
+      "PowerShell(& \"C:\\\\Program Files\\\\nodejs\\\\node.exe\" --check \"D:\\\\GitHub\\\\agent_code_IDLE\\\\vscode-extension\\\\media\\\\shim.js\" 2>&1)",
+      "PowerShell(python -m py_compile \"D:\\\\GitHub\\\\agent_code_IDLE\\\\vscode-extension\\\\pybridge\\\\server.py\" \"D:\\\\GitHub\\\\agent_code_IDLE\\\\vscode-extension\\\\pybridge\\\\win_adapters.py\" 2>&1)",
+      "PowerShell(if \\($LASTEXITCODE -eq 0\\) { \"extension.js: syntax OK\" })",
+      "PowerShell(if \\($LASTEXITCODE -eq 0\\) { \"shim.js: syntax OK\" })",
+      "PowerShell(\"--- py compile ---\")",
+      "PowerShell(if \\($LASTEXITCODE -eq 0\\) { \"python files: compile OK\" })"
+    ]
+  }
+}

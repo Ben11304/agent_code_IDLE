@@ -1,0 +1,61 @@
+{
+  "name": "agentui",
+  "displayName": "AgentUI — Multi-Agent Control Plane",
+  "description": "Localhost control plane for multi-agent CLI workflows (claude / grok) inside VSCode.",
+  "version": "0.1.0",
+  "publisher": "viethuy",
+  "engines": {
+    "vscode": "^1.84.0"
+  },
+  "categories": [
+    "Other"
+  ],
+  "main": "./src/extension.js",
+  "activationEvents": [],
+  "contributes": {
+    "commands": [
+      {
+        "command": "agentui.open",
+        "title": "AgentUI: Open Workspace",
+        "category": "AgentUI"
+      },
+      {
+        "command": "agentui.restartBackend",
+        "title": "AgentUI: Restart Backend",
+        "category": "AgentUI"
+      },
+      {
+        "command": "agentui.showLogs",
+        "title": "AgentUI: Show Backend Logs",
+        "category": "AgentUI"
+      }
+    ],
+    "configuration": {
+      "title": "AgentUI",
+      "properties": {
+        "agentui.pythonPath": {
+          "type": "string",
+          "default": "",
+          "description": "Python interpreter to use. If it already has the backend dependencies, it is used directly; otherwise a managed virtualenv is created. Leave blank to auto-detect."
+        },
+        "agentui.appPath": {
+          "type": "string",
+          "default": "",
+          "description": "Absolute path to the AgentUI `app` directory (the parent of `backend/`). Leave blank to use the copy shipped next to this extension (../app)."
+        },
+        "agentui.port": {
+          "type": "number",
+          "default": 0,
+          "description": "Fixed backend port. 0 = pick a free port automatically."
+        }
+      }
+    }
+  },
+  "scripts": {
+    "vscode:prepublish": "echo 'no build step (plain JS)'",
+    "package": "vsce package"
+  },
+  "devDependencies": {
+    "@vscode/vsce": "^2.24.0"
+  }
+}

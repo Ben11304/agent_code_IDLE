@@ -1,0 +1,6 @@
+.vscode/**
+.gitignore
+**/*.map
+node_modules/**
+*.vsix
+verify-html.js
