@@ -405,6 +405,58 @@ html, body { margin: 0; height: 100%; background: var(--bg); color: var(--text);
   border-radius: 6px; overflow-x: auto; max-height: 240px; overflow-y: auto;
   font-family: var(--mono); font-size: 11.5px; white-space: pre-wrap; }
 
+/* Worker cards — dispatched agents render inside one collapsible card each */
+.worker-card { border: 1px solid var(--border); border-left: 3px solid var(--run);
+  border-radius: 8px; background: var(--bg-soft); margin: 4px 0;
+  font-size: 12px; overflow: hidden; align-self: stretch; }
+.worker-card.status-ok { border-left-color: var(--ok); }
+.worker-card.status-error { border-left-color: var(--err); }
+.wc-head { display: flex; align-items: center; gap: 6px; padding: 6px 9px;
+  cursor: pointer; user-select: none; }
+.wc-head:hover { background: var(--hover); }
+.wc-arrow { color: var(--accent); font-weight: 600; flex-shrink: 0; }
+.wc-agent { font-family: var(--mono); font-weight: 700; flex-shrink: 0; }
+.wc-status { flex: 1 1 auto; min-width: 0; color: var(--text-dim);
+  font-size: 11px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.worker-card.status-ok .wc-status { color: var(--ok); }
+.worker-card.status-error .wc-status { color: var(--err); }
+.wc-toggle { color: var(--text-dim); width: 18px; text-align: center;
+  font-size: 10px; flex-shrink: 0; }
+.wc-task { padding: 0 9px 6px 24px; color: var(--text-faint); font-size: 10.5px;
+  font-style: italic; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.wc-body { padding: 6px 8px 8px 12px; border-top: 1px solid var(--border);
+  display: flex; flex-direction: column; gap: 8px; background: var(--bg); }
+.wc-body .bubble.worker { max-width: 100%; font-size: 12px;
+  background: var(--bg-soft); opacity: 0.92; }
+.wc-body .worker-card { margin-left: 6px; }
+.wc-foot { padding: 6px 9px; border-top: 1px solid var(--border); }
+.wc-open { background: var(--accent-soft); color: var(--accent);
+  border: 1px solid var(--accent-border); border-radius: 6px; padding: 3px 10px;
+  font-size: 11px; cursor: pointer; font-family: var(--mono); }
+.wc-open:hover { background: var(--accent); color: #fff; }
+
+/* Control-plane separator — machine-to-machine traffic, not a bubble */
+.ctrl-sep { display: flex; align-items: center; gap: 10px; align-self: stretch;
+  margin: 2px 0; color: var(--text-faint); font-size: 10.5px; font-family: var(--mono); }
+.ctrl-sep::before, .ctrl-sep::after { content: ""; flex: 1; height: 1px;
+  background: var(--border); }
+.ctrl-sep-label { flex-shrink: 0; }
+
+/* Turn progress strip — one-glance state of the in-flight turn */
+.turn-strip { display: flex; align-items: center; gap: 6px; flex-wrap: wrap;
+  padding: 5px 12px; border-bottom: 1px solid var(--border);
+  background: var(--bg-soft); font-size: 11px; font-family: var(--mono);
+  flex-shrink: 0; }
+.turn-strip[hidden] { display: none; }
+.ts-root { font-weight: 700; }
+.ts-sep { color: var(--text-dim); }
+.ts-chip { border: 1px solid var(--border); border-radius: 10px; padding: 1px 8px;
+  color: var(--text-dim); background: var(--bg-card); }
+.ts-chip.ts-ok { color: var(--ok); border-color: var(--ok); }
+.ts-chip.ts-error { color: var(--err); border-color: var(--err); }
+.ts-chip.ts-running { color: var(--run); border-color: var(--run); }
+.ts-round { color: var(--text-faint); margin-left: auto; }
+
 .chatbox { border-top: 1px solid var(--border); padding: 10px 12px; background: var(--bg);
   flex-shrink: 0; position: relative; }
 

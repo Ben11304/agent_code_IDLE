@@ -1411,7 +1411,8 @@ async def _run_agent(
                         note = note[:200] + "…"
                     if _set_plan_step(plan_path, int(m.group(1)), m.group(2).lower(), note):
                         await emit({"type": "plan_step", "agent": agent_id,
-                                    "n": int(m.group(1)), "status": m.group(2).lower()})
+                                    "n": int(m.group(1)), "status": m.group(2).lower(),
+                                    "note": (m.group(3) or "").strip()[:120]})
                 await emit({"type": "delta", "agent": agent_id, "text": text})
             elif etype == "meta":
                 data = evt.get("data") or {}
@@ -1773,6 +1774,10 @@ async def api_chat(slug: str, agent_id: str, body: ChatBody):
                 all_tasks.extend(cur)
                 rounds += 1
                 last = rounds >= _MAX_CONT_ROUNDS
+                # UI renders this as a thin separator between continuation
+                # rounds instead of showing the raw control-plane prompt.
+                await emit({"type": "continuation_round", "agent": agent_id,
+                            "round": rounds, "max": _MAX_CONT_ROUNDS})
                 synth = (
                     f"[CONTROL-PLANE CONTINUATION {rounds}/{_MAX_CONT_ROUNDS}] All worker "
                     "dispatches from your previous response have completed. Their outputs are "

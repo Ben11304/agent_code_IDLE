@@ -457,6 +457,7 @@ function renderWindowContent(w) {
   } else if (w.type === "chat") {
     c.innerHTML = `
       <div class="chat-header"></div>
+      <div class="turn-strip" hidden></div>
       <div class="messages"></div>
       <div class="chatbox">
         <div class="chatbox-label">Chat session</div>
@@ -1178,19 +1179,120 @@ async function refreshChatSession(w) {
     w.session = j.session;
     const msgRoot = w.el.querySelector(".messages");
     msgRoot.innerHTML = "";
-    (j.messages || []).forEach((m) => addBubble(w, m.role, m.content));
+    (j.messages || []).forEach((m) => {
+      if (m.role === "user" && /^\[CONTROL-PLANE /.test(m.content || "")) {
+        addCtrlSeparator(w, m.content);
+        return;
+      }
+      addBubble(w, m.role, m.content);
+    });
   } catch {}
 }
 
-function addBubble(w, role, text) {
-  const root = w.el.querySelector(".messages");
+function addBubble(w, role, text, container) {
+  const root = container || w.el.querySelector(".messages");
   const b = document.createElement("div");
   b.className = `bubble ${role}`;
   b.innerHTML = `<div class="role">${role}</div><div class="content"></div>`;
   setContent(b.querySelector(".content"), text);
   root.appendChild(b);
-  root.scrollTop = root.scrollHeight;
+  const m = w.el.querySelector(".messages");
+  if (m) m.scrollTop = m.scrollHeight;
   return b;
+}
+
+// Control-plane messages (continuation prompts, compact seeds) are machine-to-
+// machine traffic — render them as a thin labelled separator, not a user bubble.
+function addCtrlSeparator(w, content) {
+  const root = w.el.querySelector(".messages");
+  const d = document.createElement("div");
+  d.className = "ctrl-sep";
+  let label = "control-plane";
+  const m = (content || "").match(/^\[CONTROL-PLANE ([A-Z][A-Z -]*?)\s*([0-9]+\/[0-9]+)?\]/);
+  if (m) label = m[1].toLowerCase().trim() + (m[2] ? " " + m[2] : "");
+  d.innerHTML = `<span class="ctrl-sep-label">⟳ ${escapeHtml(label)}</span>`;
+  d.title = (content || "").slice(0, 400);
+  root.appendChild(d);
+  root.scrollTop = root.scrollHeight;
+  return d;
+}
+
+// ---------- Worker cards ----------
+// Each dispatched worker gets ONE collapsible card in the parent chat: a live
+// status line (driven by plan/status events) on top, the full streamed
+// transcript hidden inside. Parallel workers stop interleaving — the parent
+// chat reads as: orchestrator text → cards → orchestrator synthesis.
+
+function ensureWorkerCard(w, source, target, task, rootAgent) {
+  if (!w._workerCards) w._workerCards = {};
+  if (w._workerCards[target]) return w._workerCards[target];
+  const card = document.createElement("div");
+  card.className = "worker-card status-running";
+  card.dataset.agent = target;
+  const taskLine = (task || "").split("\n")[0].slice(0, 110);
+  card.innerHTML = `
+    <div class="wc-head">
+      <span class="wc-arrow">➜</span>
+      <span class="wc-agent">${escapeHtml(target)}</span>
+      <span class="wc-status">⏳ starting…</span>
+      <span class="wc-toggle" title="show full transcript">▸</span>
+    </div>
+    ${taskLine ? `<div class="wc-task" title="${escapeHtml((task || "").slice(0, 400))}">${escapeHtml(taskLine)}</div>` : ""}
+    <div class="wc-body" hidden></div>
+    <div class="wc-foot" hidden>
+      <button class="wc-open">open ${escapeHtml(target)} chat ↗</button>
+    </div>`;
+  card.querySelector(".wc-head").onclick = () => {
+    const body = card.querySelector(".wc-body");
+    const foot = card.querySelector(".wc-foot");
+    body.hidden = !body.hidden;
+    foot.hidden = body.hidden;
+    card.querySelector(".wc-toggle").textContent = body.hidden ? "▸" : "▾";
+  };
+  card.querySelector(".wc-open").onclick = (e) => {
+    e.stopPropagation();
+    openChat(w.projectSlug, target);
+  };
+  // A worker's own sub-dispatch (e.g. DATASET → PAPER) nests inside the
+  // source's card so the hierarchy stays visible.
+  const parentCard = (source && source !== rootAgent && w._workerCards[source]) || null;
+  const container = parentCard ? parentCard.querySelector(".wc-body") : w.el.querySelector(".messages");
+  container.appendChild(card);
+  const m = w.el.querySelector(".messages");
+  if (m) m.scrollTop = m.scrollHeight;
+  w._workerCards[target] = card;
+  return card;
+}
+
+function workerCardStatus(w, agentId, text, cls) {
+  const card = w._workerCards && w._workerCards[agentId];
+  if (!card) return false;
+  if (cls) {
+    card.classList.remove("status-running", "status-ok", "status-error");
+    card.classList.add(cls);
+  }
+  // Once the worker finished, its summary line wins over late status noise.
+  if (card.dataset.done && !cls) return true;
+  const st = card.querySelector(".wc-status");
+  if (st && text) st.textContent = text;
+  return true;
+}
+
+// ---------- Turn progress strip ----------
+
+function renderTurnStrip(w, rootAgent) {
+  const el = w.el.querySelector(".turn-strip");
+  if (!el) return;
+  const ws = w._turnWorkers || {};
+  const ids = Object.keys(ws);
+  if (!ids.length) { el.hidden = true; el.innerHTML = ""; return; }
+  el.hidden = false;
+  const icon = (s) => (s === "ok" ? "✓" : (s === "error" ? "✗" : "⏳"));
+  el.innerHTML =
+    `<span class="ts-root">${escapeHtml(rootAgent)}</span><span class="ts-sep">▸</span>` +
+    ids.map((id) =>
+      `<span class="ts-chip ts-${ws[id]}">${icon(ws[id])} ${escapeHtml(id)}</span>`).join("") +
+    (w._turnRound ? `<span class="ts-round">round ${w._turnRound}</span>` : "");
 }
 
 const DISPATCH_TAG_RE = /<dispatch\s+agent="([^"]+)"\s*>([\s\S]*?)<\/dispatch>/gi;
@@ -2303,11 +2405,16 @@ function setChatStatus(w, s) {
   if (el) el.textContent = s;
 }
 
-function makeBubbleFactory(w) {
+function makeBubbleFactory(w, rootAgent) {
   const bubbles = {};
-  return function bubbleFor(agentId) {
+  function bubbleFor(agentId) {
     if (bubbles[agentId]) return bubbles[agentId];
-    const b = addBubble(w, "assistant", "");
+    // Worker output renders INSIDE its dispatch card (collapsed by default);
+    // only the root agent writes top-level bubbles.
+    const card = (agentId !== rootAgent && w._workerCards && w._workerCards[agentId]) || null;
+    const b = card
+      ? addBubble(w, "assistant worker", "", card.querySelector(".wc-body"))
+      : addBubble(w, "assistant", "");
     b.querySelector(".role").textContent = "assistant • " + agentId;
     const contentEl = b.querySelector(".content");
 
@@ -2343,7 +2450,11 @@ function makeBubbleFactory(w) {
       streamingStarted: false,
     };
     return bubbles[agentId];
-  };
+  }
+  // Drop the cached bubble so the next delta opens a fresh one — used between
+  // continuation rounds to keep each round visually separate.
+  bubbleFor.reset = (agentId) => { delete bubbles[agentId]; };
+  return bubbleFor;
 }
 
 // Read an SSE response into the window. Tracks w.lastSeq / w.sawComplete /
@@ -2399,10 +2510,14 @@ async function sendMessageInWindow(w, text) {
   const rootAgent = w.agentId;
   const proj = state.projectCache[slug];
   addBubble(w, "user", text);
-  const bubbleFor = makeBubbleFactory(w);
+  const bubbleFor = makeBubbleFactory(w, rootAgent);
   w.streaming = true;
   w.sawComplete = false;
   w.lastSeq = -1;
+  w._workerCards = {};
+  w._turnWorkers = {};
+  w._turnRound = null;
+  renderTurnStrip(w, rootAgent);
   setSendBtn(w, "stop");
   setChatStatus(w, "running... (Esc to stop)");
   updateQueueStatus(w);
@@ -2487,10 +2602,14 @@ async function attachDetachedRun(w, slug, rootAgent) {
   const proj = state.projectCache[slug];
   // Render db history first so replayed live bubbles append after it.
   try { await refreshChatSession(w); } catch {}
-  const bubbleFor = makeBubbleFactory(w);
+  const bubbleFor = makeBubbleFactory(w, rootAgent);
   w.streaming = true;
   w.sawComplete = false;
   w.lastSeq = -1;
+  w._workerCards = {};
+  w._turnWorkers = {};
+  w._turnRound = null;
+  renderTurnStrip(w, rootAgent);
   setSendBtn(w, "stop");
   setChatStatus(w, "re-attached to a running turn (replaying)…");
   if (proj) { proj.statuses[rootAgent] = "running"; rerenderGraphsForSlug(slug); }
@@ -2556,6 +2675,7 @@ function handleEventInWindow(w, slug, evt, bubbleFor, rootAgent) {
       const b = bubbleFor(agent);
       if (evt.status === "thinking" && !b.streamingStarted) {
         b.thinkLabel.textContent = "thinking…";
+        if (agent !== rootAgent) workerCardStatus(w, agent, "⏳ thinking…");
       } else if (evt.status === "responding") {
         b.streamingStarted = true;
         if (b.thinkAccum) {
@@ -2563,7 +2683,17 @@ function handleEventInWindow(w, slug, evt, bubbleFor, rootAgent) {
         } else {
           b.thinkBlock.style.display = "none";
         }
+        if (agent !== rootAgent) workerCardStatus(w, agent, "⏳ writing…");
       }
+      break;
+    }
+    case "continuation_round": {
+      // Round boundary: thin separator + fresh bubble for the orchestrator's
+      // synthesis, so each round reads as its own paragraph block.
+      addCtrlSeparator(w, `[CONTROL-PLANE CONTINUATION ${evt.round}/${evt.max}]`);
+      if (bubbleFor.reset) bubbleFor.reset(evt.agent || rootAgent);
+      w._turnRound = `${evt.round}/${evt.max}`;
+      renderTurnStrip(w, rootAgent);
       break;
     }
     case "agent_status": {
@@ -2589,19 +2719,34 @@ function handleEventInWindow(w, slug, evt, bubbleFor, rootAgent) {
       } else {
         b.thinkBlock.style.display = "none";
       }
+      // Worker finished: promote its first meaningful line to the card summary.
+      if (agent !== rootAgent && w._workerCards && w._workerCards[agent]) {
+        const firstLine = (finalText || "").split("\n").map((l) => l.trim())
+          .find((l) => l && !l.startsWith("<")) || "";
+        const ok = (evt.status || "ok") === "ok";
+        workerCardStatus(w, agent,
+          (ok ? "✓ " : "✗ ") + (firstLine.replace(/^#+\s*/, "").slice(0, 90) || (ok ? "done" : "error")),
+          ok ? "status-ok" : "status-error");
+        w._workerCards[agent].dataset.done = "1";
+      }
       rerenderGraphsForSlug(slug);
       ensureStats(slug, true);
       mirrorDispatchedMessages(slug, agent);
       break;
     }
     case "plan_updated": {
-      setChatStatus(w, `📋 ${agent}: plan ${evt.total} steps — saved to state/plan.md`);
+      if (!workerCardStatus(w, agent, `📋 plan: ${evt.total} steps`)) {
+        setChatStatus(w, `📋 ${agent}: plan ${evt.total} steps — saved to state/plan.md`);
+      }
       ensureStats(slug, true);
       break;
     }
     case "plan_step": {
       const ico = evt.status === "done" ? "✓" : (evt.status === "blocked" ? "⛔" : "▸");
-      setChatStatus(w, `📋 ${agent}: step ${evt.n} ${ico} ${evt.status}`);
+      const note = (evt.note || "").split("\n")[0].slice(0, 60);
+      if (!workerCardStatus(w, agent, `${ico} step ${evt.n} ${evt.status}${note ? " — " + note : ""}`)) {
+        setChatStatus(w, `📋 ${agent}: step ${evt.n} ${ico} ${evt.status}`);
+      }
       ensureStats(slug, true);
       break;
     }
@@ -2621,6 +2766,10 @@ function handleEventInWindow(w, slug, evt, bubbleFor, rootAgent) {
       state.activeDispatches.add(`${evt.source}->${evt.target}`);
       proj.statuses[evt.target] = "running";
       rerenderGraphsForSlug(slug);
+      ensureWorkerCard(w, evt.source, evt.target, evt.task || "", rootAgent);
+      if (!w._turnWorkers) w._turnWorkers = {};
+      w._turnWorkers[evt.target] = "running";
+      renderTurnStrip(w, rootAgent);
       setChatStatus(w, `${evt.source} → ${evt.target}: ${(evt.task || "").slice(0, 80)}`);
       // if target's chat window is open, refresh so the user sees the task message arrive
       mirrorDispatchedMessages(slug, evt.target);
@@ -2631,6 +2780,16 @@ function handleEventInWindow(w, slug, evt, bubbleFor, rootAgent) {
       proj.statuses[evt.target] = evt.status === "ok" ? "ok" : "error";
       rerenderGraphsForSlug(slug);
       ensureStats(slug, true);
+      // Icon/border only — agent_done already wrote the summary line.
+      const card = w._workerCards && w._workerCards[evt.target];
+      if (card) {
+        workerCardStatus(w, evt.target, card.dataset.done ? "" :
+          (evt.status === "ok" ? "✓ done" : "✗ " + (evt.message || evt.status)),
+          evt.status === "ok" ? "status-ok" : "status-error");
+      }
+      if (!w._turnWorkers) w._turnWorkers = {};
+      w._turnWorkers[evt.target] = evt.status === "ok" ? "ok" : "error";
+      renderTurnStrip(w, rootAgent);
       setChatStatus(w, `${evt.source} → ${evt.target}: ${evt.status}`);
       mirrorDispatchedMessages(slug, evt.target);
       break;

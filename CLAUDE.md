@@ -78,6 +78,9 @@ Light (default) / dark toggle — ◐ button in the sidebar title, persisted in 
 ### Chat window
 
 - Header: agent name, role, current model + effort (text only — change via `/model` / `/effort`)
+- **Turn strip** (below header, only during multi-agent turns): `BOSS ▸ [VLM ✓] [DATASET ⏳] · round 2/3` — chips driven by `dispatch_started/complete`, round by `continuation_round`.
+- **Worker cards**: a dispatched worker's entire output streams INTO one collapsible card (`ensureWorkerCard`) instead of interleaving top-level bubbles. Card head shows a live status line (plan_step / status events → "▸ step 3/5 — …", then "✓ <first line of final text>" on agent_done); body (hidden by default) holds the full transcript; footer button opens the worker's own chat. Sub-dispatches nest inside the source's card. Only the root agent writes top-level bubbles.
+- **Control-plane separators**: `[CONTROL-PLANE …]` user messages (continuation prompts) render as a thin labelled rule (`addCtrlSeparator`), live (via `continuation_round` event) and on db replay — never as user bubbles. Each continuation round also starts a fresh orchestrator bubble (`bubbleFor.reset`).
 - Messages: full markdown rendering (marked + DOMPurify); dispatch tags become collapsed cards
 - Input: Enter sends, Shift+Enter newlines, Esc stops streaming, plus slash commands
 - "Send" button toggles to red "Stop" while streaming
@@ -207,7 +210,8 @@ When editing the dispatch prompt, remember the user verifies on the graph. Keep 
 | `status` | `agent`, `status=thinking\|responding` | Drives the "thinking…" indicator. |
 | `thinking` | `agent`, `text` | Recent thinking chunk (visible in indicator). |
 | `delta` | `agent`, `text` | Assistant text delta. Appended to bubble. |
-| `dispatch_started` | `source`, `target`, `task` | Animate edge, mark target running. |
+| `continuation_round` | `agent`, `round`, `max` | Round separator + turn-strip round badge; resets the orchestrator's live bubble. |
+| `dispatch_started` | `source`, `target`, `task` | Animate edge, mark target running, create worker card + turn-strip chip. |
 | `dispatch_complete` | `source`, `target`, `status`, `message` | Stop animation, mark target ok/error. |
 | `dispatch_rejected` | `source`, `target`, `reason` | Show in status bar. |
 | `agent_done` | `agent`, `text`, `status` | Final state for that agent. |
