@@ -104,6 +104,24 @@ html, body { margin: 0; height: 100%; background: var(--bg); color: var(--text);
   margin-bottom: 6px; font-size: 11px; color: var(--text-dim); font-family: var(--mono);
   letter-spacing: 0.06em; text-transform: uppercase; flex-shrink: 0; }
 .tree-hint { color: var(--text-faint); font-size: 10px; text-transform: none; letter-spacing: 0; }
+.tree-header-right { display: flex; align-items: center; gap: 6px; }
+.tree-icon-btn { background: transparent; color: var(--text-dim); border: 1px solid var(--border);
+  border-radius: 6px; width: 22px; height: 20px; line-height: 1; font-size: 13px; cursor: pointer;
+  padding: 0; display: inline-flex; align-items: center; justify-content: center; transition: all 0.12s; }
+.tree-icon-btn:hover { color: var(--accent); border-color: var(--accent); }
+.tree-icon-btn:active { transform: rotate(180deg); }
+
+/* Right-click context menu for the workspace tree */
+.ctx-menu { position: fixed; z-index: 10000; min-width: 168px; padding: 4px;
+  background: var(--glass); backdrop-filter: blur(12px); -webkit-backdrop-filter: blur(12px);
+  border: 1px solid var(--accent-border); border-radius: 8px;
+  box-shadow: 0 8px 28px rgba(0, 0, 0, 0.4); font-size: 12px; font-family: var(--mono); }
+.ctx-menu-item { padding: 6px 10px; border-radius: 5px; cursor: pointer; color: var(--text);
+  white-space: nowrap; user-select: none; }
+.ctx-menu-item:hover { background: var(--accent-soft); }
+.ctx-menu-item.danger { color: #e5638b; }
+.ctx-menu-item.danger:hover { background: rgba(229, 99, 139, 0.15); }
+.ctx-menu-sep { height: 1px; background: var(--border); margin: 4px 2px; }
 .tree { flex: 1 1 0; min-height: 0; overflow-y: auto; outline: none;
   font-family: var(--mono); font-size: 12px; }
 .tree:focus { box-shadow: inset 0 0 0 1px var(--accent-soft); border-radius: 6px; }

@@ -49,6 +49,8 @@ async function init() {
   await initWorkspaceTree();
   const npb = $("newProjectBtn");
   if (npb) npb.onclick = openNewProjectDialog;
+  const trb = $("treeReloadBtn");
+  if (trb) trb.onclick = () => reloadTree();
   bindSidebarResizer();
   bindSkillsPanel();
   loadSkills();
@@ -2904,6 +2906,7 @@ function renderTree() {
       `<span class="label" title="${escapeHtml(item.abs_path)}">${escapeHtml(item.name)}</span>`;
     node.onclick = () => onTreeNodeClick(item);
     node.ondblclick = () => { if (item.type === "folder") onTreeToggle(item); };
+    node.oncontextmenu = (e) => openTreeContextMenu(e, item);
     root.appendChild(node);
   }
 }
@@ -2942,6 +2945,139 @@ async function copySelectedPath() {
     await navigator.clipboard.writeText(item.abs_path);
     flashHint("copied: " + item.abs_path);
   } catch { flashHint("clipboard blocked, path: " + item.abs_path); }
+}
+
+// Re-fetch the root level + every expanded folder so the tree reflects disk,
+// keeping the open/closed and selection state intact.
+async function reloadTree() {
+  const t = _treeState();
+  t.cache = {};
+  await fetchTreeLevel("");
+  for (const rel of Array.from(t.expanded)) {
+    if (rel) await fetchTreeLevel(rel);
+  }
+  renderTree();
+  flashHint("reloaded");
+}
+
+// ---------- Tree context menu (rename / delete / new) ----------
+
+async function wsFileOp(endpoint, body) {
+  const r = await fetch(`/api/workspace/${endpoint}`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(body),
+  });
+  if (!r.ok) {
+    let msg = `${endpoint} failed (${r.status})`;
+    try { const j = await r.json(); if (j && j.detail) msg = j.detail; } catch {}
+    throw new Error(msg);
+  }
+  return r.json().catch(() => ({}));
+}
+
+function _ctxEsc(e) { if (e.key === "Escape") closeTreeContextMenu(); }
+
+function closeTreeContextMenu() {
+  const m = $("treeCtxMenu");
+  if (m) m.remove();
+  document.removeEventListener("keydown", _ctxEsc);
+}
+
+function openTreeContextMenu(e, item) {
+  e.preventDefault();
+  const t = _treeState();
+  t.selectedAbs = item.abs_path;
+  renderTree();
+  closeTreeContextMenu();
+
+  const menu = document.createElement("div");
+  menu.id = "treeCtxMenu";
+  menu.className = "ctx-menu";
+  const add = (label, fn, cls) => {
+    const el = document.createElement("div");
+    el.className = "ctx-menu-item" + (cls ? " " + cls : "");
+    el.textContent = label;
+    el.onclick = (ev) => { ev.stopPropagation(); closeTreeContextMenu(); fn(); };
+    menu.appendChild(el);
+  };
+  const sep = () => {
+    const s = document.createElement("div");
+    s.className = "ctx-menu-sep";
+    menu.appendChild(s);
+  };
+
+  if (item.type === "file") {
+    add("Open", () => openFileViewer(item.abs_path, item.rel_path));
+  } else {
+    add(t.expanded.has(item.rel_path) ? "Collapse" : "Expand", () => onTreeToggle(item));
+    add("New file…", () => treeNewEntry(item, "newfile"));
+    add("New folder…", () => treeNewEntry(item, "mkdir"));
+  }
+  sep();
+  add("Rename…", () => treeRename(item));
+  add("Copy path", () => copySelectedPath());
+  sep();
+  add("Delete", () => treeDelete(item), "danger");
+
+  document.body.appendChild(menu);
+  // clamp to viewport
+  const mw = menu.offsetWidth, mh = menu.offsetHeight;
+  let x = e.clientX, y = e.clientY;
+  if (x + mw > window.innerWidth) x = Math.max(4, window.innerWidth - mw - 6);
+  if (y + mh > window.innerHeight) y = Math.max(4, window.innerHeight - mh - 6);
+  menu.style.left = x + "px";
+  menu.style.top = y + "px";
+
+  setTimeout(() => {
+    document.addEventListener("click", closeTreeContextMenu, { once: true });
+    document.addEventListener("keydown", _ctxEsc);
+  }, 0);
+}
+
+async function treeRename(item) {
+  const nn = window.prompt(`Rename "${item.name}" to:`, item.name);
+  if (nn === null) return;
+  const name = nn.trim();
+  if (!name || name === item.name) return;
+  try {
+    await wsFileOp("rename", { path: item.rel_path, new_name: name });
+    await reloadTree();
+    flashHint(`renamed → ${name}`);
+  } catch (err) { flashHint(err.message); }
+}
+
+async function treeDelete(item) {
+  const kind = item.type === "folder" ? "folder and EVERYTHING inside it" : "file";
+  if (!window.confirm(`Delete this ${kind}?\n\n${item.abs_path}\n\nThis cannot be undone.`)) return;
+  try {
+    await wsFileOp("delete", { path: item.rel_path });
+    // close any open viewer windows for this path or its children
+    const prefix = item.rel_path + "/";
+    state.windows
+      .filter((w) => w.type === "file" && w.rel_path &&
+        (w.rel_path === item.rel_path || w.rel_path.startsWith(prefix)))
+      .slice()
+      .forEach(closeWindow);
+    const t = _treeState();
+    if (t.selectedAbs === item.abs_path) t.selectedAbs = null;
+    await reloadTree();
+    flashHint("deleted");
+  } catch (err) { flashHint(err.message); }
+}
+
+async function treeNewEntry(item, op) {
+  const what = op === "mkdir" ? "folder" : "file";
+  const raw = window.prompt(`New ${what} name inside "${item.name}":`, "");
+  if (raw === null) return;
+  const name = raw.trim();
+  if (!name) return;
+  try {
+    await wsFileOp(op, { path: item.rel_path, name });
+    _treeState().expanded.add(item.rel_path);   // keep parent open so the new entry shows
+    await reloadTree();
+    flashHint(`created ${name}`);
+  } catch (err) { flashHint(err.message); }
 }
 
 function flashHint(msg) {
