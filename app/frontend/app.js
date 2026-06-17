@@ -46,9 +46,12 @@ async function init() {
   if (state.projects.length) await openProject(state.projects[0].slug);
   bindGlobalKeys();
   bindTreeKeys();
+  bindTreeDnD();
   await initWorkspaceTree();
   const npb = $("newProjectBtn");
   if (npb) npb.onclick = openNewProjectDialog;
+  const trb = $("treeReloadBtn");
+  if (trb) trb.onclick = () => reloadTree();
   bindSidebarResizer();
   bindSkillsPanel();
   loadSkills();
@@ -443,12 +446,20 @@ function renderWindowContent(w) {
         <span class="file-path" title=""></span>
         <span class="file-info"></span>
         <button class="toolbar-btn file-reload" title="reload">⟳</button>
+        <button class="toolbar-btn file-copy-content" title="copy file content">⧉</button>
         <button class="toolbar-btn file-copy" title="copy abs path">⌘</button>
       </div>
       <div class="file-body">loading…</div>`;
     c.querySelector(".file-path").textContent = w.rel_path || "";
     c.querySelector(".file-path").title = w.abs_path || "";
     c.querySelector(".file-reload").onclick = () => loadFileContent(w);
+    c.querySelector(".file-copy-content").onclick = async () => {
+      if (w.fileText == null) { flashHint("no text content to copy"); return; }
+      try {
+        await navigator.clipboard.writeText(w.fileText);
+        flashHint(`copied file content (${w.fileText.length}c)`);
+      } catch { flashHint("clipboard blocked"); }
+    };
     c.querySelector(".file-copy").onclick = async () => {
       try { await navigator.clipboard.writeText(w.abs_path); flashHint("copied: " + w.abs_path); }
       catch { flashHint(w.abs_path); }
@@ -897,6 +908,7 @@ async function loadFileContent(w) {
   const body = w.contentEl.querySelector(".file-body");
   const info = w.contentEl.querySelector(".file-info");
   const ext = (w.rel_path.split(".").pop() || "").toLowerCase();
+  w.fileText = null;  // raw text for the copy-content button; only set for text/markdown
   const rawUrl = `/api/workspace/raw?path=${encodeURIComponent(w.rel_path)}`;
 
   // PDF and images: render via browser, no need to fetch JSON wrapper
@@ -932,6 +944,7 @@ async function loadFileContent(w) {
       </div>`;
       return;
     }
+    w.fileText = j.content;  // raw source — what the copy-content button copies
     if (ext === "md" || ext === "markdown") {
       body.innerHTML = `<div class="file-md content"></div>`;
       setContent(body.querySelector(".file-md"), j.content);
@@ -2896,6 +2909,8 @@ function renderTree() {
     if (item.is_project) node.classList.add("is-project");
     if (t.selectedAbs === item.abs_path) node.classList.add("selected");
     node.style.paddingLeft = (6 + item.depth * 14) + "px";
+    node.dataset.rel = item.rel_path;
+    node.dataset.type = item.type;
     const arrow = item.type === "folder"
       ? (t.expanded.has(item.rel_path) ? "▾" : "▸") : "";
     const icon = item.is_project ? "◆" : (item.type === "folder" ? "▣" : "·");
@@ -2904,6 +2919,7 @@ function renderTree() {
       `<span class="label" title="${escapeHtml(item.abs_path)}">${escapeHtml(item.name)}</span>`;
     node.onclick = () => onTreeNodeClick(item);
     node.ondblclick = () => { if (item.type === "folder") onTreeToggle(item); };
+    node.oncontextmenu = (e) => openTreeContextMenu(e, item);
     root.appendChild(node);
   }
 }
@@ -2942,6 +2958,232 @@ async function copySelectedPath() {
     await navigator.clipboard.writeText(item.abs_path);
     flashHint("copied: " + item.abs_path);
   } catch { flashHint("clipboard blocked, path: " + item.abs_path); }
+}
+
+// Re-fetch the root level + every expanded folder so the tree reflects disk,
+// keeping the open/closed and selection state intact.
+async function reloadTree() {
+  const t = _treeState();
+  t.cache = {};
+  await fetchTreeLevel("");
+  for (const rel of Array.from(t.expanded)) {
+    if (rel) await fetchTreeLevel(rel);
+  }
+  renderTree();
+  flashHint("reloaded");
+}
+
+// ---------- Tree context menu (rename / delete / new) ----------
+
+async function wsFileOp(endpoint, body) {
+  const r = await fetch(`/api/workspace/${endpoint}`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(body),
+  });
+  if (!r.ok) {
+    let msg = `${endpoint} failed (${r.status})`;
+    try { const j = await r.json(); if (j && j.detail) msg = j.detail; } catch {}
+    throw new Error(msg);
+  }
+  return r.json().catch(() => ({}));
+}
+
+function _ctxEsc(e) { if (e.key === "Escape") closeTreeContextMenu(); }
+
+function closeTreeContextMenu() {
+  const m = $("treeCtxMenu");
+  if (m) m.remove();
+  document.removeEventListener("keydown", _ctxEsc);
+}
+
+function openTreeContextMenu(e, item) {
+  e.preventDefault();
+  const t = _treeState();
+  t.selectedAbs = item.abs_path;
+  renderTree();
+  closeTreeContextMenu();
+
+  const menu = document.createElement("div");
+  menu.id = "treeCtxMenu";
+  menu.className = "ctx-menu";
+  const add = (label, fn, cls) => {
+    const el = document.createElement("div");
+    el.className = "ctx-menu-item" + (cls ? " " + cls : "");
+    el.textContent = label;
+    el.onclick = (ev) => { ev.stopPropagation(); closeTreeContextMenu(); fn(); };
+    menu.appendChild(el);
+  };
+  const sep = () => {
+    const s = document.createElement("div");
+    s.className = "ctx-menu-sep";
+    menu.appendChild(s);
+  };
+
+  if (item.type === "file") {
+    add("Open", () => openFileViewer(item.abs_path, item.rel_path));
+    add("Download", () => treeDownload(item));
+  } else {
+    add(t.expanded.has(item.rel_path) ? "Collapse" : "Expand", () => onTreeToggle(item));
+    add("New file…", () => treeNewEntry(item, "newfile"));
+    add("New folder…", () => treeNewEntry(item, "mkdir"));
+    add("Upload here…", () => treeUpload(item));
+    add("Download as zip", () => treeDownload(item));
+  }
+  sep();
+  add("Rename…", () => treeRename(item));
+  add("Copy path", () => copySelectedPath());
+  sep();
+  add("Delete", () => treeDelete(item), "danger");
+
+  document.body.appendChild(menu);
+  // clamp to viewport
+  const mw = menu.offsetWidth, mh = menu.offsetHeight;
+  let x = e.clientX, y = e.clientY;
+  if (x + mw > window.innerWidth) x = Math.max(4, window.innerWidth - mw - 6);
+  if (y + mh > window.innerHeight) y = Math.max(4, window.innerHeight - mh - 6);
+  menu.style.left = x + "px";
+  menu.style.top = y + "px";
+
+  setTimeout(() => {
+    document.addEventListener("click", closeTreeContextMenu, { once: true });
+    document.addEventListener("keydown", _ctxEsc);
+  }, 0);
+}
+
+async function treeRename(item) {
+  const nn = window.prompt(`Rename "${item.name}" to:`, item.name);
+  if (nn === null) return;
+  const name = nn.trim();
+  if (!name || name === item.name) return;
+  try {
+    await wsFileOp("rename", { path: item.rel_path, new_name: name });
+    await reloadTree();
+    flashHint(`renamed → ${name}`);
+  } catch (err) { flashHint(err.message); }
+}
+
+async function treeDelete(item) {
+  const kind = item.type === "folder" ? "folder and EVERYTHING inside it" : "file";
+  if (!window.confirm(`Delete this ${kind}?\n\n${item.abs_path}\n\nThis cannot be undone.`)) return;
+  try {
+    await wsFileOp("delete", { path: item.rel_path });
+    // close any open viewer windows for this path or its children
+    const prefix = item.rel_path + "/";
+    state.windows
+      .filter((w) => w.type === "file" && w.rel_path &&
+        (w.rel_path === item.rel_path || w.rel_path.startsWith(prefix)))
+      .slice()
+      .forEach(closeWindow);
+    const t = _treeState();
+    if (t.selectedAbs === item.abs_path) t.selectedAbs = null;
+    await reloadTree();
+    flashHint("deleted");
+  } catch (err) { flashHint(err.message); }
+}
+
+async function treeNewEntry(item, op) {
+  const what = op === "mkdir" ? "folder" : "file";
+  const raw = window.prompt(`New ${what} name inside "${item.name}":`, "");
+  if (raw === null) return;
+  const name = raw.trim();
+  if (!name) return;
+  try {
+    await wsFileOp(op, { path: item.rel_path, name });
+    _treeState().expanded.add(item.rel_path);   // keep parent open so the new entry shows
+    await reloadTree();
+    flashHint(`created ${name}`);
+  } catch (err) { flashHint(err.message); }
+}
+
+// ---------- Download (file direct / folder as zip) & upload ----------
+
+// One endpoint handles both: the backend streams a file as an attachment and
+// zips a folder on the fly. An anchor click lets the browser save it.
+function treeDownload(item) {
+  const a = document.createElement("a");
+  a.href = `/api/workspace/download?path=${encodeURIComponent(item.rel_path)}`;
+  a.download = "";
+  document.body.appendChild(a);
+  a.click();
+  a.remove();
+  flashHint(item.type === "folder" ? "downloading .zip…" : "downloading…");
+}
+
+async function wsUpload(targetRel, fileList) {
+  const fd = new FormData();
+  fd.append("path", targetRel || "");
+  for (const f of fileList) fd.append("files", f);
+  const r = await fetch("/api/workspace/upload", { method: "POST", body: fd });
+  if (!r.ok) {
+    let msg = `upload failed (${r.status})`;
+    try { const j = await r.json(); if (j && j.detail) msg = j.detail; } catch {}
+    throw new Error(msg);
+  }
+  return r.json().catch(() => ({}));
+}
+
+// Pick files via a transient <input type=file>, then upload into `item` (a folder).
+function treeUpload(item) {
+  const inp = document.createElement("input");
+  inp.type = "file";
+  inp.multiple = true;
+  inp.style.display = "none";
+  inp.onchange = async () => {
+    if (inp.files && inp.files.length) {
+      try {
+        const res = await wsUpload(item.rel_path, inp.files);
+        _treeState().expanded.add(item.rel_path);  // keep folder open so new files show
+        await reloadTree();
+        flashHint(`uploaded ${res.count || inp.files.length} file(s)`);
+      } catch (err) { flashHint(err.message); }
+    }
+    inp.remove();
+  };
+  document.body.appendChild(inp);
+  inp.click();
+}
+
+// Resolve where an OS-file drop lands: a folder node → that folder; a file node →
+// its parent; empty tree area → workspace root ("").
+function _dropTargetRel(node) {
+  if (!node) return "";
+  const rel = node.dataset.rel || "";
+  if (node.dataset.type === "folder") return rel;
+  const i = rel.lastIndexOf("/");
+  return i >= 0 ? rel.slice(0, i) : "";
+}
+
+function bindTreeDnD() {
+  const root = $("treeRoot");
+  if (!root) return;
+  const clear = () => {
+    root.classList.remove("dragover");
+    root.querySelectorAll(".tree-node.dragover").forEach((n) => n.classList.remove("dragover"));
+  };
+  root.addEventListener("dragover", (e) => {
+    if (!e.dataTransfer || !Array.from(e.dataTransfer.types).includes("Files")) return;
+    e.preventDefault();
+    e.dataTransfer.dropEffect = "copy";
+    clear();
+    const node = e.target.closest && e.target.closest(".tree-node");
+    if (node && node.dataset.type === "folder") node.classList.add("dragover");
+    else root.classList.add("dragover");
+  });
+  root.addEventListener("dragleave", (e) => { if (e.target === root) clear(); });
+  root.addEventListener("drop", async (e) => {
+    if (!e.dataTransfer || !e.dataTransfer.files.length) return;
+    e.preventDefault();
+    clear();
+    const node = e.target.closest && e.target.closest(".tree-node");
+    const targetRel = _dropTargetRel(node);
+    try {
+      const res = await wsUpload(targetRel, e.dataTransfer.files);
+      if (targetRel) _treeState().expanded.add(targetRel);
+      await reloadTree();
+      flashHint(`uploaded ${res.count || e.dataTransfer.files.length} file(s) → ${targetRel || "workspace"}`);
+    } catch (err) { flashHint(err.message); }
+  });
 }
 
 function flashHint(msg) {

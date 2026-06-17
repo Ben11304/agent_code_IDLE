@@ -11,7 +11,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
 
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, UploadFile, File, Form
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse, FileResponse
 from fastapi.staticfiles import StaticFiles
@@ -1039,6 +1039,159 @@ def api_workspace_tree(path: str = ""):
             "is_project": is_dir and resolved in project_roots,
         })
     return {"items": items, "rel_path": path, "abs_path": str(target)}
+
+
+# ---- Workspace file operations (rename / delete / create) ----
+# All operations are confined to the workspace root. Renaming or deleting a
+# registered project root or the workspace root itself is refused.
+
+class _WSRename(BaseModel):
+    path: str
+    new_name: str
+
+
+class _WSPath(BaseModel):
+    path: str
+
+
+class _WSChild(BaseModel):
+    path: str
+    name: str
+
+
+def _ws_root_or_404() -> Path:
+    root = projects.get_workspace_root()
+    if not root:
+        raise HTTPException(404, "no workspace root configured")
+    return root
+
+
+def _resolve_ws_path(path: str, *, must_exist: bool = True, must_be_dir: bool = False):
+    """Resolve `path` under the workspace root, rejecting escapes. Returns (root, target)."""
+    root = _ws_root_or_404()
+    target = (root / path).resolve()
+    try:
+        target.relative_to(root)
+    except ValueError:
+        raise HTTPException(400, "path escapes workspace root")
+    if must_exist and not target.exists():
+        raise HTTPException(404, "path not found")
+    if must_be_dir and target.exists() and not target.is_dir():
+        raise HTTPException(400, "not a directory")
+    return root, target
+
+
+def _safe_child_name(name: str) -> str:
+    name = (name or "").strip()
+    if not name or "/" in name or "\\" in name or name in (".", ".."):
+        raise HTTPException(400, "invalid name (no slashes; not '.' or '..')")
+    return name
+
+
+def _guard_not_special(root: Path, target: Path):
+    """Refuse to rename/delete the workspace root or a registered project root."""
+    if target == root:
+        raise HTTPException(403, "refusing to modify the workspace root")
+    project_roots = {Path(p["root"]).resolve() for p in projects.list_projects()}
+    if target in project_roots:
+        raise HTTPException(
+            403, "refusing to modify a registered project root — edit registry.yaml instead"
+        )
+
+
+def _new_child_dest(root: Path, parent: Path, name: str) -> Path:
+    dest = (parent / name).resolve()
+    try:
+        dest.relative_to(root)
+    except ValueError:
+        raise HTTPException(400, "destination escapes workspace root")
+    if dest.exists():
+        raise HTTPException(409, "a file or folder with that name already exists")
+    return dest
+
+
+@app.post("/api/workspace/rename")
+def api_workspace_rename(body: _WSRename):
+    root, target = _resolve_ws_path(body.path)
+    _guard_not_special(root, target)
+    new_name = _safe_child_name(body.new_name)
+    dest = _new_child_dest(root, target.parent, new_name)
+    target.rename(dest)
+    return {"ok": True, "rel_path": str(dest.relative_to(root)), "abs_path": str(dest)}
+
+
+@app.post("/api/workspace/delete")
+def api_workspace_delete(body: _WSPath):
+    import shutil
+    root, target = _resolve_ws_path(body.path)
+    _guard_not_special(root, target)
+    if target.is_dir():
+        shutil.rmtree(target)
+    else:
+        target.unlink()
+    return {"ok": True}
+
+
+@app.post("/api/workspace/mkdir")
+def api_workspace_mkdir(body: _WSChild):
+    root, parent = _resolve_ws_path(body.path, must_be_dir=True)
+    dest = _new_child_dest(root, parent, _safe_child_name(body.name))
+    dest.mkdir(parents=False)
+    return {"ok": True, "rel_path": str(dest.relative_to(root)), "abs_path": str(dest)}
+
+
+@app.post("/api/workspace/newfile")
+def api_workspace_newfile(body: _WSChild):
+    root, parent = _resolve_ws_path(body.path, must_be_dir=True)
+    dest = _new_child_dest(root, parent, _safe_child_name(body.name))
+    dest.touch()
+    return {"ok": True, "rel_path": str(dest.relative_to(root)), "abs_path": str(dest)}
+
+
+@app.get("/api/workspace/download")
+def api_workspace_download(path: str):
+    """Download a workspace entry. A file streams as an attachment; a folder is
+    zipped on the fly. Read-only — still confined to the workspace root."""
+    import io
+    import zipfile
+    root, target = _resolve_ws_path(path)
+    if target.is_dir():
+        buf = io.BytesIO()
+        with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
+            base = target.name or "workspace"
+            for p in sorted(target.rglob("*")):
+                if p.is_symlink() or not p.is_file():
+                    continue
+                zf.write(p, arcname=str(Path(base) / p.relative_to(target)))
+        buf.seek(0)
+        fname = (target.name or "workspace").replace('"', "") + ".zip"
+        return StreamingResponse(
+            buf,
+            media_type="application/zip",
+            headers={"Content-Disposition": f'attachment; filename="{fname}"'},
+        )
+    if not target.is_file():
+        raise HTTPException(404, "not a file")
+    return FileResponse(target, filename=target.name, media_type="application/octet-stream")
+
+
+@app.post("/api/workspace/upload")
+async def api_workspace_upload(
+    path: str = Form(""),
+    files: list[UploadFile] = File(...),
+):
+    """Upload one or more files into a workspace directory (`path` = target dir,
+    relative to the workspace root). Path-safe; refuses to overwrite existing entries."""
+    import shutil
+    root, parent = _resolve_ws_path(path or "", must_be_dir=True)
+    saved = []
+    for uf in files:
+        name = _safe_child_name(Path(uf.filename or "").name)
+        dest = _new_child_dest(root, parent, name)
+        with dest.open("wb") as fh:
+            shutil.copyfileobj(uf.file, fh)
+        saved.append(str(dest.relative_to(root)))
+    return {"ok": True, "saved": saved, "count": len(saved)}
 
 
 @app.get("/api/projects/{slug}/tree")
