@@ -46,6 +46,7 @@ async function init() {
   if (state.projects.length) await openProject(state.projects[0].slug);
   bindGlobalKeys();
   bindTreeKeys();
+  bindTreeDnD();
   await initWorkspaceTree();
   const npb = $("newProjectBtn");
   if (npb) npb.onclick = openNewProjectDialog;
@@ -2898,6 +2899,8 @@ function renderTree() {
     if (item.is_project) node.classList.add("is-project");
     if (t.selectedAbs === item.abs_path) node.classList.add("selected");
     node.style.paddingLeft = (6 + item.depth * 14) + "px";
+    node.dataset.rel = item.rel_path;
+    node.dataset.type = item.type;
     const arrow = item.type === "folder"
       ? (t.expanded.has(item.rel_path) ? "▾" : "▸") : "";
     const icon = item.is_project ? "◆" : (item.type === "folder" ? "▣" : "·");
@@ -3009,10 +3012,13 @@ function openTreeContextMenu(e, item) {
 
   if (item.type === "file") {
     add("Open", () => openFileViewer(item.abs_path, item.rel_path));
+    add("Download", () => treeDownload(item));
   } else {
     add(t.expanded.has(item.rel_path) ? "Collapse" : "Expand", () => onTreeToggle(item));
     add("New file…", () => treeNewEntry(item, "newfile"));
     add("New folder…", () => treeNewEntry(item, "mkdir"));
+    add("Upload here…", () => treeUpload(item));
+    add("Download as zip", () => treeDownload(item));
   }
   sep();
   add("Rename…", () => treeRename(item));
@@ -3078,6 +3084,96 @@ async function treeNewEntry(item, op) {
     await reloadTree();
     flashHint(`created ${name}`);
   } catch (err) { flashHint(err.message); }
+}
+
+// ---------- Download (file direct / folder as zip) & upload ----------
+
+// One endpoint handles both: the backend streams a file as an attachment and
+// zips a folder on the fly. An anchor click lets the browser save it.
+function treeDownload(item) {
+  const a = document.createElement("a");
+  a.href = `/api/workspace/download?path=${encodeURIComponent(item.rel_path)}`;
+  a.download = "";
+  document.body.appendChild(a);
+  a.click();
+  a.remove();
+  flashHint(item.type === "folder" ? "downloading .zip…" : "downloading…");
+}
+
+async function wsUpload(targetRel, fileList) {
+  const fd = new FormData();
+  fd.append("path", targetRel || "");
+  for (const f of fileList) fd.append("files", f);
+  const r = await fetch("/api/workspace/upload", { method: "POST", body: fd });
+  if (!r.ok) {
+    let msg = `upload failed (${r.status})`;
+    try { const j = await r.json(); if (j && j.detail) msg = j.detail; } catch {}
+    throw new Error(msg);
+  }
+  return r.json().catch(() => ({}));
+}
+
+// Pick files via a transient <input type=file>, then upload into `item` (a folder).
+function treeUpload(item) {
+  const inp = document.createElement("input");
+  inp.type = "file";
+  inp.multiple = true;
+  inp.style.display = "none";
+  inp.onchange = async () => {
+    if (inp.files && inp.files.length) {
+      try {
+        const res = await wsUpload(item.rel_path, inp.files);
+        _treeState().expanded.add(item.rel_path);  // keep folder open so new files show
+        await reloadTree();
+        flashHint(`uploaded ${res.count || inp.files.length} file(s)`);
+      } catch (err) { flashHint(err.message); }
+    }
+    inp.remove();
+  };
+  document.body.appendChild(inp);
+  inp.click();
+}
+
+// Resolve where an OS-file drop lands: a folder node → that folder; a file node →
+// its parent; empty tree area → workspace root ("").
+function _dropTargetRel(node) {
+  if (!node) return "";
+  const rel = node.dataset.rel || "";
+  if (node.dataset.type === "folder") return rel;
+  const i = rel.lastIndexOf("/");
+  return i >= 0 ? rel.slice(0, i) : "";
+}
+
+function bindTreeDnD() {
+  const root = $("treeRoot");
+  if (!root) return;
+  const clear = () => {
+    root.classList.remove("dragover");
+    root.querySelectorAll(".tree-node.dragover").forEach((n) => n.classList.remove("dragover"));
+  };
+  root.addEventListener("dragover", (e) => {
+    if (!e.dataTransfer || !Array.from(e.dataTransfer.types).includes("Files")) return;
+    e.preventDefault();
+    e.dataTransfer.dropEffect = "copy";
+    clear();
+    const node = e.target.closest && e.target.closest(".tree-node");
+    if (node && node.dataset.type === "folder") node.classList.add("dragover");
+    else root.classList.add("dragover");
+  });
+  root.addEventListener("dragleave", (e) => { if (e.target === root) clear(); });
+  root.addEventListener("drop", async (e) => {
+    if (!e.dataTransfer || !e.dataTransfer.files.length) return;
+    e.preventDefault();
+    clear();
+    const node = e.target.closest && e.target.closest(".tree-node");
+    const targetRel = _dropTargetRel(node);
+    try {
+      const res = await wsUpload(targetRel, e.dataTransfer.files);
+      if (targetRel) _treeState().expanded.add(targetRel);
+      await reloadTree();
+      flashHint(`uploaded ${res.count || e.dataTransfer.files.length} file(s) → ${targetRel || "workspace"}`);
+    } catch (err) { flashHint(err.message); }
+  });
 }
 
 function flashHint(msg) {

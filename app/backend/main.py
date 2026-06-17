@@ -11,7 +11,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
 
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, UploadFile, File, Form
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse, FileResponse
 from fastapi.staticfiles import StaticFiles
@@ -1146,6 +1146,52 @@ def api_workspace_newfile(body: _WSChild):
     dest = _new_child_dest(root, parent, _safe_child_name(body.name))
     dest.touch()
     return {"ok": True, "rel_path": str(dest.relative_to(root)), "abs_path": str(dest)}
+
+
+@app.get("/api/workspace/download")
+def api_workspace_download(path: str):
+    """Download a workspace entry. A file streams as an attachment; a folder is
+    zipped on the fly. Read-only — still confined to the workspace root."""
+    import io
+    import zipfile
+    root, target = _resolve_ws_path(path)
+    if target.is_dir():
+        buf = io.BytesIO()
+        with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
+            base = target.name or "workspace"
+            for p in sorted(target.rglob("*")):
+                if p.is_symlink() or not p.is_file():
+                    continue
+                zf.write(p, arcname=str(Path(base) / p.relative_to(target)))
+        buf.seek(0)
+        fname = (target.name or "workspace").replace('"', "") + ".zip"
+        return StreamingResponse(
+            buf,
+            media_type="application/zip",
+            headers={"Content-Disposition": f'attachment; filename="{fname}"'},
+        )
+    if not target.is_file():
+        raise HTTPException(404, "not a file")
+    return FileResponse(target, filename=target.name, media_type="application/octet-stream")
+
+
+@app.post("/api/workspace/upload")
+async def api_workspace_upload(
+    path: str = Form(""),
+    files: list[UploadFile] = File(...),
+):
+    """Upload one or more files into a workspace directory (`path` = target dir,
+    relative to the workspace root). Path-safe; refuses to overwrite existing entries."""
+    import shutil
+    root, parent = _resolve_ws_path(path or "", must_be_dir=True)
+    saved = []
+    for uf in files:
+        name = _safe_child_name(Path(uf.filename or "").name)
+        dest = _new_child_dest(root, parent, name)
+        with dest.open("wb") as fh:
+            shutil.copyfileobj(uf.file, fh)
+        saved.append(str(dest.relative_to(root)))
+    return {"ok": True, "saved": saved, "count": len(saved)}
 
 
 @app.get("/api/projects/{slug}/tree")
