@@ -446,12 +446,20 @@ function renderWindowContent(w) {
         <span class="file-path" title=""></span>
         <span class="file-info"></span>
         <button class="toolbar-btn file-reload" title="reload">⟳</button>
+        <button class="toolbar-btn file-copy-content" title="copy file content">⧉</button>
         <button class="toolbar-btn file-copy" title="copy abs path">⌘</button>
       </div>
       <div class="file-body">loading…</div>`;
     c.querySelector(".file-path").textContent = w.rel_path || "";
     c.querySelector(".file-path").title = w.abs_path || "";
     c.querySelector(".file-reload").onclick = () => loadFileContent(w);
+    c.querySelector(".file-copy-content").onclick = async () => {
+      if (w.fileText == null) { flashHint("no text content to copy"); return; }
+      try {
+        await navigator.clipboard.writeText(w.fileText);
+        flashHint(`copied file content (${w.fileText.length}c)`);
+      } catch { flashHint("clipboard blocked"); }
+    };
     c.querySelector(".file-copy").onclick = async () => {
       try { await navigator.clipboard.writeText(w.abs_path); flashHint("copied: " + w.abs_path); }
       catch { flashHint(w.abs_path); }
@@ -900,6 +908,7 @@ async function loadFileContent(w) {
   const body = w.contentEl.querySelector(".file-body");
   const info = w.contentEl.querySelector(".file-info");
   const ext = (w.rel_path.split(".").pop() || "").toLowerCase();
+  w.fileText = null;  // raw text for the copy-content button; only set for text/markdown
   const rawUrl = `/api/workspace/raw?path=${encodeURIComponent(w.rel_path)}`;
 
   // PDF and images: render via browser, no need to fetch JSON wrapper
@@ -935,6 +944,7 @@ async function loadFileContent(w) {
       </div>`;
       return;
     }
+    w.fileText = j.content;  // raw source — what the copy-content button copies
     if (ext === "md" || ext === "markdown") {
       body.innerHTML = `<div class="file-md content"></div>`;
       setContent(body.querySelector(".file-md"), j.content);
