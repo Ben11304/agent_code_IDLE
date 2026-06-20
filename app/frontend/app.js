@@ -13,6 +13,7 @@ const state = {
   viewBoxes: {},          // slug -> {x,y,w,h}
   graphBounds: {},        // slug -> {x,y,w,h}
   nodePositions: {},      // slug -> {agentId: {x,y}} — manual layout, persisted in db
+  plans: {},              // slug -> {agentId: {total, steps:[{n,text,status,agent?}]}} — todo panels
   tree: {},               // slug -> {expanded, cache, selectedAbs, flat}
   windows: [],            // [{id, projectSlug, type, agentId?, x, y, w, h, z, hidden, el, ...state}]
   zTop: 10,
@@ -52,6 +53,9 @@ async function init() {
   bindSidebarResizer();
   bindSkillsPanel();
   loadSkills();
+  bindProcDropdown();
+  bindTerminalDock();
+  startUsageWidget();
 }
 
 // ---------- Skills panel (right side, manual use) ----------
@@ -66,10 +70,13 @@ async function loadSkills() {
 
 function bindSkillsPanel() {
   const tab = $("skillsTab"), panel = $("skillsPanel"), close = $("skillsClose");
-  if (!tab || !panel) return;
-  const open = () => { panel.classList.add("open"); tab.classList.add("hidden"); };
-  const hide = () => { panel.classList.remove("open"); tab.classList.remove("hidden"); };
-  tab.onclick = open;
+  const btn = $("skillsBtn");
+  if (!panel) return;
+  const open = () => { panel.classList.add("open"); if (btn) btn.classList.add("active"); };
+  const hide = () => { panel.classList.remove("open"); if (btn) btn.classList.remove("active"); };
+  const toggle = () => panel.classList.contains("open") ? hide() : open();
+  if (tab) tab.onclick = open;       // legacy edge tab (now hidden via CSS)
+  if (btn) btn.onclick = toggle;     // top-bar trigger
   if (close) close.onclick = hide;
 }
 
@@ -99,6 +106,268 @@ function renderSkills() {
     };
     row.querySelector(".skill-use").onclick = () => useSkill(s.name);
     root.appendChild(row);
+  });
+}
+
+// ---------- Process running (SLURM jobs across clusters) ----------
+
+function bindProcDropdown() {
+  const btn = $("procBtn"), dd = $("procDropdown");
+  if (!btn || !dd) return;
+  const open = () => {
+    dd.hidden = false; btn.classList.add("active");
+    loadProcJobs();
+    state._procPoll = setInterval(loadProcJobs, 15000);  // refresh while open only
+  };
+  const hide = () => {
+    dd.hidden = true; btn.classList.remove("active");
+    clearInterval(state._procPoll); state._procPoll = null;
+  };
+  btn.onclick = () => dd.hidden ? open() : hide();
+  // click-away closes the dropdown
+  document.addEventListener("mousedown", (e) => {
+    if (dd.hidden) return;
+    if (!dd.contains(e.target) && e.target !== btn && !btn.contains(e.target)) hide();
+  });
+}
+
+async function loadProcJobs() {
+  const dd = $("procDropdown");
+  if (!dd || dd.hidden) return;
+  if (!dd.dataset.loaded) dd.innerHTML = `<div class="proc-empty">loading jobs…</div>`;
+  try {
+    const r = await fetch("/api/cluster/jobs");
+    const data = await r.json();
+    renderProcJobs(data);
+    dd.dataset.loaded = "1";
+  } catch (e) {
+    dd.innerHTML = `<div class="proc-error">failed to query clusters: ${escapeHtml(String(e))}</div>`;
+  }
+}
+
+function procStateClass(st) {
+  const s = (st || "").toUpperCase();
+  if (s === "R" || s === "RUNNING" || s === "CG") return "run";
+  if (s === "PD" || s === "PENDING") return "pend";
+  if (s === "F" || s === "FAILED" || s === "TO" || s === "NF" || s === "CA") return "err";
+  return "";
+}
+
+function renderProcJobs(data) {
+  const dd = $("procDropdown");
+  if (!dd) return;
+  const clusters = (data && data.clusters) || {};
+  const names = Object.keys(clusters);
+  const total = names.reduce((n, c) => n + clusters[c].length, 0);
+  const btn = $("procBtn");
+  if (btn) {
+    let cnt = btn.querySelector(".proc-count");
+    if (!cnt) { cnt = document.createElement("span"); cnt.className = "proc-count"; btn.appendChild(cnt); }
+    cnt.textContent = total;
+  }
+  let html = `<div class="proc-head"><span>SLURM jobs · ${total} active</span>`
+    + `<button class="proc-refresh">↻ refresh</button></div>`;
+  if (data && data.error) {
+    html += `<div class="proc-error">${escapeHtml(data.error)}</div>`;
+  } else if (!total) {
+    html += `<div class="proc-empty">no active jobs across ${names.length || 3} clusters</div>`;
+  } else {
+    for (const c of names) {
+      const jobs = clusters[c];
+      html += `<div class="proc-cluster"><div class="proc-cluster-name">${escapeHtml(c)} · ${jobs.length}</div>`;
+      if (!jobs.length) { html += `<div class="proc-empty">—</div>`; }
+      for (const j of jobs) {
+        html += `<div class="proc-job">`
+          + `<span class="pj-dot ${procStateClass(j.state)}" title="${escapeHtml(j.state || "")}"></span>`
+          + `<span class="pj-id">${escapeHtml(j.id || "")}</span>`
+          + `<span class="pj-name" title="${escapeHtml((j.name || "") + " · " + (j.reason || ""))}">${escapeHtml(j.name || "")}</span>`
+          + `<span class="pj-meta">${escapeHtml(j.state || "")} ${escapeHtml(j.time || "")}</span>`
+          + `</div>`;
+      }
+      html += `</div>`;
+    }
+  }
+  dd.innerHTML = html;
+  const rb = dd.querySelector(".proc-refresh");
+  if (rb) rb.onclick = () => { dd.dataset.loaded = ""; loadProcJobs(); };
+}
+
+// ---------- Usage widget (Claude subscription rate limits) ----------
+
+function startUsageWidget() {
+  if (!$("usageWidget")) return;
+  loadUsage();
+  setInterval(loadUsage, 60000);
+}
+
+async function loadUsage() {
+  const el = $("usageWidget");
+  if (!el) return;
+  let data;
+  try { data = await (await fetch("/api/usage")).json(); }
+  catch { data = { available: false }; }
+  el.hidden = false;
+  if (!data || !data.available) {
+    el.innerHTML = `<div class="usage-na" title="${escapeHtml((data && data.reason) || "unavailable")}">usage n/a</div>`;
+    return;
+  }
+  el.innerHTML = usageRow("5 hrs", data.five_hour) + usageRow("weekly", data.weekly);
+}
+
+function usageRow(label, p) {
+  if (!p || p.pct == null)
+    return `<div class="usage-row"><span class="u-label">${label}</span><span class="u-na">n/a</span></div>`;
+  const pct = Math.max(0, Math.min(100, p.pct));
+  const cls = pct >= 90 ? "high" : pct >= 70 ? "mid" : "low";
+  return `<div class="usage-row">
+    <div class="u-top">
+      <span class="u-label">${label}</span>
+      <div class="u-bar"><div class="u-fill ${cls}" style="width:${pct}%"></div></div>
+      <span class="u-pct">${pct}%</span>
+    </div>
+    ${p.reset_at ? `<span class="u-reset">${fmtReset(p.reset_at)}</span>` : ""}
+  </div>`;
+}
+
+function fmtReset(ts) {
+  const secs = ts - Math.floor(Date.now() / 1000);
+  if (secs <= 0) return "reset soon";
+  const h = Math.floor(secs / 3600), m = Math.floor((secs % 3600) / 60);
+  if (h >= 24) return "reset " + Math.floor(h / 24) + "d";
+  if (h >= 1) return "reset " + h + "h" + (m ? m + "m" : "");
+  return "reset " + m + "m";
+}
+
+// ---------- Terminal dock (VS Code-style, real PTY over WebSocket) ----------
+
+function bindTerminalDock() {
+  const dock = $("terminalDock");
+  if (!dock) return;
+  state.terminals = [];
+  state.termSeq = 0;
+  dock.innerHTML = `
+    <div class="term-resize" id="termResize" title="drag to resize"></div>
+    <div class="term-bar">
+      <span class="term-label" id="termLabel">▴ Terminal</span>
+      <div class="term-tabs" id="termTabs"></div>
+      <button class="term-add" id="termAdd" title="new terminal">+ new</button>
+      <button class="term-collapse" id="termCollapse" title="show / hide terminal">▴</button>
+    </div>
+    <div class="term-panes" id="termPanes"></div>`;
+  $("termAdd").onclick = () => newTerminal();
+  $("termCollapse").onclick = () => toggleTerminalDock();
+  $("termLabel").onclick = () => toggleTerminalDock();
+  bindTermResize();
+  window.addEventListener("resize", () => {
+    const act = state.terminals && state.terminals.find((t) => t.paneEl.classList.contains("active"));
+    if (act) { act.fit.fit(); sendResize(act); }
+  });
+}
+
+function toggleTerminalDock(forceOpen) {
+  const dock = $("terminalDock");
+  const collapsed = forceOpen === undefined ? !dock.classList.contains("collapsed") : !forceOpen;
+  dock.classList.toggle("collapsed", collapsed);
+  const btn = $("termCollapse");
+  if (btn) btn.textContent = collapsed ? "▴" : "▾";
+  const lbl = $("termLabel");
+  if (lbl) lbl.textContent = (collapsed ? "▴" : "▾") + " Terminal";
+  if (!collapsed) {
+    if (!state.terminals.length) { newTerminal(); return; }
+    const act = state.terminals.find((t) => t.paneEl.classList.contains("active")) || state.terminals[0];
+    if (act) setTimeout(() => { act.fit.fit(); sendResize(act); act.term.focus(); }, 50);
+  }
+}
+
+function newTerminal() {
+  const dock = $("terminalDock");
+  if (dock.classList.contains("collapsed")) toggleTerminalDock(true);
+  if (typeof Terminal === "undefined" || typeof FitAddon === "undefined") {
+    flashHint("xterm.js not loaded (check network / CDN)"); return;
+  }
+  if (state.terminals.length >= 6) { flashHint("terminal limit (6) reached"); return; }
+
+  const id = ++state.termSeq;
+  const tabEl = document.createElement("div");
+  tabEl.className = "term-tab";
+  tabEl.innerHTML = `<span>term ${id}</span><span class="tt-close" title="close">×</span>`;
+  $("termTabs").appendChild(tabEl);
+  const paneEl = document.createElement("div");
+  paneEl.className = "term-pane";
+  $("termPanes").appendChild(paneEl);
+
+  const term = new Terminal({
+    fontSize: 12, fontFamily: "ui-monospace, SFMono-Regular, Menlo, monospace",
+    cursorBlink: true, theme: { background: "#1d212c", foreground: "#e6e8ee", cursor: "#c2c7d0" },
+  });
+  const fit = new FitAddon.FitAddon();
+  term.loadAddon(fit);
+  term.open(paneEl);
+
+  const proto = location.protocol === "https:" ? "wss" : "ws";
+  const ws = new WebSocket(`${proto}://${location.host}/api/terminal/ws`);
+  ws.binaryType = "arraybuffer";
+  const rec = { id, term, fit, ws, tabEl, paneEl };
+  state.terminals.push(rec);
+
+  ws.onopen = () => { fit.fit(); sendResize(rec); term.focus(); };
+  ws.onmessage = (e) => {
+    if (typeof e.data === "string") term.write(e.data);
+    else term.write(new Uint8Array(e.data));
+  };
+  ws.onclose = () => { try { term.write("\r\n\x1b[2m[session closed]\x1b[0m\r\n"); } catch {} };
+  ws.onerror = () => { try { term.write("\r\n\x1b[31m[connection error]\x1b[0m\r\n"); } catch {} };
+  term.onData((d) => { if (ws.readyState === 1) ws.send(JSON.stringify({ t: "i", d })); });
+
+  tabEl.onclick = (e) => {
+    if (e.target.classList.contains("tt-close")) { e.stopPropagation(); closeTerminal(rec); }
+    else activateTerminal(rec);
+  };
+  activateTerminal(rec);
+}
+
+function sendResize(rec) {
+  if (rec.ws.readyState === 1 && rec.term.cols)
+    rec.ws.send(JSON.stringify({ t: "r", cols: rec.term.cols, rows: rec.term.rows }));
+}
+
+function activateTerminal(rec) {
+  state.terminals.forEach((t) => {
+    t.tabEl.classList.toggle("active", t === rec);
+    t.paneEl.classList.toggle("active", t === rec);
+  });
+  setTimeout(() => { rec.fit.fit(); sendResize(rec); rec.term.focus(); }, 30);
+}
+
+function closeTerminal(rec) {
+  try { rec.ws.close(); } catch {}
+  try { rec.term.dispose(); } catch {}
+  rec.tabEl.remove(); rec.paneEl.remove();
+  state.terminals = state.terminals.filter((t) => t !== rec);
+  if (state.terminals.length) activateTerminal(state.terminals[state.terminals.length - 1]);
+}
+
+function bindTermResize() {
+  const handle = $("termResize"), dock = $("terminalDock");
+  if (!handle) return;
+  let startY, startH;
+  const onMove = (e) => {
+    const dy = startY - e.clientY;
+    const h = Math.max(120, Math.min(window.innerHeight * 0.8, startH + dy));
+    dock.style.setProperty("--term-h", h + "px");
+    const act = state.terminals.find((t) => t.paneEl.classList.contains("active"));
+    if (act) { act.fit.fit(); sendResize(act); }
+  };
+  const onUp = () => {
+    document.removeEventListener("mousemove", onMove);
+    document.removeEventListener("mouseup", onUp);
+  };
+  handle.addEventListener("mousedown", (e) => {
+    startY = e.clientY;
+    startH = $("termPanes").offsetHeight || 280;
+    document.addEventListener("mousemove", onMove);
+    document.addEventListener("mouseup", onUp);
+    e.preventDefault();
   });
 }
 
@@ -182,6 +451,11 @@ async function openProject(slug) {
     const r = await fetch(`/api/projects/${slug}`);
     state.projectCache[slug] = await r.json();
     state.nodePositions[slug] = { ...(state.projectCache[slug].positions || {}) };
+    state.plans[slug] = {};
+    const plans0 = state.projectCache[slug].plans || {};
+    for (const id in plans0) {
+      state.plans[slug][id] = { total: plans0[id].total, steps: plans0[id].steps || [] };
+    }
   }
   renderTabs();
   renderProjectList();
@@ -588,7 +862,65 @@ function renderGraphInWindow(w) {
   });
   deferred.forEach((g) => svg.appendChild(g));
 
+  // Todo panels: rendered beside the SELECTED (chat open) or RUNNING node only,
+  // so a busy canvas stays legible. Every node still shows a done/total badge.
+  w._todoPanels = [];
+  proj.agents.forEach((a) => {
+    const pos = saved[a.id];
+    if (!pos) return;
+    const plan = (state.plans[proj.slug] || {})[a.id];
+    if (!plan || !(plan.steps || []).length) return;
+    const status = (proj.statuses && proj.statuses[a.id]) || "idle";
+    const isOpenChat = state.windows.some(
+      (x) => x.type === "chat" && x.projectSlug === proj.slug && x.agentId === a.id);
+    if (!isOpenChat && status !== "running") return;
+    const fo = buildTodoPanel(a, pos, sizes[a.id], plan);
+    svg.appendChild(fo);
+    w._todoPanels.push({ el: fo, agentId: a.id });
+  });
+
   applyViewBox(svg, proj.slug, w);
+}
+
+const TODO_PANEL_W = 200, TODO_GAP = 12;
+
+function buildTodoPanel(a, pos, size, plan) {
+  const ns = "http://www.w3.org/2000/svg";
+  const steps = plan.steps || [];
+  const rowH = 22, headH = 28, padV = 10;
+  const fo = document.createElementNS(ns, "foreignObject");
+  fo.setAttribute("x", pos.x + size.w + TODO_GAP);
+  fo.setAttribute("y", pos.y);
+  fo.setAttribute("width", TODO_PANEL_W);
+  fo.setAttribute("height", headH + steps.length * rowH + padV);
+  fo.setAttribute("overflow", "visible");
+  const done = steps.filter((s) => s.status === "done").length;
+  const rows = steps.map((s) => {
+    const st = s.status || "pending";
+    const ico = st === "done" ? "✓" : st === "doing" ? "⏳" : st === "blocked" ? "⛔" : "☐";
+    const tag = s.agent ? `<span class="td-agent">→${escapeHtml(s.agent)}</span>` : "";
+    return `<div class="td-row td-${st}"><span class="td-ico">${ico}</span>`
+      + `<span class="td-n">${s.n}</span>`
+      + `<span class="td-text" title="${escapeHtml(s.text || "")}">${escapeHtml(s.text || "")}</span>`
+      + tag + `</div>`;
+  }).join("");
+  fo.innerHTML =
+    `<div xmlns="http://www.w3.org/1999/xhtml" class="todo-panel">`
+    + `<div class="td-head">TODO <span class="td-count">${done}/${steps.length}</span></div>`
+    + `<div class="td-list">${rows}</div></div>`;
+  return fo;
+}
+
+// Reposition todo panels during a node drag (mirrors updateEdgesLive).
+function updateTodoPanelsLive(w) {
+  const saved = state.nodePositions[w.projectSlug] || {};
+  const sizes = w._sizes || {};
+  (w._todoPanels || []).forEach(({ el, agentId }) => {
+    const pos = saved[agentId], size = sizes[agentId];
+    if (!pos || !size) return;
+    el.setAttribute("x", pos.x + size.w + TODO_GAP);
+    el.setAttribute("y", pos.y);
+  });
 }
 
 function autoLayoutPositions(agents, W, nodeW, nodeH) {
@@ -652,6 +984,7 @@ function buildAgentNode(proj, a, pos, nodeW, nodeH, gw) {
   const key = `${proj.slug}:${a.id}`;
   const expanded = state.expandedNodes.has(key);
   const stats = (state.statsCache[proj.slug] || {})[a.id];
+  const plan = (state.plans[proj.slug] || {})[a.id];
 
   const g = document.createElementNS(ns, "g");
   const fo = document.createElementNS(ns, "foreignObject");
@@ -669,7 +1002,7 @@ function buildAgentNode(proj, a, pos, nodeW, nodeH, gw) {
 
   fo.innerHTML =
     `<div xmlns="http://www.w3.org/1999/xhtml" class="${cls}" style="min-height:${nodeH}px">`
-    + nodeCardHtml(a, status, expanded, stats) + `</div>`;
+    + nodeCardHtml(a, status, expanded, stats, plan) + `</div>`;
   g.appendChild(fo);
 
   const card = fo.querySelector(".agent-card");
@@ -687,7 +1020,7 @@ function buildAgentNode(proj, a, pos, nodeW, nodeH, gw) {
   return g;
 }
 
-function nodeCardHtml(a, status, expanded, stats) {
+function nodeCardHtml(a, status, expanded, stats, plan) {
   const chev = expanded ? "▾" : "▸";
   let html = `
     <div class="ac-head">
@@ -728,7 +1061,6 @@ function nodeBodyHtml(a, stats) {
     <div class="ac-row"><span class="ac-k">memory</span><span class="ac-v${memStale ? " ac-stale" : ""}">${memTime}${memStale ? " ⚠" : ""}</span></div>
     ${memStale ? `<div class="ac-warn">⚠ recent activity but memory not written</div>` : ""}
     ${memHead ? `<div class="ac-headline" title="${memHead}">${memHead}</div>` : ""}
-    ${stats.plan ? `<div class="ac-row"><span class="ac-k">plan</span><span class="ac-v">${stats.plan.done}/${stats.plan.total}${stats.plan.blocked ? " ⛔" : ""}</span></div>` : ""}
     ${stats.plan && stats.plan.current ? `<div class="ac-headline" title="${escapeHtml(stats.plan.current)}">▸ ${escapeHtml(stats.plan.current)}</div>` : ""}
     <div class="ac-row"><span class="ac-k">activity</span><span class="ac-v">${lastAct}</span></div>
     <div class="ac-row"><span class="ac-k">messages</span><span class="ac-v">${stats.message_count}</span></div>
@@ -790,6 +1122,7 @@ function _onNodeDragMove(e) {
   d.fo.setAttribute("x", pos.x);
   d.fo.setAttribute("y", pos.y);
   updateEdgesLive(d.gw);
+  updateTodoPanelsLive(d.gw);
 }
 
 function _endNodeDrag() {
@@ -1107,6 +1440,7 @@ const EFFORT_LEVELS = [
   { value: "low",    label: "low"     },
   { value: "medium", label: "medium"  },
   { value: "high",   label: "high"    },
+  { value: "xhigh",  label: "xhigh"   },
   { value: "max",    label: "max"     },
 ];
 
@@ -1119,7 +1453,11 @@ function renderChatHeader(w) {
   const modelText = agent.model === "grok"
     ? (agent.grok_model || agent.default_grok_model || "grok-build")
     : (agent.claude_model || agent.default_claude_model || "claude-sonnet-4-6").replace(/^claude-/, "");
-  const effortText = agent.effort ? `effort ${agent.effort}` : "";
+  const curEffort = agent.effort || "";
+
+  const effortOpts = EFFORT_LEVELS.map((e) =>
+    `<option value="${e.value}"${e.value === curEffort ? " selected" : ""}>${e.label}</option>`
+  ).join("");
 
   header.innerHTML = `
     <div class="header-top">
@@ -1128,10 +1466,29 @@ function renderChatHeader(w) {
     </div>
     <div class="header-meta">
       <span class="meta-model">${escapeHtml(modelText)}</span>
-      ${effortText ? `<span class="meta-effort">${escapeHtml(effortText)}</span>` : ""}
+      <label class="meta-effort-ctl" title="Reasoning effort — applies from the next turn">
+        <span class="meta-effort-label">effort</span>
+        <select class="meta-effort-select">${effortOpts}</select>
+      </label>
       <span class="meta-hint">type <code>/</code> for commands</span>
       <span class="save-hint"></span>
     </div>`;
+
+  const sel = header.querySelector(".meta-effort-select");
+  if (sel) {
+    sel.addEventListener("change", async () => {
+      const eff = sel.value;  // "" = default
+      // Preserve the agent's current model; only effort changes.
+      const a = state.projectCache[w.projectSlug]?.agents.find((x) => x.id === w.agentId) || agent;
+      if (a.model === "grok") {
+        await updateAgentSettings(w, null, a.grok_model || "grok-build", eff);
+      } else {
+        await updateAgentSettings(w, a.claude_model || "claude-sonnet-4-6", null, eff);
+      }
+    });
+    // Stop drags on the select from moving the window / pannning the canvas.
+    sel.addEventListener("mousedown", (e) => e.stopPropagation());
+  }
 }
 
 async function updateAgentSettings(w, claudeModel, grokModel, effort) {
@@ -2629,6 +2986,27 @@ async function attachDetachedRun(w, slug, rootAgent) {
   }
 }
 
+// Auto-tick safety net: link a dispatch to the orchestrator's plan step (by
+// step agent="ID", else by the target id appearing in the step text) and move
+// its status forward. Never downgrades; a model's explicit <step> wins.
+function autoTickStep(slug, source, target, status) {
+  const pl = (state.plans[slug] || {})[source];
+  if (!pl || !target) return false;
+  const rx = new RegExp(`\\b${target}\\b`, "i");
+  const matches = (pl.steps || []).filter((s) =>
+    (s.agent && s.agent.toUpperCase() === target.toUpperCase()) || rx.test(s.text || ""));
+  if (!matches.length) return false;
+  const cand = matches.find((s) => s.status !== "done") || matches[0];
+  if (status === "doing") {
+    if (cand.status === "pending") cand.status = "doing";
+  } else if (status === "done") {
+    if (cand.status !== "blocked") cand.status = "done";
+  } else if (status === "blocked") {
+    cand.status = "blocked";
+  }
+  return true;
+}
+
 function handleEventInWindow(w, slug, evt, bubbleFor, rootAgent) {
   const proj = state.projectCache[slug];
   const agent = evt.agent || rootAgent;
@@ -2735,6 +3113,9 @@ function handleEventInWindow(w, slug, evt, bubbleFor, rootAgent) {
       break;
     }
     case "plan_updated": {
+      if (!state.plans[slug]) state.plans[slug] = {};
+      state.plans[slug][agent] = { total: evt.total, steps: evt.steps || [] };
+      rerenderGraphsForSlug(slug);
       if (!workerCardStatus(w, agent, `📋 plan: ${evt.total} steps`)) {
         setChatStatus(w, `📋 ${agent}: plan ${evt.total} steps — saved to state/plan.md`);
       }
@@ -2742,6 +3123,16 @@ function handleEventInWindow(w, slug, evt, bubbleFor, rootAgent) {
       break;
     }
     case "plan_step": {
+      const pl = (state.plans[slug] || {})[agent];
+      if (pl) {
+        const s = (pl.steps || []).find((x) => x.n === evt.n);
+        if (s) {
+          s.status = evt.status;
+          if (evt.step_agent) s.agent = evt.step_agent;
+          if (evt.note) s.text = s.text; // keep plan text; note shown in chat only
+        }
+        rerenderGraphsForSlug(slug);
+      }
       const ico = evt.status === "done" ? "✓" : (evt.status === "blocked" ? "⛔" : "▸");
       const note = (evt.note || "").split("\n")[0].slice(0, 60);
       if (!workerCardStatus(w, agent, `${ico} step ${evt.n} ${evt.status}${note ? " — " + note : ""}`)) {
@@ -2765,6 +3156,7 @@ function handleEventInWindow(w, slug, evt, bubbleFor, rootAgent) {
     case "dispatch_started": {
       state.activeDispatches.add(`${evt.source}->${evt.target}`);
       proj.statuses[evt.target] = "running";
+      autoTickStep(slug, evt.source, evt.target, "doing");
       rerenderGraphsForSlug(slug);
       ensureWorkerCard(w, evt.source, evt.target, evt.task || "", rootAgent);
       if (!w._turnWorkers) w._turnWorkers = {};
@@ -2778,6 +3170,7 @@ function handleEventInWindow(w, slug, evt, bubbleFor, rootAgent) {
     case "dispatch_complete": {
       state.activeDispatches.delete(`${evt.source}->${evt.target}`);
       proj.statuses[evt.target] = evt.status === "ok" ? "ok" : "error";
+      autoTickStep(slug, evt.source, evt.target, evt.status === "ok" ? "done" : "blocked");
       rerenderGraphsForSlug(slug);
       ensureStats(slug, true);
       // Icon/border only — agent_done already wrote the summary line.

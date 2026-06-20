@@ -1,17 +1,22 @@
 from __future__ import annotations
 
 import asyncio
+import fcntl
 import hashlib
 import json
 import os
+import pty
 import re
+import signal
+import struct
+import termios
 import time
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
 
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse, FileResponse
 from fastapi.staticfiles import StaticFiles
@@ -50,10 +55,14 @@ DISPATCH_RE = re.compile(
 # declares (or replaces) the agent's step list; <step> marks one step's status.
 # Persisted to the agent's own `state/plan.md` so the plan survives sessions.
 PLAN_RE = re.compile(r'<plan>([\s\S]*?)</plan>', re.IGNORECASE)
+# n is mandatory + first; the remaining attrs (status, optional agent="ID" that
+# links a step to a dispatch target) are captured as a blob and parsed below so
+# attribute ORDER does not matter.
 STEP_RE = re.compile(
-    r'<step\s+n="(\d+)"\s+status="(pending|doing|done|blocked)"\s*(?:/>|>([\s\S]*?)</step>)',
+    r'<step\s+n="(\d+)"((?:\s+[\w-]+="[^"]*")*)\s*(?:/>|>([\s\S]*?)</step>)',
     re.IGNORECASE,
 )
+_STEP_ATTR_RE = re.compile(r'([\w-]+)="([^"]*)"')
 
 _PLAN_LINE_RE = re.compile(r"^\s*(\d+)\.\s*\[([ x~!])\]\s*(.*)$")
 _PLAN_STATUS_MARK = {"pending": " ", "doing": "~", "done": "x", "blocked": "!"}
@@ -65,12 +74,14 @@ _PLAN_INSTRUCTIONS = (
     "<plan>\n1. step one\n2. step two\n</plan>\n"
     "Then IMMEDIATELY AFTER finishing/starting/getting stuck on each step, emit:\n"
     "<step n=\"1\" status=\"done\">one-line note (optional)</step>\n"
-    "Valid status: doing | done | blocked. The control plane parses the tags in real time, persists them to "
-    "`state/plan.md` (survives sessions) and shows progress on the graph — narrating steps without emitting "
-    "the tag is INVISIBLE to the user. When you wake up in a new session and `state/plan.md` still has an "
-    "unfinished step → CONTINUE from that step; do NOT re-plan unless the user asks."
+    "Valid status: doing | done | blocked. When a step IS a dispatch to a worker, add that worker's id as "
+    "`agent=\"ID\"` (e.g. <step n=\"2\" status=\"doing\" agent=\"B\">feed A's result to B</step>) — the graph "
+    "links the step to that node's todo panel and auto-ticks it when the dispatch finishes. The control plane "
+    "parses the tags in real time, persists them to `state/plan.md` (survives sessions) and shows progress on "
+    "the graph — narrating steps without emitting the tag is INVISIBLE to the user. When you wake up in a new "
+    "session and `state/plan.md` still has an unfinished step → CONTINUE from that step; do NOT re-plan unless "
+    "the user asks."
 )
-
 
 def _extract_plan_steps(body: str) -> list[str]:
     steps = []
@@ -137,7 +148,9 @@ def _read_plan(path: Path) -> Optional[dict]:
         "done": done,
         "blocked": any(s["status"] == "blocked" for s in steps),
         "current": f'{cur["n"]}. {cur["text"]}' if cur else None,
+        "steps": steps,  # full list for the graph todo panel (reload path)
     }
+
 
 # Size guard when injecting a worker result back into the orchestrator's prompt.
 # Larger results are truncated head+tail with a marker; the full output remains in
@@ -213,6 +226,13 @@ def api_project(slug: str):
             a["effort"] = ov["effort"]
     out["statuses"] = statuses
     out["positions"] = db.get_node_positions(slug)
+    plans = {}
+    for a in out["agents"]:
+        cwd_abs = projects.resolve_cwd(p["root"], a.get("cwd", "."))
+        pl = _read_plan(_agent_dir(p["root"], a, cwd_abs) / "state" / "plan.md")
+        if pl:
+            plans[a["id"]] = pl
+    out["plans"] = plans
     return out
 
 
@@ -1290,7 +1310,8 @@ async def _run_agent(
     if children:
         system_prompt = (system_prompt or "") + _dispatch_instructions(children)
     system_prompt = (system_prompt or "") + _PLAN_INSTRUCTIONS
-    plan_path = _agent_dir(project["root"], agent, cwd) / "state" / "plan.md"
+    _adir = _agent_dir(project["root"], agent, cwd)
+    plan_path = _adir / "state" / "plan.md"
 
     model = agent.get("model", "claude")
     stream_fn = get_stream(model)
@@ -1399,20 +1420,30 @@ async def _run_agent(
                     if steps:
                         try:
                             _write_plan_file(plan_path, agent_id, steps)
-                            await emit({"type": "plan_updated", "agent": agent_id, "total": len(steps)})
+                            await emit({"type": "plan_updated", "agent": agent_id,
+                                        "total": len(steps),
+                                        "steps": [{"n": i, "text": s, "status": "pending"}
+                                                  for i, s in enumerate(steps, 1)]})
                         except OSError:
                             pass
                 for m in STEP_RE.finditer(buf):
                     if m.start() in step_seen:
                         continue
                     step_seen.add(m.start())
+                    attrs = {k.lower(): v for k, v in _STEP_ATTR_RE.findall(m.group(2) or "")}
+                    status = (attrs.get("status") or "").lower()
+                    if status not in _PLAN_STATUS_MARK:
+                        continue
                     note = (m.group(3) or "").strip()
                     if len(note) > 200:
                         note = note[:200] + "…"
-                    if _set_plan_step(plan_path, int(m.group(1)), m.group(2).lower(), note):
+                    if _set_plan_step(plan_path, int(m.group(1)), status, note):
+                        # `agent` field stays the OWNER (event routing); `step_agent`
+                        # is the dispatch target this step links to, for auto-tick.
                         await emit({"type": "plan_step", "agent": agent_id,
-                                    "n": int(m.group(1)), "status": m.group(2).lower(),
-                                    "note": (m.group(3) or "").strip()[:120]})
+                                    "n": int(m.group(1)), "status": status,
+                                    "step_agent": attrs.get("agent") or None,
+                                    "note": note[:120]})
                 await emit({"type": "delta", "agent": agent_id, "text": text})
             elif etype == "meta":
                 data = evt.get("data") or {}
@@ -1947,6 +1978,261 @@ async def api_compact(slug: str, agent_id: str):
 
 def _sse(payload: dict) -> str:
     return f"data: {json.dumps(payload, ensure_ascii=False)}\n\n"
+
+
+# ---------------------------------------------------------------------------
+# UI-only read-only side panels (cluster jobs + subscription usage).
+# These are pure projections — they NEVER touch agent sessions, the dispatch
+# ledger, or any orchestration state.
+# ---------------------------------------------------------------------------
+
+_CLUSTER_NAMES = ["ascend", "cardinal", "pitzer"]
+
+
+@app.get("/api/cluster/jobs")
+async def api_cluster_jobs():
+    """SLURM queue across all federated clusters via `squeue --clusters=all`.
+    Returns {clusters: {name: [job,...]}, error?}. Read-only."""
+    user = os.environ.get("USER") or os.environ.get("LOGNAME") or ""
+    fmt = "%i|%P|%j|%t|%M|%D|%R|%C"
+    clusters: dict[str, list] = {c: [] for c in _CLUSTER_NAMES}
+    proc = None
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            "squeue", "--clusters=all", "-u", user, "-o", fmt,
+            stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
+        )
+        out, err = await asyncio.wait_for(proc.communicate(), timeout=12)
+    except FileNotFoundError:
+        return {"clusters": clusters, "error": "squeue not found on PATH"}
+    except asyncio.TimeoutError:
+        if proc is not None:
+            try: proc.kill()
+            except Exception: pass
+        return {"clusters": clusters, "error": "squeue timed out (12s)"}
+    except Exception as e:
+        return {"clusters": clusters, "error": f"squeue failed: {e}"}
+
+    cur = None
+    for line in out.decode("utf-8", errors="replace").splitlines():
+        s = line.strip()
+        if not s:
+            continue
+        if s.startswith("CLUSTER:"):
+            cur = s.split(":", 1)[1].strip()
+            clusters.setdefault(cur, [])
+            continue
+        if s.startswith("JOBID|") or "|" not in s:
+            continue
+        p = s.split("|")
+        if len(p) < 4:
+            continue
+        clusters.setdefault(cur or "unknown", []).append({
+            "id": p[0], "partition": p[1], "name": p[2], "state": p[3],
+            "time": p[4] if len(p) > 4 else "", "nodes": p[5] if len(p) > 5 else "",
+            "reason": p[6] if len(p) > 6 else "", "cpus": p[7] if len(p) > 7 else "",
+        })
+
+    if proc.returncode and not any(clusters.values()):
+        msg = err.decode("utf-8", errors="replace")[:200].strip()
+        return {"clusters": clusters, "error": msg or "squeue returned non-zero"}
+    return {"clusters": clusters}
+
+
+@app.get("/api/usage")
+async def api_usage():
+    """Best-effort Claude subscription usage. Reads the existing OAuth bearer from
+    ~/.claude/.credentials.json (subscription auth, NOT an ANTHROPIC_API_KEY) and pulls
+    the anthropic-ratelimit-unified-* headers off a cheap authenticated GET. Returns
+    {available, five_hour:{pct,reset_at}, weekly:{pct,reset_at}} or {available:false}.
+    The token is never logged or returned."""
+    def _fetch():
+        import urllib.request
+        import urllib.error
+        cred = Path.home() / ".claude" / ".credentials.json"
+        try:
+            tok = (json.loads(cred.read_text()).get("claudeAiOauth") or {}).get("accessToken")
+        except Exception:
+            return {"available": False, "reason": "no credentials"}
+        if not tok:
+            return {"available": False, "reason": "no token"}
+        req = urllib.request.Request(
+            "https://api.anthropic.com/api/oauth/usage",
+            headers={
+                "Authorization": f"Bearer {tok}",
+                "anthropic-beta": "oauth-2025-04-20",
+                "Content-Type": "application/json",
+                "User-Agent": "AgentUI-usage/1.0",
+            },
+            method="GET",
+        )
+        try:
+            with urllib.request.urlopen(req, timeout=10) as resp:
+                body = json.loads(resp.read().decode("utf-8", errors="replace"))
+        except Exception as e:
+            return {"available": False, "reason": str(e)[:120]}
+
+        def _period(block):
+            d = body.get(block)
+            if not isinstance(d, dict):
+                return None
+            u = d.get("utilization")
+            try: pct = round(float(u), 1)  # already 0..100
+            except Exception: pct = None
+            reset = None
+            ra = d.get("resets_at")
+            if ra:
+                try:
+                    reset = int(datetime.fromisoformat(str(ra)).timestamp())
+                except Exception:
+                    reset = None
+            return {"pct": pct, "reset_at": reset}
+
+        five, week = _period("five_hour"), _period("seven_day")
+        if five is None and week is None:
+            return {"available": False, "reason": "no usage fields"}
+        return {"available": True, "five_hour": five, "weekly": week}
+
+    return await asyncio.to_thread(_fetch)
+
+
+# ---------------------------------------------------------------------------
+# Terminal dock — real PTY shells over WebSocket (xterm.js front-end).
+# Isolated subsystem: its own process registry, never touches agent sessions.
+# Safeguards: per-server cap, kill-on-disconnect, idle reap, kill-all on
+# shutdown. Server binds 127.0.0.1 only (run.sh), so shells are local-only.
+# ---------------------------------------------------------------------------
+
+_MAX_TERMINALS = 6
+_TERM_IDLE_S = 1800  # reap a shell with no I/O for 30 min
+_terminals: dict[str, dict] = {}  # id -> {pid, fd, last_io}
+
+
+def _term_kill(tid: str):
+    t = _terminals.pop(tid, None)
+    if not t:
+        return
+    try:
+        os.kill(t["pid"], signal.SIGHUP)
+    except Exception:
+        pass
+    try:
+        os.kill(t["pid"], signal.SIGKILL)
+    except Exception:
+        pass
+    try:
+        os.close(t["fd"])
+    except Exception:
+        pass
+    try:
+        os.waitpid(t["pid"], os.WNOHANG)
+    except Exception:
+        pass
+
+
+@app.websocket("/api/terminal/ws")
+async def api_terminal_ws(ws: WebSocket):
+    """One PTY-backed `bash` login shell per connection. Frontend protocol (JSON text):
+    {"t":"i","d":"<keystrokes>"} input, {"t":"r","cols":C,"rows":R} resize.
+    Server streams raw shell bytes back as binary frames."""
+    await ws.accept()
+    if len(_terminals) >= _MAX_TERMINALS:
+        await ws.send_text("\r\n[terminal limit reached — close another terminal first]\r\n")
+        await ws.close()
+        return
+
+    tid = uuid.uuid4().hex[:8]
+    pid, fd = pty.fork()
+    if pid == 0:
+        # Child: become the shell. (pty.fork already set up the controlling tty.)
+        os.environ["TERM"] = "xterm-256color"
+        # Give the user a clean login shell — don't leak AgentUI's own venv
+        # (VIRTUAL_ENV + its PATH prefix + its PS1) into their terminal, otherwise
+        # the prompt shows just "(.venv) " with no cwd instead of their normal one.
+        venv = os.environ.pop("VIRTUAL_ENV", None)
+        os.environ.pop("VIRTUAL_ENV_PROMPT", None)
+        os.environ.pop("PS1", None)
+        if venv:
+            kept = [p for p in os.environ.get("PATH", "").split(":")
+                    if p and not p.startswith(venv)]
+            os.environ["PATH"] = ":".join(kept)
+        os.chdir(os.path.expanduser("~"))
+        try:
+            os.execvp("bash", ["bash", "-l", "-i"])
+        except Exception:
+            os.execvp("sh", ["sh", "-i"])
+        os._exit(127)
+
+    _terminals[tid] = {"pid": pid, "fd": fd, "last_io": time.time()}
+    loop = asyncio.get_event_loop()
+
+    async def pump_out():
+        while True:
+            try:
+                data = await loop.run_in_executor(None, os.read, fd, 65536)
+            except OSError:
+                break
+            if not data:
+                break
+            _terminals.get(tid, {}).update(last_io=time.time())
+            try:
+                await ws.send_bytes(data)
+            except Exception:
+                break
+        try:
+            await ws.close()
+        except Exception:
+            pass
+
+    out_task = asyncio.create_task(pump_out())
+    try:
+        while True:
+            raw = await ws.receive_text()
+            try:
+                msg = json.loads(raw)
+            except Exception:
+                continue
+            t = msg.get("t")
+            if t == "i":
+                try:
+                    os.write(fd, (msg.get("d") or "").encode("utf-8"))
+                    _terminals.get(tid, {}).update(last_io=time.time())
+                except OSError:
+                    break
+            elif t == "r":
+                try:
+                    cols = int(msg.get("cols") or 80)
+                    rows = int(msg.get("rows") or 24)
+                    fcntl.ioctl(fd, termios.TIOCSWINSZ, struct.pack("HHHH", rows, cols, 0, 0))
+                except Exception:
+                    pass
+    except WebSocketDisconnect:
+        pass
+    except Exception:
+        pass
+    finally:
+        out_task.cancel()
+        _term_kill(tid)
+
+
+async def _terminal_reaper():
+    while True:
+        await asyncio.sleep(120)
+        now = time.time()
+        for tid, t in list(_terminals.items()):
+            if now - t.get("last_io", now) > _TERM_IDLE_S:
+                _term_kill(tid)
+
+
+@app.on_event("startup")
+async def _start_terminal_reaper():
+    asyncio.create_task(_terminal_reaper())
+
+
+@app.on_event("shutdown")
+async def _kill_all_terminals():
+    for tid in list(_terminals.keys()):
+        _term_kill(tid)
 
 
 if FRONTEND_DIR.exists():

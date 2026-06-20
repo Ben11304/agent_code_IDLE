@@ -48,7 +48,9 @@ cd app
 # → http://127.0.0.1:5174
 ```
 
-`run.sh` creates `.venv`, installs `fastapi uvicorn pyyaml`, runs uvicorn with `--reload`. Frontend changes need browser hard refresh (Cmd+Shift+R) because CDN scripts cache.
+`run.sh` creates `.venv`, installs `fastapi uvicorn pyyaml`, runs uvicorn **without `--reload`**. Frontend changes need browser hard refresh (Cmd+Shift+R) because CDN scripts cache; **backend changes need a manual restart** (no reloader).
+
+> ⚠️ Do NOT re-add `--reload`. `agentui.db` (+ `-wal`/`-journal`) lives inside the watched `app/` tree, so every DB write during an agent turn used to trigger a reload that cancelled the driver task and killed the `claude -p` subprocess — the "agent cut off mid-answer" bug. Run.sh is env-specific and not committed.
 
 Port conflicts: `lsof -ti tcp:5174 | xargs kill -9`.
 
@@ -70,6 +72,7 @@ Port conflicts: `lsof -ti tcp:5174 | xargs kill -9`.
 - Node color: idle gray / running yellow pulse / ok green / error red.
 - Edge: pulsing purple dash during active dispatch.
 - Each node shows its current model in the badge (e.g. `opus-4-8`).
+- **Plan todo panel.** The full todo list renders as a `.todo-panel` anchored to the RIGHT of the node, but ONLY for the node whose chat is open or that is `running` (others stay bare, so a busy canvas stays legible). No per-node `done/total` count is shown on the node itself. Rows: ☐ pending / ⏳ doing / ✓ done (struck-through) / ⛔ blocked, plus a `→ID` tag when the step links to a dispatch target. Data: `state.plans[slug][agentId]` seeded from `GET /api/projects/{slug}` payload `plans` (read from each agent's `state/plan.md`) and updated live by `plan_updated`/`plan_step`/dispatch auto-tick. Panels track node position during drag via `updateTodoPanelsLive` (mirrors `updateEdgesLive`).
 
 ### Theme
 
@@ -211,8 +214,10 @@ When editing the dispatch prompt, remember the user verifies on the graph. Keep 
 | `thinking` | `agent`, `text` | Recent thinking chunk (visible in indicator). |
 | `delta` | `agent`, `text` | Assistant text delta. Appended to bubble. |
 | `continuation_round` | `agent`, `round`, `max` | Round separator + turn-strip round badge; resets the orchestrator's live bubble. |
-| `dispatch_started` | `source`, `target`, `task` | Animate edge, mark target running, create worker card + turn-strip chip. |
-| `dispatch_complete` | `source`, `target`, `status`, `message` | Stop animation, mark target ok/error. |
+| `plan_updated` | `agent`, `total`, `steps[{n,text,status}]` | (Re)declare the agent's plan; populates the graph todo panel + node badge. |
+| `plan_step` | `agent`, `n`, `status`, `step_agent`, `note` | One step's status change. `agent`=owner (event routing); `step_agent`=dispatch target the step links to (auto-tick). |
+| `dispatch_started` | `source`, `target`, `task` | Animate edge, mark target running, create worker card + turn-strip chip, auto-tick linked todo step → doing. |
+| `dispatch_complete` | `source`, `target`, `status`, `message` | Stop animation, mark target ok/error, auto-tick linked todo step → done/blocked. |
 | `dispatch_rejected` | `source`, `target`, `reason` | Show in status bar. |
 | `agent_done` | `agent`, `text`, `status` | Final state for that agent. |
 | `error` | `agent`, `message` | Surface in bubble as quote. |
@@ -230,6 +235,34 @@ If you add an event type, update both `_run_agent` / `_dispatched_run` (emit) an
 `main.py:api_chat` returns `StreamingResponse` with `Cache-Control: no-cache, no-transform`, `X-Accel-Buffering: no`. Don't introduce middleware that buffers.
 
 Default `claude_model` is `claude-sonnet-4-6` — fast and cheap. Opus 4.7 / 4.8 have expensive extended thinking by default; use only for orchestrators if needed.
+
+## Side panels & terminal (UI-only surfaces)
+
+These are presentation surfaces wired to read-only endpoints; they never touch agent
+sessions, the dispatch ledger, or orchestration state.
+
+- **Top bar** (`.topbar` wraps `#tabs`). Right-aligned `#procBtn` "Process running" +
+  `#skillsBtn` "Skills". Skills was relocated here from the old fixed right-edge tab
+  (`.skills-tab` now `display:none`); it opens the same `#skillsPanel`.
+- **Process running dropdown** (`#procDropdown`). `GET /api/cluster/jobs` runs
+  `squeue --clusters=all -u $USER -o '%i|%P|%j|%t|%M|%D|%R|%C'`, parses the `CLUSTER:`
+  markers, returns `{clusters:{ascend|cardinal|pitzer:[…]}}`. Polls every 15s while open.
+- **Usage widget** (`#usageWidget`, bottom-right). `GET /api/usage` reads the OAuth bearer
+  from `~/.claude/.credentials.json` (`.claudeAiOauth.accessToken` — subscription auth, NOT
+  an `ANTHROPIC_API_KEY`) and GETs `https://api.anthropic.com/api/oauth/usage` with header
+  `anthropic-beta: oauth-2025-04-20`; the JSON body's `five_hour`/`seven_day`
+  `{utilization, resets_at}` drive the two bars. Graceful `{available:false}` → "usage n/a".
+  Token is never logged or returned. Polls every 60s.
+- **Terminal dock** (`#terminalDock`, bottom, VS Code-style). `WebSocket /api/terminal/ws`
+  spawns one `bash -l -i` per tab on a PTY (same termios raw-mode trick as
+  `adapters.py:claude_stream`); protocol is JSON text `{"t":"i",d}` input / `{"t":"r",cols,rows}`
+  resize, raw shell bytes streamed back as binary frames. The child shell is given a CLEAN
+  env (pops `VIRTUAL_ENV`/`VIRTUAL_ENV_PROMPT`/`PS1`, strips the venv from PATH, `cd ~`) so the
+  user's normal login prompt shows instead of `(.venv)`. Front-end uses xterm.js + fit addon
+  from CDN. **Safeguards:** cap 6 shells, kill-on-disconnect, idle reap (`_TERM_IDLE_S`=30min),
+  kill-all on `@app.on_event("shutdown")`. Needs the `websockets` package (in
+  `requirements.txt`). These are real persistent shells on the login node — bounded but
+  remember they exist.
 
 ## Things NOT to do
 
@@ -268,7 +301,7 @@ Template generation lives in `projects.py:_AGENT_FILE_TEMPLATES` (5 templates) +
 - **Compaction: solved.** `/compact` (manual) and auto-compact (fires before a user turn when the session's last-turn context ≥ `_AUTO_COMPACT_PCT` = 80%): the agent summarises its own context, a fresh session is created seeded with that recap (`sessions.seed`, prepended once then cleared). Empty recap → rotate anyway, cold-start preamble covers recovery.
 - **Cold-start preamble.** Any turn that cannot `--resume` (fresh/torn session) gets a deterministic recap prepended: latest `state/progress.md` sections + unfinished `state/plan.md` + `state/children_status.json` (parents) + `inputs/manifest.md` head. Built in `_session_preamble`; a /compact seed takes precedence.
 - **Children rollup.** Every parent gets `state/children_status.json` auto-derived on each `/stats` call (and via `POST /api/projects/{slug}/rollup`): per-child status, context %, memory freshness + `stale_memory` flag, sha256 of progress.md. Read-only projection — never hand-edited, never a second source of truth.
-- **Plan ledger.** All agents get `_PLAN_INSTRUCTIONS` appended to their system prompt: multi-step tasks must emit `<plan>1. …</plan>` then `<step n="1" status="done">note</step>` (doing|done|blocked). Parsed live like dispatch tags, persisted to the agent's `state/plan.md` (survives sessions, resumed via preamble), surfaced as `plan` in `/stats` and a progress row on the node panel. SSE events: `plan_updated`, `plan_step`.
+- **Plan ledger.** All agents get `_PLAN_INSTRUCTIONS` appended to their system prompt: multi-step tasks must emit `<plan>1. …</plan>` then `<step n="1" status="done">note</step>` (doing|done|blocked). A step that IS a dispatch may carry `agent="ID"` (order-tolerant; parsed by `STEP_RE` + `_STEP_ATTR_RE`) to link it to a worker node — the graph then auto-ticks it from `dispatch_started`/`dispatch_complete` as a safety net over the model's own `<step>`. Parsed live like dispatch tags, persisted to the agent's `state/plan.md` (survives sessions, resumed via preamble), surfaced as `plan` in `/stats`, a node badge + a `.todo-panel` on the graph (see Graph canvas), and a progress row on the node panel. SSE events: `plan_updated` (carries full `steps`), `plan_step` (carries `step_agent`).
 - **Continuation is multi-round.** Up to `_MAX_CONT_ROUNDS` = 3 continuations per user turn: each wave of dispatches is gathered, then the orchestrator reacts (synthesise or chain new dispatches) in the same SSE response. The final round's prompt forbids further dispatches; any emitted anyway still run, results land in the ledger for the next turn.
 - **Dispatch contract verify.** `_dispatched_run` snapshots the worker's `outputs/manifest.md` (mtime + version) before/after; an unchanged manifest on an ok dispatch appends a `[control-plane verify]` warning into the ledger text so the orchestrator demands a manifest bump before consuming artifact-producing work.
 - **Turns are detached from the browser (solved: "send work, close the laptop").** Each chat turn runs as a server-side task publishing to an in-memory per-run event buffer (`_Run` registry in main.py, every event stamped with `seq`). The SSE returned by POST /chat is just the first subscriber — disconnect only unsubscribes, the turn (and all its dispatched workers) runs to completion and persists everything. Re-attach: `GET /api/projects/{slug}/runs` lists active runs (UI calls it on project open and auto-opens those chats), `GET .../agents/{id}/stream?since=N` replays buffered events from `since` then follows live (finished runs stay replayable `_RUN_KEEP_DONE_S` = 10 min). Stopping is ONLY explicit `POST .../agents/{id}/stop` (UI Stop/Esc calls it; local fetch abort merely stops watching). One active run per agent — a second POST /chat gets 409 and the UI queues the message + re-attaches. Caveat: the buffer is in-memory, so a **server restart** still kills in-flight runs (startup reaper marks them `cancelled`). Also note: cron keepalive restarts run.sh with cron's bare PATH — run.sh asserts `~/.local/bin` (claude) and `~/.grok/bin` (grok) explicitly; do not remove that export.

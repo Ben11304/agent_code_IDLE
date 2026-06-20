@@ -4,6 +4,7 @@
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width,initial-scale=1" />
   <title>AgentUI</title>
+  <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/xterm@5.3.0/css/xterm.min.css" />
   <link rel="stylesheet" href="/styles.css" />
 </head>
 <body>
@@ -25,10 +26,19 @@
     <div class="sidebar-resizer" id="sidebarResizer" title="drag to resize sidebar"></div>
 
     <main class="workspace">
-      <div class="tabs" id="tabs"></div>
+      <div class="topbar">
+        <div class="tabs" id="tabs"></div>
+        <div class="topbar-actions">
+          <button id="procBtn" class="topbar-btn" title="Submitted SLURM jobs across all clusters">▦ Process running</button>
+          <button id="skillsBtn" class="topbar-btn" title="Installed skills panel">⚡ Skills</button>
+        </div>
+        <div id="procDropdown" class="proc-dropdown" hidden></div>
+      </div>
       <div id="windowsRoot" class="windows-root">
         <div class="canvas-empty" id="canvasEmpty">Pick a project in the left sidebar</div>
       </div>
+      <div id="terminalDock" class="terminal-dock collapsed"></div>
+      <div id="usageWidget" class="usage-widget" hidden></div>
       <div id="taskbar" class="taskbar"></div>
     </main>
   </div>
@@ -45,6 +55,8 @@
 
   <script src="https://cdn.jsdelivr.net/npm/marked@12.0.0/marked.min.js"></script>
   <script src="https://cdn.jsdelivr.net/npm/dompurify@3.0.9/dist/purify.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/xterm@5.3.0/lib/xterm.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/xterm-addon-fit@0.8.0/lib/xterm-addon-fit.min.js"></script>
   <script src="/app.js"></script>
 </body>
 </html>
