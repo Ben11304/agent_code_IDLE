@@ -33,6 +33,10 @@ See [DEPLOY.md](DEPLOY.md) — SSH tunnel + systemd service.
 - **Per-agent overrides** (model + effort) persisted in SQLite, applied next turn
 - **Resilience**: `--resume` only on `last_status == "ok"`; SSE heartbeat keeps Opus thinking sessions alive; startup reaper recovers orphan `running` sessions after restart
 
+**User customizations recorded in CLAUDE.md** (so future agents know how to intervene):
+- The entire Plan/todo-panel system (multi-step `<plan>` protocol + side panels on the graph) has been **completely removed**.
+- A global **Scheduler on/off toggle** (Apple-style switch) was added in the 🕒 Schedules dropdown. When off, no new schedules fire or can be created. See CLAUDE.md "Active user custom modifications" for details and how to re-enable / extend.
+
 ## Add a project
 
 1. Create `.agentui/project.yaml` in the project root.

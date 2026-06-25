@@ -55,3 +55,5 @@ agents:
 - backend/db.py SQLite cho session và message.
 - backend/projects.py đọc registry và project.yaml.
 - frontend/ vanilla HTML/CSS/JS, SVG đồ thị.
+
+**Ghi chú cho agent sau**: Xem CLAUDE.md phần "Active user custom modifications". Plan/todo feature đã bị xoá hoàn toàn. Scheduler có nút on/off global (Apple toggle) trong dropdown 🕒.

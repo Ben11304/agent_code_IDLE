@@ -73,12 +73,36 @@ def init_db() -> None:
                 updated_at REAL NOT NULL,
                 PRIMARY KEY (project_slug, agent_id)
             );
+            CREATE TABLE IF NOT EXISTS scheduled_tasks (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                project_slug TEXT NOT NULL,
+                agent_id TEXT NOT NULL,
+                prompt TEXT NOT NULL,
+                kind TEXT NOT NULL CHECK(kind IN ('interval','once','until')),
+                interval_seconds INTEGER,
+                until_goal TEXT,
+                next_run_at REAL NOT NULL,
+                last_run_at REAL,
+                last_status TEXT,
+                runs_done INTEGER NOT NULL DEFAULT 0,
+                max_runs INTEGER,
+                active INTEGER NOT NULL DEFAULT 1,
+                origin TEXT NOT NULL DEFAULT 'user',
+                created_at REAL NOT NULL,
+                updated_at REAL NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_sched_due
+                ON scheduled_tasks(active, next_run_at);
             CREATE INDEX IF NOT EXISTS idx_dr_source
                 ON dispatch_results(project_slug, source_agent, consumed_at, completed_at);
             CREATE INDEX IF NOT EXISTS idx_sessions_proj_agent
                 ON sessions(project_slug, agent_id, updated_at DESC);
             CREATE INDEX IF NOT EXISTS idx_messages_session
                 ON messages(session_id, id);
+            CREATE TABLE IF NOT EXISTS settings (
+                key TEXT PRIMARY KEY,
+                value TEXT NOT NULL
+            );
             """
         )
         # backward-compat: add grok_model column if older db
@@ -374,3 +398,155 @@ def get_last_status(project_slug: str, agent_id: str) -> str | None:
             (project_slug, agent_id),
         ).fetchone()
     return row["last_status"] if row else None
+
+
+# ---------------------------------------------------------------------------
+# Scheduler — recurring / deferred / goal-driven re-invocation of an agent turn.
+# A fire goes through the same _Run/_run_agent path as a normal /chat. See
+# docs/scheduler-spec.md.
+# ---------------------------------------------------------------------------
+
+def create_scheduled_task(
+    project_slug: str,
+    agent_id: str,
+    prompt: str,
+    kind: str,
+    interval_seconds: int | None,
+    next_run_at: float,
+    *,
+    until_goal: str | None = None,
+    max_runs: int | None = None,
+    origin: str = "user",
+) -> dict:
+    now = time.time()
+    with _conn() as c:
+        cur = c.execute(
+            "INSERT INTO scheduled_tasks(project_slug, agent_id, prompt, kind, "
+            "interval_seconds, until_goal, next_run_at, runs_done, max_runs, "
+            "active, origin, created_at, updated_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, 0, ?, 1, ?, ?, ?)",
+            (project_slug, agent_id, prompt, kind, interval_seconds, until_goal,
+             next_run_at, max_runs, origin, now, now),
+        )
+        row = c.execute("SELECT * FROM scheduled_tasks WHERE id=?", (cur.lastrowid,)).fetchone()
+    return dict(row)
+
+
+def list_scheduled_tasks(project_slug: str, include_inactive: bool = True) -> list[dict]:
+    q = "SELECT * FROM scheduled_tasks WHERE project_slug=?"
+    if not include_inactive:
+        q += " AND active=1"
+    q += " ORDER BY active DESC, next_run_at ASC"
+    with _conn() as c:
+        rows = c.execute(q, (project_slug,)).fetchall()
+    return [dict(r) for r in rows]
+
+
+def get_scheduled_task(task_id: int) -> dict | None:
+    with _conn() as c:
+        row = c.execute("SELECT * FROM scheduled_tasks WHERE id=?", (task_id,)).fetchone()
+    return dict(row) if row else None
+
+
+def get_due_scheduled_tasks(now: float | None = None) -> list[dict]:
+    """Active schedules whose next fire time has arrived."""
+    now = time.time() if now is None else now
+    with _conn() as c:
+        rows = c.execute(
+            "SELECT * FROM scheduled_tasks WHERE active=1 AND next_run_at<=? "
+            "ORDER BY next_run_at ASC",
+            (now,),
+        ).fetchall()
+    return [dict(r) for r in rows]
+
+
+def record_scheduled_fire(task_id: int, next_run_at: float | None, status: str) -> dict | None:
+    """After a fire completes: bump runs_done, stamp last_run_at/last_status, set
+    the next fire time (None = no further fire, deactivate)."""
+    now = time.time()
+    with _conn() as c:
+        if next_run_at is None:
+            c.execute(
+                "UPDATE scheduled_tasks SET runs_done=runs_done+1, last_run_at=?, "
+                "last_status=?, active=0, next_run_at=?, updated_at=? WHERE id=?",
+                (now, status, now, now, task_id),
+            )
+        else:
+            c.execute(
+                "UPDATE scheduled_tasks SET runs_done=runs_done+1, last_run_at=?, "
+                "last_status=?, next_run_at=?, updated_at=? WHERE id=?",
+                (now, status, next_run_at, now, task_id),
+            )
+        row = c.execute("SELECT * FROM scheduled_tasks WHERE id=?", (task_id,)).fetchone()
+    return dict(row) if row else None
+
+
+def defer_scheduled_task(task_id: int, next_run_at: float) -> None:
+    """Push the next fire time forward without counting a run (skip-on-busy)."""
+    with _conn() as c:
+        c.execute(
+            "UPDATE scheduled_tasks SET next_run_at=?, updated_at=? WHERE id=?",
+            (next_run_at, time.time(), task_id),
+        )
+
+
+def set_scheduled_active(task_id: int, active: bool) -> dict | None:
+    with _conn() as c:
+        c.execute(
+            "UPDATE scheduled_tasks SET active=?, updated_at=? WHERE id=?",
+            (1 if active else 0, time.time(), task_id),
+        )
+        row = c.execute("SELECT * FROM scheduled_tasks WHERE id=?", (task_id,)).fetchone()
+    return dict(row) if row else None
+
+
+def deactivate_agent_schedules(project_slug: str, agent_id: str, kind: str | None = None,
+                               created_before: float | None = None) -> list[int]:
+    """Deactivate this agent's active schedules (optionally only one kind). Used by
+    <schedule_stop> so a goal-loop can self-terminate. Returns deactivated ids.
+
+    `created_before` guards the same-turn-echo pitfall: an agent that EXPLAINS or
+    quotes `<schedule_stop>` (e.g. echoing the example from its instructions) in the
+    very message that also CREATES a schedule must not instantly kill it. Passing the
+    turn's start time means only schedules that pre-date this turn are stopped."""
+    q = "SELECT id FROM scheduled_tasks WHERE project_slug=? AND agent_id=? AND active=1"
+    params: list = [project_slug, agent_id]
+    if kind:
+        q += " AND kind=?"
+        params.append(kind)
+    if created_before is not None:
+        q += " AND created_at < ?"
+        params.append(created_before)
+    with _conn() as c:
+        ids = [r["id"] for r in c.execute(q, params).fetchall()]
+        if ids:
+            placeholders = ",".join("?" * len(ids))
+            c.execute(
+                f"UPDATE scheduled_tasks SET active=0, updated_at=? WHERE id IN ({placeholders})",
+                (time.time(), *ids),
+            )
+    return ids
+
+
+def delete_scheduled_task(task_id: int) -> None:
+    with _conn() as c:
+        c.execute("DELETE FROM scheduled_tasks WHERE id=?", (task_id,))
+
+
+# ---------------------------------------------------------------------------
+# Global settings (key-value). Used for scheduler on/off etc.
+# ---------------------------------------------------------------------------
+
+def get_setting(key: str, default: str = "1") -> str:
+    with _conn() as c:
+        row = c.execute("SELECT value FROM settings WHERE key=?", (key,)).fetchone()
+    return row["value"] if row else default
+
+def set_setting(key: str, value: str) -> None:
+    now = time.time()
+    with _conn() as c:
+        c.execute(
+            "INSERT INTO settings(key, value) VALUES (?, ?) "
+            "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+            (key, value),
+        )

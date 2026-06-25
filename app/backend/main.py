@@ -16,7 +16,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
 
-from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect
+from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect, Body
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse, FileResponse
 from fastapi.staticfiles import StaticFiles
@@ -51,105 +51,114 @@ DISPATCH_RE = re.compile(
     re.IGNORECASE,
 )
 
-# Step-by-step protocol tags, parsed from the stream like <dispatch>. <plan>
-# declares (or replaces) the agent's step list; <step> marks one step's status.
-# Persisted to the agent's own `state/plan.md` so the plan survives sessions.
-PLAN_RE = re.compile(r'<plan>([\s\S]*?)</plan>', re.IGNORECASE)
-# n is mandatory + first; the remaining attrs (status, optional agent="ID" that
-# links a step to a dispatch target) are captured as a blob and parsed below so
-# attribute ORDER does not matter.
-STEP_RE = re.compile(
-    r'<step\s+n="(\d+)"((?:\s+[\w-]+="[^"]*")*)\s*(?:/>|>([\s\S]*?)</step>)',
-    re.IGNORECASE,
+# Scheduler tags, parsed from the stream like <dispatch>. <schedule> registers a
+# recurring/deferred/goal-driven re-invocation; <schedule_stop> lets a goal-loop
+# (until-mode) self-terminate. The \s+ after "schedule" makes this NOT match
+# <schedule_stop ...>. See docs/scheduler-spec.md.
+SCHEDULE_RE = re.compile(r'<schedule\s+([^>]*?)>([\s\S]*?)</schedule>', re.IGNORECASE)
+SCHEDULE_STOP_RE = re.compile(
+    r'<schedule_stop\b([^>]*?)(?:/>|>([\s\S]*?)</schedule_stop>)', re.IGNORECASE)
+_SCHED_ATTR_RE = re.compile(r'([\w-]+)="([^"]*)"')
+
+_SCHED_INTERVAL_FLOOR_S = 300      # 5 min — bound subscription-quota burn
+_SCHED_UNTIL_CEILING = 48          # hard ceiling for until-loops without <schedule_stop>
+_SCHED_ZOMBIE_DAYS = 7
+
+_SCHEDULE_INSTRUCTIONS = (
+    "\n\n## ⏰ Recurring / deferred work — emit <schedule>, NEVER narrate a loop (control-plane parsed)\n"
+    "You CANNOT run background timers, cron jobs, pollers, heartbeats, or detached processes. A turn ends and "
+    "your CLI process EXITS. The ONLY thing that can ever wake you up again is a `<schedule>` tag parsed by the "
+    "control plane. No tag = nothing runs = you will NEVER be re-invoked.\n\n"
+    "**Trigger — whenever the user asks you to track / monitor / watch / poll / check periodically / keep them "
+    "posted / report every N minutes / run until done — or in Vietnamese: 'theo dõi', 'tracking', 'mỗi 30 phút', "
+    "'định kỳ', 'báo cáo định kỳ', 'tự chạy tới đích', 'cho đến khi xong' — you MUST emit a `<schedule>` tag in "
+    "THAT SAME response.** Pick the form:\n"
+    '  <schedule every="30m" until="<the condition that ends it>">Check …; DONE → report + <schedule_stop/>; '
+    'FAILED → fix & rerun; still running → note progress to state/progress.md.</schedule>   ← "track until done"\n'
+    '  <schedule every="30m" max="8">Check … and report.</schedule>                          ← fixed cadence/count\n'
+    '  <schedule in="2h">Do … once.</schedule>                                                ← one-shot\n'
+    "Durations: `30m | 2h | 90s | 1d`; minimum 5m for `every`. End a goal loop with "
+    '<schedule_stop reason="..."/>.\n\n'
+    "**ABSOLUTELY FORBIDDEN: describing tracking that does not exist.** Sentences like 'tracking active', "
+    "'loop is running', 'BOSS heartbeat ~30′', 'VLM poller', 'I'll wake myself every 30 min', 'tôi sẽ tự đánh "
+    "thức', 'anh cứ nghỉ, tracking lo phần còn lại' — WITHOUT a `<schedule>` tag in the same message — are LIES. "
+    "There is no heartbeat, no poller, no loop. The user verifies on the graph: no 🕒 badge ⇒ you lied and they "
+    "get silence. If you truly should not schedule, say so in one plain sentence — do not invent a background "
+    "process.\n\n"
+    "**Emit <schedule_stop> ONLY to actually end a loop you started on an EARLIER turn** — never as an "
+    "illustration/quote, and never in the same message where you create a schedule (that would instantly kill "
+    "it). To explain the stop tag in prose, describe it in words; do not write the literal tag."
 )
-_STEP_ATTR_RE = re.compile(r'([\w-]+)="([^"]*)"')
 
-_PLAN_LINE_RE = re.compile(r"^\s*(\d+)\.\s*\[([ x~!])\]\s*(.*)$")
-_PLAN_STATUS_MARK = {"pending": " ", "doing": "~", "done": "x", "blocked": "!"}
-_MARK_TO_STATUS = {" ": "pending", "~": "doing", "x": "done", "!": "blocked"}
+# Phrases that mean the user wants recurring / deferred follow-up. If a user turn
+# matches this AND the agent's response emitted no <schedule> tag, the driver fires
+# one corrective continuation (delivered via the prompt channel, so it reaches the
+# model even on a resumed session where --append-system-prompt may not).
+_TRACK_INTENT_RE = re.compile(
+    r"(tracking|track this|track it|track the|monitor|keep me posted|keep an eye|periodically|"
+    r"recurring|every\s+\d+\s*(m|min|minute|mins|minutes|h|hr|hour|hours)\b|"
+    r"theo\s*d[õo]i|đ[ịi]nh\s*k[ỳy]|b[áa]o\s*c[áa]o\s*đ[ịi]nh\s*k[ỳy]|m[ỗo]i\s+\d+\s*(ph[úu]t|gi[ờo]|p|h|m)|"
+    r"cho\s+đ[ếe]n\s+khi\s+xong|t[ựu]\s+ch[ạa]y|until\s+(it'?s\s+)?(done|finished|complete|over))",
+    re.IGNORECASE)
 
-_PLAN_INSTRUCTIONS = (
-    "\n\n## Step-by-step protocol (control-plane parsed — MANDATORY for multi-step tasks)\n"
-    "If the task has ≥2 distinct steps: emit the plan BEFORE starting work, as a tag:\n"
-    "<plan>\n1. step one\n2. step two\n</plan>\n"
-    "Then IMMEDIATELY AFTER finishing/starting/getting stuck on each step, emit:\n"
-    "<step n=\"1\" status=\"done\">one-line note (optional)</step>\n"
-    "Valid status: doing | done | blocked. When a step IS a dispatch to a worker, add that worker's id as "
-    "`agent=\"ID\"` (e.g. <step n=\"2\" status=\"doing\" agent=\"B\">feed A's result to B</step>) — the graph "
-    "links the step to that node's todo panel and auto-ticks it when the dispatch finishes. The control plane "
-    "parses the tags in real time, persists them to `state/plan.md` (survives sessions) and shows progress on "
-    "the graph — narrating steps without emitting the tag is INVISIBLE to the user. When you wake up in a new "
-    "session and `state/plan.md` still has an unfinished step → CONTINUE from that step; do NOT re-plan unless "
-    "the user asks."
+_SCHEDULE_NUDGE = (
+    "[CONTROL-PLANE SCHEDULE CHECK] Your previous response described tracking / monitoring / a recurring "
+    "check (a 'heartbeat', 'poller', 'loop active', 'I'll wake myself every N min', 'tôi sẽ tự đánh thức', "
+    "'tracking lo phần còn lại') — but you emitted NO <schedule> tag. So NOTHING was registered: there is no "
+    "timer, no heartbeat, no poller, no loop, and you will NOT be re-invoked. The user will get silence — the "
+    "exact failure to avoid. Fix it NOW by choosing ONE:\n"
+    '(a) Emit the real recurring tag, e.g. <schedule every="30m" until="<goal that ends it>">Concise check; '
+    'DONE → report + <schedule_stop/>; FAILED → fix & continue; else note progress.</schedule>\n'
+    '(b) Or a fixed cadence: <schedule every="30m" max="8">…</schedule>.\n'
+    "(c) Or, if you genuinely should NOT schedule this, say so plainly in ONE sentence and retract the "
+    "tracking claim.\n"
+    "Do NOT again describe a background loop without emitting the tag."
 )
 
-def _extract_plan_steps(body: str) -> list[str]:
-    steps = []
-    for ln in body.splitlines():
-        s = re.sub(r"^(?:\d+[.)]|[-*•])\s*", "", ln.strip()).strip()
-        if s:
-            steps.append(s)
-    return steps
+
+def _has_schedule_tag(text: str) -> bool:
+    return bool(text) and bool(SCHEDULE_RE.search(text) or SCHEDULE_STOP_RE.search(text))
 
 
-def _write_plan_file(path: Path, agent_id: str, steps: list[str]) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    lines = [
-        f"# Plan — {agent_id}",
-        "_(control-plane managed — updated via `<plan>`/`<step>` tags, do not edit by hand)_",
-        "",
-    ]
-    lines += [f"{i}. [ ] {s}" for i, s in enumerate(steps, 1)]
-    path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+def _looks_like_tracking_intent(text: str) -> bool:
+    return bool(text) and bool(_TRACK_INTENT_RE.search(text))
 
 
-def _set_plan_step(path: Path, n: int, status: str, note: str = "") -> bool:
-    mark = _PLAN_STATUS_MARK.get(status)
-    if mark is None:
+def _should_include_schedule_instructions(slug: str, agent_id: str, message: str) -> bool:
+    """Include the heavy schedule instructions (~524 tokens) only when relevant.
+    Include when:
+    - User message shows tracking/recurring/monitoring intent
+    - This is a scheduled fire (wrapped prompt)
+    - The agent currently has at least one active schedule (may need <schedule_stop>)
+    Never include when the scheduler is globally disabled — nothing can fire, so
+    the ~524-token guard is pure overhead (this is what the off switch promises).
+    """
+    if not _scheduler_enabled():
         return False
+    msg = (message or "").lower()
+    if _looks_like_tracking_intent(message or ""):
+        return True
+    if "scheduled check" in msg or "schedule_stop" in msg or "automatic recurring" in msg:
+        return True
     try:
-        lines = path.read_text(encoding="utf-8").splitlines()
-    except OSError:
-        return False
-    for i, ln in enumerate(lines):
-        m = _PLAN_LINE_RE.match(ln)
-        if m and int(m.group(1)) == n:
-            text = m.group(3)
-            if note:
-                text = f"{text} — {note}"
-            lines[i] = f"{m.group(1)}. [{mark}] {text}"
-            path.write_text("\n".join(lines) + "\n", encoding="utf-8")
-            return True
+        for t in db.list_scheduled_tasks(slug):
+            if t.get("agent_id") == agent_id and t.get("active"):
+                return True
+    except Exception:
+        pass
     return False
 
 
-def _read_plan(path: Path) -> Optional[dict]:
-    """Parse plan.md → progress summary for the stats panel / preamble."""
-    try:
-        lines = path.read_text(encoding="utf-8").splitlines()
-    except OSError:
+def _parse_duration(s: str) -> Optional[int]:
+    """'30m' / '2h' / '90s' / '1d' → seconds. None if unparseable."""
+    if not s:
         return None
-    steps = []
-    for ln in lines:
-        m = _PLAN_LINE_RE.match(ln)
-        if m:
-            steps.append({
-                "n": int(m.group(1)),
-                "status": _MARK_TO_STATUS.get(m.group(2), "pending"),
-                "text": m.group(3),
-            })
-    if not steps:
+    m = re.fullmatch(r"\s*(\d+)\s*([smhd]?)\s*", s, re.IGNORECASE)
+    if not m:
         return None
-    done = sum(1 for s in steps if s["status"] == "done")
-    cur = (next((s for s in steps if s["status"] in ("doing", "blocked")), None)
-           or next((s for s in steps if s["status"] == "pending"), None))
-    return {
-        "total": len(steps),
-        "done": done,
-        "blocked": any(s["status"] == "blocked" for s in steps),
-        "current": f'{cur["n"]}. {cur["text"]}' if cur else None,
-        "steps": steps,  # full list for the graph todo panel (reload path)
-    }
+    n = int(m.group(1))
+    unit = (m.group(2) or "s").lower()
+    return n * {"s": 1, "m": 60, "h": 3600, "d": 86400}[unit]
 
 
 # Size guard when injecting a worker result back into the orchestrator's prompt.
@@ -226,13 +235,7 @@ def api_project(slug: str):
             a["effort"] = ov["effort"]
     out["statuses"] = statuses
     out["positions"] = db.get_node_positions(slug)
-    plans = {}
-    for a in out["agents"]:
-        cwd_abs = projects.resolve_cwd(p["root"], a.get("cwd", "."))
-        pl = _read_plan(_agent_dir(p["root"], a, cwd_abs) / "state" / "plan.md")
-        if pl:
-            plans[a["id"]] = pl
-    out["plans"] = plans
+    out["schedules"] = [_schedule_public(t) for t in db.list_scheduled_tasks(slug)]
     return out
 
 
@@ -572,7 +575,6 @@ def api_project_stats(slug: str):
             "has_session": has_session,
             "num_sessions": len(sessions),
             "memory": _memory_info(root, a, cwd_abs),
-            "plan": _read_plan(_agent_dir(root, a, cwd_abs) / "state" / "plan.md"),
         }
     rollups = _write_children_rollups(root, project, stats)
     return {"stats": stats, "rollups_written": rollups}
@@ -1208,14 +1210,6 @@ def _session_preamble(project_root: str, agent: dict, cwd_abs: str) -> str:
         if ex:
             parts.append(f"### Your memory (`state/progress.md`, newest first)\n{ex}")
 
-    plan_p = adir / "state" / "plan.md"
-    if plan_p.is_file() and _read_plan(plan_p):
-        ex = _read_capped(plan_p, 1200)
-        if ex:
-            parts.append(
-                "### Unfinished plan (`state/plan.md`) — CONTINUE from the unfinished step, do not re-plan\n" + ex
-            )
-
     roll = adir / "state" / "children_status.json"
     if roll.is_file():
         try:
@@ -1249,6 +1243,68 @@ def _session_preamble(project_root: str, agent: dict, cwd_abs: str) -> str:
     )
 
 
+def _schedule_public(t: dict) -> dict:
+    """Trim a scheduled_tasks row to what the UI needs."""
+    return {
+        "id": t["id"], "agent_id": t["agent_id"], "kind": t["kind"],
+        "prompt": t["prompt"], "interval_seconds": t["interval_seconds"],
+        "until_goal": t.get("until_goal"), "next_run_at": t["next_run_at"],
+        "last_run_at": t.get("last_run_at"), "last_status": t.get("last_status"),
+        "runs_done": t["runs_done"], "max_runs": t.get("max_runs"),
+        "active": bool(t["active"]), "origin": t["origin"],
+    }
+
+
+def _build_schedule(slug: str, agent_id: str, attrs: dict, body: str,
+                    origin: str) -> tuple[Optional[dict], Optional[str]]:
+    """Create a scheduled_tasks row from <schedule>-style attrs (every/in/max/until).
+    Returns (row, None) on success or (None, error_message). No streaming side
+    effects — shared by the live tag parser and the REST endpoint."""
+    body = (body or "").strip()
+    if not body:
+        return None, "schedule: empty task body"
+    if not _scheduler_enabled():
+        return None, "scheduler is globally disabled"
+    until_goal = (attrs.get("until") or "").strip() or None
+    every = _parse_duration(attrs.get("every", ""))
+    delay = _parse_duration(attrs.get("in", ""))
+    max_attr = attrs.get("max")
+    try:
+        max_runs = int(max_attr) if max_attr not in (None, "") else None
+    except (ValueError, TypeError):
+        max_runs = None
+
+    now = time.time()
+    if every is not None or until_goal:
+        interval = max(every if every is not None else _SCHED_INTERVAL_FLOOR_S,
+                       _SCHED_INTERVAL_FLOOR_S)
+        kind = "until" if until_goal else "interval"
+        if kind == "until":
+            max_runs = max_runs or _SCHED_UNTIL_CEILING
+        t = db.create_scheduled_task(
+            slug, agent_id, body, kind, interval, now + interval,
+            until_goal=until_goal, max_runs=max_runs, origin=origin)
+    elif delay is not None:
+        t = db.create_scheduled_task(
+            slug, agent_id, body, "once", None, now + delay,
+            max_runs=1, origin=origin)
+    else:
+        return None, "schedule: need every=, in=, or until="
+    return t, None
+
+
+async def _register_schedule(slug: str, agent_id: str, attrs: dict, body: str,
+                             origin: str, emit) -> Optional[dict]:
+    """Tag-path wrapper: build the row, then emit schedule_created / error."""
+    t, err = _build_schedule(slug, agent_id, attrs, body, origin)
+    if err:
+        await emit({"type": "error", "agent": agent_id, "message": err + " — ignored"})
+        return None
+    await emit({"type": "schedule_created", "agent": agent_id,
+                "schedule": _schedule_public(t)})
+    return t
+
+
 async def _run_agent(
     slug: str,
     agent_id: str,
@@ -1264,6 +1320,7 @@ async def _run_agent(
     from streamed text and fire worker dispatches as background tasks.
     `chain` tracks ancestors to prevent infinite loops.
     """
+    turn_start = time.time()   # for the schedule_stop same-turn-echo guard
     found = projects.get_agent(slug, agent_id)
     if not found:
         await emit({"type": "error", "agent": agent_id, "message": f"agent {agent_id} not found"})
@@ -1307,11 +1364,14 @@ async def _run_agent(
     system_prompt = projects.resolve_system_prompt(project["root"], agent.get("system_prompt_file", ""))
     cwd = projects.resolve_cwd(project["root"], agent.get("cwd", "."))
     children = _get_children(project, agent_id)
+
     if children:
         system_prompt = (system_prompt or "") + _dispatch_instructions(children)
-    system_prompt = (system_prompt or "") + _PLAN_INSTRUCTIONS
+
+    if _should_include_schedule_instructions(slug, agent_id, message):
+        system_prompt = (system_prompt or "") + _SCHEDULE_INSTRUCTIONS
+
     _adir = _agent_dir(project["root"], agent, cwd)
-    plan_path = _adir / "state" / "plan.md"
 
     model = agent.get("model", "claude")
     stream_fn = get_stream(model)
@@ -1365,8 +1425,8 @@ async def _run_agent(
     assembled: list[str] = []
     buf = ""
     dispatched: set = set()
-    plan_seen: set = set()
-    step_seen: set = set()
+    sched_seen: set = set()
+    sched_stop_seen: set = set()
     final_status = "ok"
     new_chain = chain + (agent_id,)
 
@@ -1411,39 +1471,28 @@ async def _run_agent(
                         _dispatched_run(slug, agent_id, target, task, emit, tracker, new_chain)
                     )
                     tracker.append(task_handle)
-                # plan / step tags → persist to state/plan.md + notify graph
-                for m in PLAN_RE.finditer(buf):
-                    if m.start() in plan_seen:
+                # schedule tags → register recurring/deferred re-invocation
+                for m in SCHEDULE_RE.finditer(buf):
+                    if m.start() in sched_seen:
                         continue
-                    plan_seen.add(m.start())
-                    steps = _extract_plan_steps(m.group(1))
-                    if steps:
-                        try:
-                            _write_plan_file(plan_path, agent_id, steps)
-                            await emit({"type": "plan_updated", "agent": agent_id,
-                                        "total": len(steps),
-                                        "steps": [{"n": i, "text": s, "status": "pending"}
-                                                  for i, s in enumerate(steps, 1)]})
-                        except OSError:
-                            pass
-                for m in STEP_RE.finditer(buf):
-                    if m.start() in step_seen:
+                    sched_seen.add(m.start())
+                    attrs = {k.lower(): v for k, v in _SCHED_ATTR_RE.findall(m.group(1) or "")}
+                    await _register_schedule(slug, agent_id, attrs, m.group(2), "agent", emit)
+                # schedule_stop → a goal loop self-terminates its own schedule(s)
+                for m in SCHEDULE_STOP_RE.finditer(buf):
+                    if m.start() in sched_stop_seen:
                         continue
-                    step_seen.add(m.start())
-                    attrs = {k.lower(): v for k, v in _STEP_ATTR_RE.findall(m.group(2) or "")}
-                    status = (attrs.get("status") or "").lower()
-                    if status not in _PLAN_STATUS_MARK:
-                        continue
-                    note = (m.group(3) or "").strip()
-                    if len(note) > 200:
-                        note = note[:200] + "…"
-                    if _set_plan_step(plan_path, int(m.group(1)), status, note):
-                        # `agent` field stays the OWNER (event routing); `step_agent`
-                        # is the dispatch target this step links to, for auto-tick.
-                        await emit({"type": "plan_step", "agent": agent_id,
-                                    "n": int(m.group(1)), "status": status,
-                                    "step_agent": attrs.get("agent") or None,
-                                    "note": note[:120]})
+                    sched_stop_seen.add(m.start())
+                    sattrs = {k.lower(): v for k, v in _SCHED_ATTR_RE.findall(m.group(1) or "")}
+                    reason = (sattrs.get("reason") or (m.group(2) or "")).strip()
+                    # created_before=turn_start: a stop tag only ends loops that
+                    # pre-date this turn, so quoting/echoing the example in the same
+                    # message that creates a schedule does NOT instantly kill it.
+                    stopped = db.deactivate_agent_schedules(
+                        slug, agent_id, kind="until", created_before=turn_start)
+                    for sid in stopped:
+                        await emit({"type": "schedule_done", "agent": agent_id,
+                                    "id": sid, "reason": reason or "goal reached"})
                 await emit({"type": "delta", "agent": agent_id, "text": text})
             elif etype == "meta":
                 data = evt.get("data") or {}
@@ -1668,7 +1717,7 @@ async def _auto_compact_if_needed(slug: str, agent_id: str, emit) -> bool:
 # per-run buffer plus live subscriber queues. The SSE response returned by
 # /chat is merely the FIRST subscriber: closing the browser only unsubscribes —
 # the turn keeps running to completion and persists its results (messages
-# table, dispatch ledger, plan.md) exactly as if the tab had stayed open.
+# table, dispatch ledger) exactly as if the tab had stayed open.
 # Reopening the UI re-attaches via GET /stream with full event replay (seq 0).
 # Stopping is now an explicit POST /stop, never a side effect of disconnect.
 
@@ -1766,25 +1815,15 @@ _SSE_HEADERS = {
 }
 
 
-@app.post("/api/projects/{slug}/agents/{agent_id}/chat")
-async def api_chat(slug: str, agent_id: str, body: ChatBody):
-    found = projects.get_agent(slug, agent_id)
-    if not found:
-        raise HTTPException(404, "agent not found")
-    _prune_runs()
-    existing = _active_run(slug, agent_id)
-    if existing:
-        raise HTTPException(409, f"a turn is already running for {agent_id} (run {existing.id})")
-
+def _start_run(slug: str, agent_id: str, message: str, *,
+               origin: str = "user", grok_options: Optional[dict] = None) -> _Run:
+    """Create + launch a detached run for one agent turn. Shared by POST /chat and
+    the scheduler — a scheduled fire is identical to a user turn. Caller is
+    responsible for the one-active-run-per-agent policy (api_chat 409s, the
+    scheduler skips). Returns the _Run; subscribe to it for the SSE stream."""
     run = _Run(slug, agent_id)
     _RUNS[run.id] = run
     emit = run.publish
-
-    grok_options = {
-        "best_of_n": body.best_of_n,
-        "check_loop": body.check_loop,
-        "memory_mode": body.memory_mode,
-    } if (body.best_of_n or body.check_loop or body.memory_mode) else None
 
     async def driver():
         # Multi-round continuation: after each wave of dispatches lands in the
@@ -1795,10 +1834,12 @@ async def api_chat(slug: str, agent_id: str, body: ChatBody):
         # just don't trigger another continuation.
         all_tasks: list = []
         cur: list = []
+        saw_sched = False   # did any turn this run emit a <schedule>/<schedule_stop> tag?
         try:
             await _auto_compact_if_needed(slug, agent_id, emit)
-            await _run_agent(slug, agent_id, body.message, emit, cur,
-                             grok_options=grok_options)
+            txt = await _run_agent(slug, agent_id, message, emit, cur,
+                                   grok_options=grok_options)
+            saw_sched = saw_sched or _has_schedule_tag(txt)
             rounds = 0
             while cur and rounds < _MAX_CONT_ROUNDS:
                 await asyncio.gather(*cur, return_exceptions=True)
@@ -1825,10 +1866,25 @@ async def api_chat(slug: str, agent_id: str, body: ChatBody):
                     )
                 )
                 cur = []
-                await _run_agent(slug, agent_id, synth, emit, cur)
+                txt = await _run_agent(slug, agent_id, synth, emit, cur)
+                saw_sched = saw_sched or _has_schedule_tag(txt)
             if cur:
                 await asyncio.gather(*cur, return_exceptions=True)
                 all_tasks.extend(cur)
+
+            # Schedule safety-net — STRICTLY one extra turn, only when the user asked
+            # to track/monitor but no <schedule> tag was emitted the whole run. Tightly
+            # gated (origin user-only, intent regex, not already scheduled) so it can't
+            # loop or add steady-state load: it fires at most once per user turn, never
+            # on scheduled fires or continuations. Without it, the agent's "tracking is
+            # active" narration silently registers nothing — the failure we're fixing.
+            if (origin == "user" and not saw_sched
+                    and _looks_like_tracking_intent(message)):
+                ncur: list = []
+                await _run_agent(slug, agent_id, _SCHEDULE_NUDGE, emit, ncur)
+                if ncur:
+                    await asyncio.gather(*ncur, return_exceptions=True)
+                    all_tasks.extend(ncur)
         except asyncio.CancelledError:
             pending = [t for t in all_tasks + cur if not t.done()]
             for t in pending:
@@ -1846,6 +1902,26 @@ async def api_chat(slug: str, agent_id: str, body: ChatBody):
             run.finish()
 
     run.task = asyncio.create_task(driver())
+    return run
+
+
+@app.post("/api/projects/{slug}/agents/{agent_id}/chat")
+async def api_chat(slug: str, agent_id: str, body: ChatBody):
+    found = projects.get_agent(slug, agent_id)
+    if not found:
+        raise HTTPException(404, "agent not found")
+    _prune_runs()
+    existing = _active_run(slug, agent_id)
+    if existing:
+        raise HTTPException(409, f"a turn is already running for {agent_id} (run {existing.id})")
+
+    grok_options = {
+        "best_of_n": body.best_of_n,
+        "check_loop": body.check_loop,
+        "memory_mode": body.memory_mode,
+    } if (body.best_of_n or body.check_loop or body.memory_mode) else None
+
+    run = _start_run(slug, agent_id, body.message, origin="user", grok_options=grok_options)
 
     return StreamingResponse(
         _run_subscriber_sse(run, since=0),
@@ -1892,6 +1968,194 @@ async def api_stop(slug: str, agent_id: str):
         return {"stopped": False, "reason": "no active run"}
     run.task.cancel()
     return {"stopped": True, "run_id": run.id}
+
+
+class ScheduleBody(BaseModel):
+    agent_id: str
+    prompt: str
+    # one of: every (recurring), in (one-shot delay), until (goal loop, needs every)
+    every: Optional[str] = None
+    delay: Optional[str] = None      # maps to the `in=` attr
+    until: Optional[str] = None
+    max: Optional[int] = None
+
+
+@app.get("/api/projects/{slug}/schedules")
+def api_list_schedules(slug: str):
+    if not projects.get_project(slug):
+        raise HTTPException(404, "project not found")
+    return {"schedules": [_schedule_public(t) for t in db.list_scheduled_tasks(slug)]}
+
+
+@app.post("/api/projects/{slug}/schedules")
+def api_create_schedule(slug: str, body: ScheduleBody):
+    if not projects.get_project(slug):
+        raise HTTPException(404, "project not found")
+    if not projects.get_agent(slug, body.agent_id):
+        raise HTTPException(404, "agent not found")
+    if not _scheduler_enabled():
+        raise HTTPException(403, "scheduler is globally disabled")
+    attrs = {"every": body.every or "", "in": body.delay or "",
+             "until": body.until or "", "max": body.max}
+    t, err = _build_schedule(slug, body.agent_id, attrs, body.prompt, "user")
+    if err:
+        raise HTTPException(400, err)
+    return {"schedule": _schedule_public(t)}
+
+
+@app.patch("/api/projects/{slug}/schedules/{task_id}")
+def api_patch_schedule(slug: str, task_id: int, active: bool):
+    t = db.get_scheduled_task(task_id)
+    if not t or t["project_slug"] != slug:
+        raise HTTPException(404, "schedule not found")
+    # resuming a recurring schedule whose next_run_at is in the past → fire next tick
+    updated = db.set_scheduled_active(task_id, active)
+    return {"schedule": _schedule_public(updated)}
+
+
+@app.delete("/api/projects/{slug}/schedules/{task_id}")
+def api_delete_schedule(slug: str, task_id: int):
+    t = db.get_scheduled_task(task_id)
+    if not t or t["project_slug"] != slug:
+        raise HTTPException(404, "schedule not found")
+    db.delete_scheduled_task(task_id)
+    return {"deleted": True, "id": task_id}
+
+
+@app.get("/api/scheduler/enabled")
+def api_get_scheduler_enabled():
+    return {"enabled": _scheduler_enabled()}
+
+
+@app.post("/api/scheduler/enabled")
+def api_set_scheduler_enabled(payload: dict = Body(default={"enabled": True})):
+    en = bool(payload.get("enabled", True)) if isinstance(payload, dict) else True
+    was = _scheduler_enabled()
+    db.set_setting("scheduler_enabled", "1" if en else "0")
+    if en and not was:
+        # Re-enabling: never replay fires that came due while disabled. Push
+        # overdue recurring tasks to their next forward cycle; retire overdue
+        # one-shots. Only the 0→1 transition triggers this.
+        _skip_overdue_on_resume()
+    return {"enabled": _scheduler_enabled()}
+
+
+# ---------- Scheduler loop (fires due schedules; see docs/scheduler-spec.md) ----------
+#
+# A fire = _start_run with a wrapped prompt — identical to a /chat turn, so it
+# streams + persists and is picked up by the UI's /runs poll. The loop only
+# fires; the per-fire task awaits the run and computes the next fire time.
+
+_sched_inflight: set[int] = set()
+
+
+def _wrap_schedule_prompt(t: dict, n: int) -> str:
+    head = f"[SCHEDULED CHECK #{n}" + (f"/{t['max_runs']}" if t.get("max_runs") else "") + "] "
+    body = (t["prompt"] or "").strip()
+    if t["kind"] == "until":
+        return (
+            head + body + "\n\n"
+            f"(Goal: {t.get('until_goal')}.) This is an automatic recurring check by the control plane. "
+            "If the goal is COMPLETE → give the final report and emit "
+            '<schedule_stop reason="..."/> to end the loop. If something FAILED → fix it and continue. '
+            "If still in progress → record concrete progress to state/progress.md (so a fresh session can "
+            "recover) and you will be re-invoked next interval. Do NOT emit a new <schedule> tag."
+        )
+    return (head + body + "\n\n"
+            "(Automatic scheduled run by the control plane. Do NOT emit a new <schedule> tag.)")
+
+
+async def _run_scheduled_fire(t: dict) -> None:
+    tid, slug, agent_id = t["id"], t["project_slug"], t["agent_id"]
+    try:
+        n = t["runs_done"] + 1
+        run = _start_run(slug, agent_id, _wrap_schedule_prompt(t, n), origin=f"schedule:{tid}")
+        await run.publish({"type": "schedule_fired", "agent": agent_id, "id": tid,
+                           "run": run.id, "n": n, "max": t.get("max_runs")})
+        try:
+            await run.task
+        except asyncio.CancelledError:
+            pass
+        status = db.get_last_status(slug, agent_id) or "ok"
+        cur = db.get_scheduled_task(tid)
+        stopped_mid = (cur is None) or (not cur["active"])   # e.g. <schedule_stop> this round
+        reached_ceiling = bool(t.get("max_runs")) and n >= t["max_runs"]
+        if t["kind"] == "once" or stopped_mid or reached_ceiling:
+            db.record_scheduled_fire(tid, None, status)
+            if reached_ceiling and t["kind"] == "until" and not stopped_mid:
+                await run.publish({"type": "schedule_exhausted", "agent": agent_id,
+                                   "id": tid, "n": n})
+            elif t["kind"] == "once":
+                await run.publish({"type": "schedule_done", "agent": agent_id,
+                                   "id": tid, "reason": "one-shot complete"})
+        else:
+            interval = t["interval_seconds"] or _SCHED_INTERVAL_FLOOR_S
+            db.record_scheduled_fire(tid, time.time() + interval, status)
+    except Exception as e:  # never let one bad fire kill the loop
+        print(f"[scheduler] fire {tid} error: {e}")
+    finally:
+        _sched_inflight.discard(tid)
+
+
+def _scheduler_enabled() -> bool:
+    return db.get_setting("scheduler_enabled", "1") == "1"
+
+
+def _skip_overdue_on_resume() -> None:
+    """Called on the disabled→enabled transition. Anything that came due while
+    the scheduler was off must NOT be replayed: push overdue interval/until
+    tasks to `now + interval` (resume the next cycle only), retire overdue
+    one-shots (their moment has passed)."""
+    now = time.time()
+    pushed = retired = 0
+    for t in db.get_due_scheduled_tasks(now):   # active AND next_run_at <= now
+        if t.get("kind") == "once":
+            db.set_scheduled_active(t["id"], False)
+            retired += 1
+        else:
+            interval = t.get("interval_seconds") or _SCHED_INTERVAL_FLOOR_S
+            db.defer_scheduled_task(t["id"], now + interval)
+            pushed += 1
+    if pushed or retired:
+        print(f"[scheduler] resume: deferred {pushed} overdue task(s) to next "
+              f"cycle, retired {retired} one-shot(s)")
+
+
+async def _scheduler_tick() -> None:
+    if not _scheduler_enabled():
+        return
+    now = time.time()
+    fired_agents: set = set()
+    for t in db.get_due_scheduled_tasks(now):
+        tid, slug, agent_id = t["id"], t["project_slug"], t["agent_id"]
+        if tid in _sched_inflight:
+            continue
+        # zombie guard: untouched too long → retire
+        if now - (t.get("updated_at") or t["created_at"]) > _SCHED_ZOMBIE_DAYS * 86400:
+            db.set_scheduled_active(tid, False)
+            continue
+        # agent removed from the project → retire
+        if not projects.get_agent(slug, agent_id):
+            db.set_scheduled_active(tid, False)
+            continue
+        # one active run per agent: skip-on-busy (and ≤1 fire/agent/tick) → short retry
+        key = (slug, agent_id)
+        if key in fired_agents or _active_run(slug, agent_id):
+            interval = t["interval_seconds"] or _SCHED_INTERVAL_FLOOR_S
+            db.defer_scheduled_task(tid, now + min(interval, 120))
+            continue
+        fired_agents.add(key)
+        _sched_inflight.add(tid)
+        asyncio.create_task(_run_scheduled_fire(t))
+
+
+async def _scheduler_loop() -> None:
+    while True:
+        await asyncio.sleep(30)
+        try:
+            await _scheduler_tick()
+        except Exception as e:
+            print(f"[scheduler] tick error: {e}")
 
 
 _COMPACT_PROMPT = (
@@ -2227,6 +2491,11 @@ async def _terminal_reaper():
 @app.on_event("startup")
 async def _start_terminal_reaper():
     asyncio.create_task(_terminal_reaper())
+
+
+@app.on_event("startup")
+async def _start_scheduler():
+    asyncio.create_task(_scheduler_loop())
 
 
 @app.on_event("shutdown")

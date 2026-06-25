@@ -23,24 +23,24 @@ compound `&&`/`||`, exact stderr redirects, SLURM
 (`sbatch`/`squeue`/`sacct`/`scancel`/`scontrol`), `module load`,
 write ops (`mkdir`/`chmod`/`rm`/`mv`), one-shot `python -c`, env exports.
 
-## AAS — Grok delegate (research / verify / survey)
+## Consensus MCP — academic paper search (peer-reviewed)
 
-`aas` is a CLI that uses Grok for tasks Grok does better than Claude: realtime web,
-fresh-eyes review, adversarial red-teaming, multi-source surveys.
+Search 200M+ peer-reviewed papers (Semantic Scholar, PubMed, Scopus, ArXiv) via the
+`mcp__consensus__search` MCP tool. Call it directly as a tool — no CLI needed.
 
-```bash
-aas research "<query>"     # find papers, latest tech, realtime web + X
-aas verify "<claim>"       # cross-check a technical claim (independent model)
-aas survey "<topic>"       # 15-30 source literature survey
-aas redteam <path-or-desc> # adversarial critique of a design/spec
-aas review <path>          # code review from another perspective
-aas reason "<question>"    # hard STEM/math reasoning (no web needed)
-aas ask "<prompt>"         # free-form, when none of the above fits
-```
+Key parameters (all optional except `query`):
+- `query` — use academic terminology, be specific
+- `year_min` / `year_max` — only when user explicitly wants a date range
+- `exclude_preprints: true` — only when user asks for peer-reviewed only
+- Do NOT set `domain`, `study_types`, or other filters unless user explicitly requests them
 
-When to use: finding papers/DOIs, verifying technical claims, researching the latest, critiquing specs.
-When NOT to use: file/code operations (Read/Edit/Bash), running experiments (Bash+SLURM).
-`aas` failing → run `aas doctor`.
+When to use: finding papers/DOIs, literature survey, verifying a paper exists,
+  reviewing state-of-the-art on a topic.
+When NOT to use: general web/realtime news, code-level questions, non-academic claims.
+
+For general web research: use `WebSearch` (already permitted in settings).
+For adversarial review / code critique / hard reasoning: use Claude's built-in
+  capabilities (Read + analysis — no external tool needed).
 
 ## Git / filesystem safety (no cross-scope destructive ops)
 

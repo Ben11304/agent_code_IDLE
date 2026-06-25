@@ -13,7 +13,7 @@ const state = {
   viewBoxes: {},          // slug -> {x,y,w,h}
   graphBounds: {},        // slug -> {x,y,w,h}
   nodePositions: {},      // slug -> {agentId: {x,y}} — manual layout, persisted in db
-  plans: {},              // slug -> {agentId: {total, steps:[{n,text,status,agent?}]}} — todo panels
+  schedules: {},          // slug -> [ {id, agent_id, kind, next_run_at, ...} ] — recurring/deferred tasks
   tree: {},               // slug -> {expanded, cache, selectedAbs, flat}
   windows: [],            // [{id, projectSlug, type, agentId?, x, y, w, h, z, hidden, el, ...state}]
   zTop: 10,
@@ -54,8 +54,201 @@ async function init() {
   bindSkillsPanel();
   loadSkills();
   bindProcDropdown();
+  bindScheduleDropdown();
   bindTerminalDock();
   startUsageWidget();
+  // The load-bearing part of the scheduler: a scheduled fire starts a server-side
+  // run with no browser attached. Poll /runs so it auto-opens + streams instead of
+  // running silently (the exact failure the scheduler exists to fix).
+  setInterval(pollActiveRunsActiveTab, 20000);
+  setInterval(refreshSchedulesActiveTab, 30000);
+}
+
+// ---------- Scheduler (recurring / deferred / goal-driven agent turns) ----------
+
+function pollActiveRunsActiveTab() {
+  if (state.activeTab) reattachActiveRuns(state.activeTab);
+}
+
+async function refreshSchedulesActiveTab() {
+  const slug = state.activeTab;
+  if (!slug) return;
+  try {
+    const r = await fetch(`/api/projects/${slug}/schedules`);
+    if (!r.ok) return;
+    state.schedules[slug] = (await r.json()).schedules || [];
+  } catch { return; }
+  renderScheduleDropdown();
+  rerenderGraphsForSlug(slug);
+}
+
+function activeSchedulesFor(slug, agentId) {
+  return (state.schedules[slug] || []).filter(
+    (s) => s.active && s.agent_id === agentId);
+}
+
+function fmtCountdown(ts) {
+  const secs = Math.round(ts - Date.now() / 1000);
+  if (secs <= 0) return "due";
+  const h = Math.floor(secs / 3600), m = Math.floor((secs % 3600) / 60), s = secs % 60;
+  if (h >= 1) return `${h}h${m ? m + "m" : ""}`;
+  if (m >= 1) return `${m}m`;
+  return `${s}s`;
+}
+
+function schedLabel(s) {
+  if (s.kind === "once") return "once";
+  const every = s.interval_seconds >= 3600
+    ? Math.round(s.interval_seconds / 3600) + "h"
+    : Math.round(s.interval_seconds / 60) + "m";
+  if (s.kind === "until") return `every ${every} · until`;
+  return `every ${every}${s.max_runs ? ` · ${s.runs_done}/${s.max_runs}` : ""}`;
+}
+
+function bindScheduleDropdown() {
+  const btn = $("schedBtn"), dd = $("schedDropdown");
+  if (!btn || !dd) return;
+  const open = () => {
+    dd.hidden = false; btn.classList.add("active");
+    refreshSchedulesActiveTab();
+    state._schedPoll = setInterval(updateScheduleCountdowns, 1000); // live countdown only
+  };
+  const hide = () => {
+    dd.hidden = true; btn.classList.remove("active");
+    clearInterval(state._schedPoll); state._schedPoll = null;
+  };
+  btn.onclick = () => dd.hidden ? open() : hide();
+  document.addEventListener("mousedown", (e) => {
+    if (dd.hidden) return;
+    if (!dd.contains(e.target) && e.target !== btn && !btn.contains(e.target)) hide();
+  });
+}
+
+async function renderScheduleDropdown() {
+  const dd = $("schedDropdown");
+  if (!dd || dd.hidden) return;
+  const slug = state.activeTab;
+  const all = (state.schedules[slug] || []);
+  const active = all.filter((s) => s.active);
+  const btn = $("schedBtn");
+  if (btn) {
+    let cnt = btn.querySelector(".sched-count");
+    if (!cnt) { cnt = document.createElement("span"); cnt.className = "sched-count"; btn.appendChild(cnt); }
+    cnt.textContent = active.length || "";
+    cnt.style.display = active.length ? "" : "none";
+  }
+  // fetch scheduler global state
+  let schedEnabled = true;
+  try {
+    const r = await fetch(`/api/scheduler/enabled`);
+    if (r.ok) schedEnabled = (await r.json()).enabled;
+  } catch {}
+  const toggleHtml =
+    `<button id="schedPowerBtn" class="sched-power ${schedEnabled ? "on" : "off"}">`
+    + `Scheduler: ${schedEnabled ? "ON" : "OFF"}</button>`;
+  let html = `<div class="sched-head">`
+    + toggleHtml
+    + `<span>Schedules · ${active.length} active</span>`
+    + `<button class="sched-refresh">↻</button></div>`;
+  if (!schedEnabled) {
+    html += `<div class="sched-empty" style="color:var(--run)">Scheduler disabled globally (toggle above to enable).</div>`;
+  } else if (!all.length) {
+    html += `<div class="sched-empty">no schedules. Use <code>/track 30m &lt;task&gt;</code> or <code>/schedule</code> in a chat.</div>`;
+  } else {
+    for (const s of all) {
+      const cls = s.kind === "until" ? "until" : (s.kind === "once" ? "once" : "interval");
+      const when = s.active ? `next ${fmtCountdown(s.next_run_at)}` : "stopped";
+      html += `<div class="sched-row ${s.active ? "" : "inactive"}" data-id="${s.id}">`
+        + `<span class="sr-dot ${cls}"></span>`
+        + `<span class="sr-agent">${escapeHtml(s.agent_id)}</span>`
+        + `<span class="sr-kind" title="${escapeHtml(s.until_goal || "")}">${escapeHtml(schedLabel(s))}</span>`
+        + `<span class="sr-when">${when}</span>`
+        + `<span class="sr-task" title="${escapeHtml(s.prompt || "")}">${escapeHtml((s.prompt || "").slice(0, 60))}</span>`
+        + `<span class="sr-actions">`
+        + (s.active ? `<button class="sr-pause" title="pause">⏸</button>`
+                    : `<button class="sr-resume" title="resume">▶</button>`)
+        + `<button class="sr-del" title="delete">✕</button></span>`
+        + `</div>`;
+    }
+  }
+  dd.innerHTML = html;
+  // Scheduler on/off — a plain <button> using the SAME reliable .onclick path as
+  // the pause/resume/delete buttons below. The old iOS-switch (a display:none
+  // checkbox toggled via <label> activation) never registered the click.
+  const powerBtn = dd.querySelector("#schedPowerBtn");
+  if (powerBtn) {
+    powerBtn.addEventListener("mousedown", (e) => e.stopPropagation()); // keep dropdown open
+    powerBtn.addEventListener("click", async (e) => {
+      e.stopPropagation();
+      const next = !schedEnabled;          // schedEnabled = state fetched this render
+      powerBtn.disabled = true;
+      powerBtn.textContent = "…";
+      try {
+        const r = await fetch(`/api/scheduler/enabled`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ enabled: next })
+        });
+        if (!r.ok) throw new Error("http " + r.status);
+      } catch (err) {
+        console.error("scheduler toggle failed:", err);
+      }
+      renderScheduleDropdown();             // re-fetch authoritative state + rebind
+    });
+  }
+  dd.querySelector(".sched-refresh") && (dd.querySelector(".sched-refresh").onclick = refreshSchedulesActiveTab);
+  dd.querySelectorAll(".sched-row").forEach((row) => {
+    const id = row.dataset.id;
+    const pause = row.querySelector(".sr-pause"), resume = row.querySelector(".sr-resume"),
+          del = row.querySelector(".sr-del");
+    if (pause) pause.onclick = () => patchSchedule(slug, id, false);
+    if (resume) resume.onclick = () => patchSchedule(slug, id, true);
+    if (del) del.onclick = () => deleteSchedule(slug, id);
+  });
+}
+
+function updateScheduleCountdowns() {
+  const dd = $("schedDropdown");
+  if (!dd || dd.hidden) return;
+  const slug = state.activeTab;
+  const all = (state.schedules[slug] || []);
+  dd.querySelectorAll(".sched-row").forEach((row) => {
+    const id = row.dataset.id;
+    const s = all.find(x => String(x.id) === id);
+    if (!s) return;
+    const whenEl = row.querySelector(".sr-when");
+    if (whenEl) {
+      const when = s.active ? `next ${fmtCountdown(s.next_run_at)}` : "stopped";
+      whenEl.textContent = when;
+    }
+  });
+}
+
+async function patchSchedule(slug, id, active) {
+  try { await fetch(`/api/projects/${slug}/schedules/${id}?active=${active}`, { method: "PATCH" }); }
+  catch {}
+  await refreshSchedulesActiveTab();
+}
+
+async function deleteSchedule(slug, id) {
+  try { await fetch(`/api/projects/${slug}/schedules/${id}`, { method: "DELETE" }); }
+  catch {}
+  await refreshSchedulesActiveTab();
+}
+
+// transient corner toast (scheduled fires surface here even with chats closed)
+function showToast(msg, kind) {
+  let host = $("toastHost");
+  if (!host) {
+    host = document.createElement("div");
+    host.id = "toastHost"; host.className = "toast-host";
+    document.body.appendChild(host);
+  }
+  const t = document.createElement("div");
+  t.className = "toast" + (kind ? " toast-" + kind : "");
+  t.textContent = msg;
+  host.appendChild(t);
+  setTimeout(() => { t.classList.add("leaving"); setTimeout(() => t.remove(), 400); }, 5200);
 }
 
 // ---------- Skills panel (right side, manual use) ----------
@@ -451,11 +644,7 @@ async function openProject(slug) {
     const r = await fetch(`/api/projects/${slug}`);
     state.projectCache[slug] = await r.json();
     state.nodePositions[slug] = { ...(state.projectCache[slug].positions || {}) };
-    state.plans[slug] = {};
-    const plans0 = state.projectCache[slug].plans || {};
-    for (const id in plans0) {
-      state.plans[slug][id] = { total: plans0[id].total, steps: plans0[id].steps || [] };
-    }
+    state.schedules[slug] = state.projectCache[slug].schedules || [];
   }
   renderTabs();
   renderProjectList();
@@ -862,65 +1051,7 @@ function renderGraphInWindow(w) {
   });
   deferred.forEach((g) => svg.appendChild(g));
 
-  // Todo panels: rendered beside the SELECTED (chat open) or RUNNING node only,
-  // so a busy canvas stays legible. Every node still shows a done/total badge.
-  w._todoPanels = [];
-  proj.agents.forEach((a) => {
-    const pos = saved[a.id];
-    if (!pos) return;
-    const plan = (state.plans[proj.slug] || {})[a.id];
-    if (!plan || !(plan.steps || []).length) return;
-    const status = (proj.statuses && proj.statuses[a.id]) || "idle";
-    const isOpenChat = state.windows.some(
-      (x) => x.type === "chat" && x.projectSlug === proj.slug && x.agentId === a.id);
-    if (!isOpenChat && status !== "running") return;
-    const fo = buildTodoPanel(a, pos, sizes[a.id], plan);
-    svg.appendChild(fo);
-    w._todoPanels.push({ el: fo, agentId: a.id });
-  });
-
   applyViewBox(svg, proj.slug, w);
-}
-
-const TODO_PANEL_W = 200, TODO_GAP = 12;
-
-function buildTodoPanel(a, pos, size, plan) {
-  const ns = "http://www.w3.org/2000/svg";
-  const steps = plan.steps || [];
-  const rowH = 22, headH = 28, padV = 10;
-  const fo = document.createElementNS(ns, "foreignObject");
-  fo.setAttribute("x", pos.x + size.w + TODO_GAP);
-  fo.setAttribute("y", pos.y);
-  fo.setAttribute("width", TODO_PANEL_W);
-  fo.setAttribute("height", headH + steps.length * rowH + padV);
-  fo.setAttribute("overflow", "visible");
-  const done = steps.filter((s) => s.status === "done").length;
-  const rows = steps.map((s) => {
-    const st = s.status || "pending";
-    const ico = st === "done" ? "✓" : st === "doing" ? "⏳" : st === "blocked" ? "⛔" : "☐";
-    const tag = s.agent ? `<span class="td-agent">→${escapeHtml(s.agent)}</span>` : "";
-    return `<div class="td-row td-${st}"><span class="td-ico">${ico}</span>`
-      + `<span class="td-n">${s.n}</span>`
-      + `<span class="td-text" title="${escapeHtml(s.text || "")}">${escapeHtml(s.text || "")}</span>`
-      + tag + `</div>`;
-  }).join("");
-  fo.innerHTML =
-    `<div xmlns="http://www.w3.org/1999/xhtml" class="todo-panel">`
-    + `<div class="td-head">TODO <span class="td-count">${done}/${steps.length}</span></div>`
-    + `<div class="td-list">${rows}</div></div>`;
-  return fo;
-}
-
-// Reposition todo panels during a node drag (mirrors updateEdgesLive).
-function updateTodoPanelsLive(w) {
-  const saved = state.nodePositions[w.projectSlug] || {};
-  const sizes = w._sizes || {};
-  (w._todoPanels || []).forEach(({ el, agentId }) => {
-    const pos = saved[agentId], size = sizes[agentId];
-    if (!pos || !size) return;
-    el.setAttribute("x", pos.x + size.w + TODO_GAP);
-    el.setAttribute("y", pos.y);
-  });
 }
 
 function autoLayoutPositions(agents, W, nodeW, nodeH) {
@@ -973,7 +1104,7 @@ function updateEdgesLive(w) {
 }
 
 // Expanded-panel geometry (viewBox units, matches collapsed node width baseline).
-const PANEL_W = 212, PANEL_H = 284; // headroom for warn rows + plan progress rows
+const PANEL_W = 212, PANEL_H = 284; // headroom for warn rows
 
 function buildAgentNode(proj, a, pos, nodeW, nodeH, gw) {
   const ns = "http://www.w3.org/2000/svg";
@@ -984,7 +1115,6 @@ function buildAgentNode(proj, a, pos, nodeW, nodeH, gw) {
   const key = `${proj.slug}:${a.id}`;
   const expanded = state.expandedNodes.has(key);
   const stats = (state.statsCache[proj.slug] || {})[a.id];
-  const plan = (state.plans[proj.slug] || {})[a.id];
 
   const g = document.createElementNS(ns, "g");
   const fo = document.createElementNS(ns, "foreignObject");
@@ -1002,7 +1132,7 @@ function buildAgentNode(proj, a, pos, nodeW, nodeH, gw) {
 
   fo.innerHTML =
     `<div xmlns="http://www.w3.org/1999/xhtml" class="${cls}" style="min-height:${nodeH}px">`
-    + nodeCardHtml(a, status, expanded, stats, plan) + `</div>`;
+    + nodeCardHtml(a, status, expanded, stats, proj.slug) + `</div>`;
   g.appendChild(fo);
 
   const card = fo.querySelector(".agent-card");
@@ -1020,12 +1150,20 @@ function buildAgentNode(proj, a, pos, nodeW, nodeH, gw) {
   return g;
 }
 
-function nodeCardHtml(a, status, expanded, stats, plan) {
+function nodeCardHtml(a, status, expanded, stats, slug) {
   const chev = expanded ? "▾" : "▸";
+  const scheds = slug ? activeSchedulesFor(slug, a.id) : [];
+  let schedBadge = "";
+  if (scheds.length) {
+    const next = scheds.reduce((m, s) => Math.min(m, s.next_run_at), Infinity);
+    const title = scheds.map((s) => `${schedLabel(s)} · next ${fmtCountdown(s.next_run_at)}`).join("\n");
+    schedBadge = `<span class="ac-sched" title="${escapeHtml(title)}">🕒 ${fmtCountdown(next)}</span>`;
+  }
   let html = `
     <div class="ac-head">
       <span class="ac-dot" style="background:${statusColor(status)}"></span>
       <span class="ac-id">${escapeHtml(a.id)}</span>
+      ${schedBadge}
       <span class="ac-expand" title="${expanded ? "collapse" : "expand"}">${chev}</span>
     </div>
     <div class="ac-model">${escapeHtml(modelLabel(a))}</div>`;
@@ -1061,7 +1199,6 @@ function nodeBodyHtml(a, stats) {
     <div class="ac-row"><span class="ac-k">memory</span><span class="ac-v${memStale ? " ac-stale" : ""}">${memTime}${memStale ? " ⚠" : ""}</span></div>
     ${memStale ? `<div class="ac-warn">⚠ recent activity but memory not written</div>` : ""}
     ${memHead ? `<div class="ac-headline" title="${memHead}">${memHead}</div>` : ""}
-    ${stats.plan && stats.plan.current ? `<div class="ac-headline" title="${escapeHtml(stats.plan.current)}">▸ ${escapeHtml(stats.plan.current)}</div>` : ""}
     <div class="ac-row"><span class="ac-k">activity</span><span class="ac-v">${lastAct}</span></div>
     <div class="ac-row"><span class="ac-k">messages</span><span class="ac-v">${stats.message_count}</span></div>
     <div class="ac-row"><span class="ac-k">effort</span><span class="ac-v">${effort}</span></div>
@@ -1122,7 +1259,6 @@ function _onNodeDragMove(e) {
   d.fo.setAttribute("x", pos.x);
   d.fo.setAttribute("y", pos.y);
   updateEdgesLive(d.gw);
-  updateTodoPanelsLive(d.gw);
 }
 
 function _endNodeDrag() {
@@ -1860,6 +1996,10 @@ const CHAT_COMMANDS = [
   { cmd: "/dispatch", adapter: "*",     hint: "<AGENT_ID> <task>",                   desc: "open target agent's chat and send the task now",              exec: cmdDispatch },
   { cmd: "/stop",     adapter: "*",     hint: "",                                    desc: "stop the current stream",                             exec: cmdStop },
   { cmd: "/status",   adapter: "*",     hint: "",                                    desc: "session, model, effort, next-options status",  exec: cmdStatus },
+  { cmd: "/schedule", adapter: "*",     hint: "<30m|once 2h> <task>",                desc: "recurring or one-shot scheduled run of this agent", exec: cmdSchedule },
+  { cmd: "/track",    adapter: "*",     hint: "<30m> <goal task>",                   desc: "goal loop: re-run every interval until the agent finishes", exec: cmdTrack },
+  { cmd: "/schedules",adapter: "*",     hint: "",                                    desc: "list this project's schedules",                       exec: cmdSchedules },
+  { cmd: "/unschedule",adapter: "*",    hint: "<id>",                                desc: "cancel a schedule by id",                             exec: cmdUnschedule },
   // grok-only one-shot modifiers (consumed by next message)
   { cmd: "/best-of",  adapter: "grok",  hint: "<2..5>",                              desc: "NEXT turn: run N attempts in parallel, pick best",    exec: cmdBestOf },
   { cmd: "/check",    adapter: "grok",  hint: "",                                    desc: "NEXT turn: add self-verification loop",             exec: cmdCheck },
@@ -2143,6 +2283,70 @@ async function cmdDispatch(w, arg) {
 async function cmdStop(w) {
   if (!w.streaming) { addSystemBubble(w, "no stream is running."); return; }
   stopChat(w);
+}
+
+async function _postSchedule(w, body) {
+  const slug = w.projectSlug;
+  try {
+    const r = await fetch(`/api/projects/${slug}/schedules`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ agent_id: w.agentId, ...body }),
+    });
+    if (!r.ok) { addSystemBubble(w, `❌ schedule failed: ${escapeHtml(await r.text())}`); return; }
+    const s = (await r.json()).schedule;
+    const arr = state.schedules[slug] || (state.schedules[slug] = []);
+    arr.push(s);
+    addSystemBubble(w, `🕒 Scheduled (${schedLabel(s)}) → fires ${fmtCountdown(s.next_run_at)}. See the 🕒 Schedules panel / graph badge.`);
+    renderScheduleDropdown();
+    rerenderGraphsForSlug(slug);
+  } catch (e) {
+    addSystemBubble(w, `❌ schedule error: ${escapeHtml(String(e))}`);
+  }
+}
+
+async function cmdSchedule(w, arg) {
+  arg = (arg || "").trim();
+  if (!arg) { addSystemBubble(w, "Syntax: `/schedule 30m <task>` (repeat) or `/schedule once 2h <task>` (one-shot). Min interval 5m."); return; }
+  if (arg.toLowerCase().startsWith("once ")) {
+    const rest = arg.slice(5).trim();
+    const sp = rest.indexOf(" ");
+    if (sp === -1) { addSystemBubble(w, "Syntax: `/schedule once <2h> <task>`"); return; }
+    await _postSchedule(w, { delay: rest.slice(0, sp).trim(), prompt: rest.slice(sp + 1).trim() });
+    return;
+  }
+  const sp = arg.indexOf(" ");
+  if (sp === -1) { addSystemBubble(w, "Syntax: `/schedule <30m> <task>`"); return; }
+  await _postSchedule(w, { every: arg.slice(0, sp).trim(), prompt: arg.slice(sp + 1).trim() });
+}
+
+async function cmdTrack(w, arg) {
+  arg = (arg || "").trim();
+  const sp = arg.indexOf(" ");
+  if (sp === -1) { addSystemBubble(w, "Syntax: `/track <30m> <goal task>` — re-runs until the agent emits done. Min 5m."); return; }
+  const every = arg.slice(0, sp).trim();
+  const task = arg.slice(sp + 1).trim();
+  await _postSchedule(w, { every, until: task, prompt: task });
+}
+
+async function cmdSchedules(w) {
+  const slug = w.projectSlug;
+  await refreshSchedulesActiveTab();
+  const all = state.schedules[slug] || [];
+  if (!all.length) { addSystemBubble(w, "No schedules in this project. Use `/schedule` or `/track`."); return; }
+  const lines = ["**Schedules** (this project)", ""];
+  for (const s of all) {
+    const when = s.active ? `next ${fmtCountdown(s.next_run_at)}` : "stopped";
+    lines.push(`- \`#${s.id}\` ${s.agent_id} — ${schedLabel(s)} · ${when}${s.until_goal ? ` · until: ${s.until_goal.slice(0, 50)}` : ""} — cancel with \`/unschedule ${s.id}\``);
+  }
+  addSystemBubble(w, lines.join("\n"));
+}
+
+async function cmdUnschedule(w, arg) {
+  const id = (arg || "").trim().replace(/^#/, "");
+  if (!id) { addSystemBubble(w, "Syntax: `/unschedule <id>` (see `/schedules`)"); return; }
+  await deleteSchedule(w.projectSlug, id);
+  addSystemBubble(w, `🕒 schedule #${id} cancelled.`);
 }
 
 // ---------- Add agent dialog ----------
@@ -2986,27 +3190,6 @@ async function attachDetachedRun(w, slug, rootAgent) {
   }
 }
 
-// Auto-tick safety net: link a dispatch to the orchestrator's plan step (by
-// step agent="ID", else by the target id appearing in the step text) and move
-// its status forward. Never downgrades; a model's explicit <step> wins.
-function autoTickStep(slug, source, target, status) {
-  const pl = (state.plans[slug] || {})[source];
-  if (!pl || !target) return false;
-  const rx = new RegExp(`\\b${target}\\b`, "i");
-  const matches = (pl.steps || []).filter((s) =>
-    (s.agent && s.agent.toUpperCase() === target.toUpperCase()) || rx.test(s.text || ""));
-  if (!matches.length) return false;
-  const cand = matches.find((s) => s.status !== "done") || matches[0];
-  if (status === "doing") {
-    if (cand.status === "pending") cand.status = "doing";
-  } else if (status === "done") {
-    if (cand.status !== "blocked") cand.status = "done";
-  } else if (status === "blocked") {
-    cand.status = "blocked";
-  }
-  return true;
-}
-
 function handleEventInWindow(w, slug, evt, bubbleFor, rootAgent) {
   const proj = state.projectCache[slug];
   const agent = evt.agent || rootAgent;
@@ -3112,35 +3295,6 @@ function handleEventInWindow(w, slug, evt, bubbleFor, rootAgent) {
       mirrorDispatchedMessages(slug, agent);
       break;
     }
-    case "plan_updated": {
-      if (!state.plans[slug]) state.plans[slug] = {};
-      state.plans[slug][agent] = { total: evt.total, steps: evt.steps || [] };
-      rerenderGraphsForSlug(slug);
-      if (!workerCardStatus(w, agent, `📋 plan: ${evt.total} steps`)) {
-        setChatStatus(w, `📋 ${agent}: plan ${evt.total} steps — saved to state/plan.md`);
-      }
-      ensureStats(slug, true);
-      break;
-    }
-    case "plan_step": {
-      const pl = (state.plans[slug] || {})[agent];
-      if (pl) {
-        const s = (pl.steps || []).find((x) => x.n === evt.n);
-        if (s) {
-          s.status = evt.status;
-          if (evt.step_agent) s.agent = evt.step_agent;
-          if (evt.note) s.text = s.text; // keep plan text; note shown in chat only
-        }
-        rerenderGraphsForSlug(slug);
-      }
-      const ico = evt.status === "done" ? "✓" : (evt.status === "blocked" ? "⛔" : "▸");
-      const note = (evt.note || "").split("\n")[0].slice(0, 60);
-      if (!workerCardStatus(w, agent, `${ico} step ${evt.n} ${evt.status}${note ? " — " + note : ""}`)) {
-        setChatStatus(w, `📋 ${agent}: step ${evt.n} ${ico} ${evt.status}`);
-      }
-      ensureStats(slug, true);
-      break;
-    }
     case "compact_started": {
       addSystemBubble(w, `📦 Context ${evt.pct || "?"}% — auto-compacting before this turn runs (agent summarizes itself, then a new session opens)…`);
       setChatStatus(w, "auto-compacting…");
@@ -3156,7 +3310,6 @@ function handleEventInWindow(w, slug, evt, bubbleFor, rootAgent) {
     case "dispatch_started": {
       state.activeDispatches.add(`${evt.source}->${evt.target}`);
       proj.statuses[evt.target] = "running";
-      autoTickStep(slug, evt.source, evt.target, "doing");
       rerenderGraphsForSlug(slug);
       ensureWorkerCard(w, evt.source, evt.target, evt.task || "", rootAgent);
       if (!w._turnWorkers) w._turnWorkers = {};
@@ -3170,7 +3323,6 @@ function handleEventInWindow(w, slug, evt, bubbleFor, rootAgent) {
     case "dispatch_complete": {
       state.activeDispatches.delete(`${evt.source}->${evt.target}`);
       proj.statuses[evt.target] = evt.status === "ok" ? "ok" : "error";
-      autoTickStep(slug, evt.source, evt.target, evt.status === "ok" ? "done" : "blocked");
       rerenderGraphsForSlug(slug);
       ensureStats(slug, true);
       // Icon/border only — agent_done already wrote the summary line.
@@ -3197,6 +3349,36 @@ function handleEventInWindow(w, slug, evt, bubbleFor, rootAgent) {
       if (!b.thinkAccum) b.thinkBlock.style.display = "none";
       proj.statuses[agent] = "error";
       rerenderGraphsForSlug(slug);
+      break;
+    }
+    case "schedule_created": {
+      const s = evt.schedule;
+      const arr = state.schedules[slug] || (state.schedules[slug] = []);
+      if (!arr.some((x) => x.id === s.id)) arr.push(s);
+      addSystemBubble(w, `🕒 Scheduled (${schedLabel(s)}) → fires ${fmtCountdown(s.next_run_at)}. Verify on the graph badge / Schedules panel.`);
+      renderScheduleDropdown();
+      rerenderGraphsForSlug(slug);
+      break;
+    }
+    case "schedule_fired": {
+      showToast(`🕒 ${agent}: scheduled check #${evt.n}${evt.max ? "/" + evt.max : ""} started`, "sched");
+      setChatStatus(w, `🕒 scheduled run #${evt.n} started`);
+      break;
+    }
+    case "schedule_done": {
+      addSystemBubble(w, `🕒 Schedule #${evt.id} finished — ${escapeHtml(evt.reason || "complete")}.`);
+      showToast(`🕒 ${agent}: schedule done — ${evt.reason || "complete"}`, "sched");
+      refreshSchedulesActiveTab();
+      break;
+    }
+    case "schedule_exhausted": {
+      addSystemBubble(w, `🕒 Schedule #${evt.id} stopped after ${evt.n} checks without completing (hit the safety ceiling).`);
+      showToast(`🕒 ${agent}: schedule exhausted after ${evt.n} checks`, "warn");
+      refreshSchedulesActiveTab();
+      break;
+    }
+    case "schedule_cancelled": {
+      refreshSchedulesActiveTab();
       break;
     }
   }

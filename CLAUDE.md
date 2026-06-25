@@ -17,10 +17,10 @@ This file is read on session start. Follow it.
 ```
 app/
 ├── backend/
-│   ├── main.py          FastAPI: /api/projects*, /tree, /file + /raw, /workspace/*, SSE chat with dispatch parsing + ledger enrichment + auto-continuation
+│   ├── main.py          FastAPI: /api/projects*, /tree, /file + /raw, /workspace/*, SSE chat with dispatch parsing + ledger enrichment + auto-continuation; _start_run (shared by /chat + scheduler), _scheduler_loop, <schedule>/<schedule_stop> parsing
 │   ├── adapters.py      claude_stream (PTY) + grok_stream (PTY, streaming-json, --resume, --best-of-n, --check, --memory)
 │   ├── projects.py      registry + project.yaml loader, graph edges, workspace_root, agent bootstrap templates + create_agent atomic
-│   └── db.py            SQLite sessions, messages, agent_overrides, dispatch_results, node_positions; cleanup_stale_running on startup
+│   └── db.py            SQLite sessions, messages, agent_overrides, dispatch_results, node_positions, scheduled_tasks; cleanup_stale_running on startup
 ├── frontend/
 │   ├── index.html       Loads marked + DOMPurify from CDN, sidebar + workspace + taskbar
 │   ├── app.js           Vanilla JS, window manager, SVG graph canvas (drag nodes + persist), SSE parser, markdown render, slash commands
@@ -72,7 +72,6 @@ Port conflicts: `lsof -ti tcp:5174 | xargs kill -9`.
 - Node color: idle gray / running yellow pulse / ok green / error red.
 - Edge: pulsing purple dash during active dispatch.
 - Each node shows its current model in the badge (e.g. `opus-4-8`).
-- **Plan todo panel.** The full todo list renders as a `.todo-panel` anchored to the RIGHT of the node, but ONLY for the node whose chat is open or that is `running` (others stay bare, so a busy canvas stays legible). No per-node `done/total` count is shown on the node itself. Rows: ☐ pending / ⏳ doing / ✓ done (struck-through) / ⛔ blocked, plus a `→ID` tag when the step links to a dispatch target. Data: `state.plans[slug][agentId]` seeded from `GET /api/projects/{slug}` payload `plans` (read from each agent's `state/plan.md`) and updated live by `plan_updated`/`plan_step`/dispatch auto-tick. Panels track node position during drag via `updateTodoPanelsLive` (mirrors `updateEdgesLive`).
 
 ### Theme
 
@@ -82,7 +81,7 @@ Light (default) / dark toggle — ◐ button in the sidebar title, persisted in 
 
 - Header: agent name, role, current model + effort (text only — change via `/model` / `/effort`)
 - **Turn strip** (below header, only during multi-agent turns): `BOSS ▸ [VLM ✓] [DATASET ⏳] · round 2/3` — chips driven by `dispatch_started/complete`, round by `continuation_round`.
-- **Worker cards**: a dispatched worker's entire output streams INTO one collapsible card (`ensureWorkerCard`) instead of interleaving top-level bubbles. Card head shows a live status line (plan_step / status events → "▸ step 3/5 — …", then "✓ <first line of final text>" on agent_done); body (hidden by default) holds the full transcript; footer button opens the worker's own chat. Sub-dispatches nest inside the source's card. Only the root agent writes top-level bubbles.
+- **Worker cards**: a dispatched worker's entire output streams INTO one collapsible card (`ensureWorkerCard`) instead of interleaving top-level bubbles. Card head shows a live status line (status events → "✓ <first line of final text>" on agent_done); body (hidden by default) holds the full transcript; footer button opens the worker's own chat. Sub-dispatches nest inside the source's card. Only the root agent writes top-level bubbles.
 - **Control-plane separators**: `[CONTROL-PLANE …]` user messages (continuation prompts) render as a thin labelled rule (`addCtrlSeparator`), live (via `continuation_round` event) and on db replay — never as user bubbles. Each continuation round also starts a fresh orchestrator bubble (`bubbleFor.reset`).
 - Messages: full markdown rendering (marked + DOMPurify); dispatch tags become collapsed cards
 - Input: Enter sends, Shift+Enter newlines, Esc stops streaming, plus slash commands
@@ -132,6 +131,10 @@ Type `/` to open the command menu. Tab to insert, ↑↓ to navigate, Esc to clo
 | `/dispatch <AGENT_ID> <task>` | Open target's chat and send task immediately |
 | `/stop` | Same as Stop button |
 | `/status` | Show current model, effort, status, streaming state |
+| `/schedule <30m\|once 2h> <task>` | Recurring or one-shot scheduled run of this agent |
+| `/track <30m> <goal task>` | Goal loop — re-run every interval until the agent self-terminates |
+| `/schedules` | List this project's schedules |
+| `/unschedule <id>` | Cancel a schedule by id |
 
 ## project.yaml schema
 
@@ -203,6 +206,27 @@ Hard constraints on dispatch:
 
 When editing the dispatch prompt, remember the user verifies on the graph. Keep the instruction strict about "narrating without emitting tag = lying" and forbid verbose reading lists in task bodies — models tend to regress without explicit ban.
 
+## Scheduler (recurring / deferred / goal-driven turns)
+
+`claude -p` headless has no way to wake itself up, so an agent that "promises to monitor every 30 min" used to go silent — there was never any mechanism behind the promise. The scheduler adds one. **A scheduled fire is identical to a `POST /chat`**: it runs through the same `_start_run` → `_Run`/`driver`/`_run_agent` path, streams into the agent's chat, and persists to `messages` — so it is visible and replayable. Full design in [docs/scheduler-spec.md](docs/scheduler-spec.md).
+
+Three modes (SQLite `scheduled_tasks` table, survives restart):
+- `interval` — `<schedule every="30m" max="8">…</schedule>` — fixed count.
+- `once` — `<schedule in="2h">…</schedule>` — one-shot.
+- `until` — `<schedule every="30m" until="goal">…</schedule>` — **goal loop**: re-runs until the agent emits `<schedule_stop reason="…"/>` (semantic termination, agent judges each round; "done→report+stop, error→fix&continue"). Hard ceiling `max_runs` default **48** + a `schedule_exhausted` event if it never stops.
+
+Both tags (parsed live in `_run_agent` like `<dispatch>`) and the `/schedule` `/track` `/schedules` `/unschedule` slash commands write the same table; `_build_schedule` is the shared core, `_register_schedule` wraps it for the tag path. Interval floor 5 min; 7-day zombie guard.
+
+`_scheduler_loop` (startup task, modelled on `_terminal_reaper`) ticks every 30s, selects `active AND next_run_at<=now`, **skips if the agent already has an active run** (one-active-run-per-agent — defers a short retry, never overlaps), else fires. `next_run_at` is recomputed **at fire completion** (`= completion + interval`), not pre-scheduled, so a long "fix" round can't cause overlap or drift. `_sched_inflight` guards against double-firing the same row across ticks.
+
+**UI feedback is load-bearing**: a scheduled fire starts a server-side run with no browser attached. `app.js` polls `/runs` every 20s (`pollActiveRunsActiveTab`) so the run auto-opens + streams instead of running silently — the exact failure the scheduler exists to remove. Plus toasts + a node 🕒 badge + the **🕒 Schedules dropdown** (`#schedDropdown`, GET `/api/projects/{slug}/schedules`).
+
+**Honesty guard** (`_SCHEDULE_INSTRUCTIONS`): appended **conditionally** (only for agents with active schedules, when the user message shows tracking intent, or during scheduled fires) to save tokens (~524 tokens). The honesty rules and safety-net still apply when the instructions are present.
+
+Endpoints: `GET/POST /api/projects/{slug}/schedules`, `PATCH /…/{id}?active=` (pause/resume), `DELETE /…/{id}`.
+
+> ⚠️ A scheduler firing `claude -p` every 30 min on an OSC **login node** is exactly the persistent-agent activity OSC flagged (killed ~7GB of processes, threatened account restriction). Run AgentUI **off-cluster** before enabling recurring schedules. Not enforced in code.
+
 ## SSE event types (backend → frontend)
 
 | Event | Fields | Meaning |
@@ -214,15 +238,18 @@ When editing the dispatch prompt, remember the user verifies on the graph. Keep 
 | `thinking` | `agent`, `text` | Recent thinking chunk (visible in indicator). |
 | `delta` | `agent`, `text` | Assistant text delta. Appended to bubble. |
 | `continuation_round` | `agent`, `round`, `max` | Round separator + turn-strip round badge; resets the orchestrator's live bubble. |
-| `plan_updated` | `agent`, `total`, `steps[{n,text,status}]` | (Re)declare the agent's plan; populates the graph todo panel + node badge. |
-| `plan_step` | `agent`, `n`, `status`, `step_agent`, `note` | One step's status change. `agent`=owner (event routing); `step_agent`=dispatch target the step links to (auto-tick). |
-| `dispatch_started` | `source`, `target`, `task` | Animate edge, mark target running, create worker card + turn-strip chip, auto-tick linked todo step → doing. |
-| `dispatch_complete` | `source`, `target`, `status`, `message` | Stop animation, mark target ok/error, auto-tick linked todo step → done/blocked. |
+
+| `dispatch_started` | `source`, `target`, `task` | Animate edge, mark target running, create worker card + turn-strip chip. |
+| `dispatch_complete` | `source`, `target`, `status`, `message` | Stop animation, mark target ok/error. |
 | `dispatch_rejected` | `source`, `target`, `reason` | Show in status bar. |
 | `agent_done` | `agent`, `text`, `status` | Final state for that agent. |
 | `error` | `agent`, `message` | Surface in bubble as quote. |
 | `complete` | — | Queue closed, all dispatches finished. |
 | `bootstrap_done` | `files`, `warnings`, `target_folder` | Emitted only by `/agents/preview-from-parent` at end of stream. Frontend uses this to build the preview pane. |
+| `schedule_created` | `agent`, `schedule` | A `<schedule>` tag (or `/schedule`) registered a recurring/deferred run. |
+| `schedule_fired` | `agent`, `id`, `run`, `n`, `max` | A scheduled fire just started → toast + node 🕒 pulse. |
+| `schedule_done` | `agent`, `id`, `reason` | `<schedule_stop>` / one-shot complete. |
+| `schedule_exhausted` | `agent`, `id`, `n` | An until-loop hit the hard ceiling without stopping. |
 
 If you add an event type, update both `_run_agent` / `_dispatched_run` (emit) and `handleEventInWindow` in `app.js` (consume).
 
@@ -244,6 +271,10 @@ sessions, the dispatch ledger, or orchestration state.
 - **Top bar** (`.topbar` wraps `#tabs`). Right-aligned `#procBtn` "Process running" +
   `#skillsBtn` "Skills". Skills was relocated here from the old fixed right-edge tab
   (`.skills-tab` now `display:none`); it opens the same `#skillsPanel`.
+- **Schedules dropdown** (`#schedDropdown`, `🕒 Schedules` button). Lists the active
+  project's `scheduled_tasks` with a live next-fire countdown + pause/resume/delete.
+  This one is NOT purely read-only — pause/delete hit `PATCH`/`DELETE
+  /api/projects/{slug}/schedules/{id}`. See the **Scheduler** section.
 - **Process running dropdown** (`#procDropdown`). `GET /api/cluster/jobs` runs
   `squeue --clusters=all -u $USER -o '%i|%P|%j|%t|%M|%D|%R|%C'`, parses the `CLUSTER:`
   markers, returns `{clusters:{ascend|cardinal|pitzer:[…]}}`. Polls every 15s while open.
@@ -299,9 +330,9 @@ Template generation lives in `projects.py:_AGENT_FILE_TEMPLATES` (5 templates) +
 - **Worker result feedback to orchestrator is solved by the dispatch ledger** (see the dedicated section above). Future work: an optional MCP tool surface so claude-native tool_result UX is available for Claude orchestrators without changing the persistence model.
 - **No idle reaper**. Sessions live forever. Plan: idle timeout + startup reaping with pid groups.
 - **Compaction: solved.** `/compact` (manual) and auto-compact (fires before a user turn when the session's last-turn context ≥ `_AUTO_COMPACT_PCT` = 80%): the agent summarises its own context, a fresh session is created seeded with that recap (`sessions.seed`, prepended once then cleared). Empty recap → rotate anyway, cold-start preamble covers recovery.
-- **Cold-start preamble.** Any turn that cannot `--resume` (fresh/torn session) gets a deterministic recap prepended: latest `state/progress.md` sections + unfinished `state/plan.md` + `state/children_status.json` (parents) + `inputs/manifest.md` head. Built in `_session_preamble`; a /compact seed takes precedence.
+- **Cold-start preamble.** Any turn that cannot `--resume` (fresh/torn session) gets a deterministic recap prepended: latest `state/progress.md` sections + `state/children_status.json` (parents) + `inputs/manifest.md` head. Built in `_session_preamble`; a /compact seed takes precedence.
 - **Children rollup.** Every parent gets `state/children_status.json` auto-derived on each `/stats` call (and via `POST /api/projects/{slug}/rollup`): per-child status, context %, memory freshness + `stale_memory` flag, sha256 of progress.md. Read-only projection — never hand-edited, never a second source of truth.
-- **Plan ledger.** All agents get `_PLAN_INSTRUCTIONS` appended to their system prompt: multi-step tasks must emit `<plan>1. …</plan>` then `<step n="1" status="done">note</step>` (doing|done|blocked). A step that IS a dispatch may carry `agent="ID"` (order-tolerant; parsed by `STEP_RE` + `_STEP_ATTR_RE`) to link it to a worker node — the graph then auto-ticks it from `dispatch_started`/`dispatch_complete` as a safety net over the model's own `<step>`. Parsed live like dispatch tags, persisted to the agent's `state/plan.md` (survives sessions, resumed via preamble), surfaced as `plan` in `/stats`, a node badge + a `.todo-panel` on the graph (see Graph canvas), and a progress row on the node panel. SSE events: `plan_updated` (carries full `steps`), `plan_step` (carries `step_agent`).
+
 - **Continuation is multi-round.** Up to `_MAX_CONT_ROUNDS` = 3 continuations per user turn: each wave of dispatches is gathered, then the orchestrator reacts (synthesise or chain new dispatches) in the same SSE response. The final round's prompt forbids further dispatches; any emitted anyway still run, results land in the ledger for the next turn.
 - **Dispatch contract verify.** `_dispatched_run` snapshots the worker's `outputs/manifest.md` (mtime + version) before/after; an unchanged manifest on an ok dispatch appends a `[control-plane verify]` warning into the ledger text so the orchestrator demands a manifest bump before consuming artifact-producing work.
 - **Turns are detached from the browser (solved: "send work, close the laptop").** Each chat turn runs as a server-side task publishing to an in-memory per-run event buffer (`_Run` registry in main.py, every event stamped with `seq`). The SSE returned by POST /chat is just the first subscriber — disconnect only unsubscribes, the turn (and all its dispatched workers) runs to completion and persists everything. Re-attach: `GET /api/projects/{slug}/runs` lists active runs (UI calls it on project open and auto-opens those chats), `GET .../agents/{id}/stream?since=N` replays buffered events from `since` then follows live (finished runs stay replayable `_RUN_KEEP_DONE_S` = 10 min). Stopping is ONLY explicit `POST .../agents/{id}/stop` (UI Stop/Esc calls it; local fetch abort merely stops watching). One active run per agent — a second POST /chat gets 409 and the UI queues the message + re-attaches. Caveat: the buffer is in-memory, so a **server restart** still kills in-flight runs (startup reaper marks them `cancelled`). Also note: cron keepalive restarts run.sh with cron's bare PATH — run.sh asserts `~/.local/bin` (claude) and `~/.grok/bin` (grok) explicitly; do not remove that export.
@@ -310,6 +341,79 @@ Template generation lives in `projects.py:_AGENT_FILE_TEMPLATES` (5 templates) +
 - **Add-agent is creation-only**. Edit and delete (with archive) are Sprint 1. To remove an agent today: stop the server, delete the folder + remove the yaml entry by hand, restart.
 
 If you implement any of these, update this section.
+
+## Active user custom modifications (for future agents to understand & intervene)
+
+These changes were made at user request. Documented here so later agents can inspect, revert, extend, or debug without surprise.
+
+### 1. Plan / todo-panel feature — completely removed
+- **What was removed**:
+  - `_PLAN_INSTRUCTIONS` no longer appended to any agent's system prompt.
+  - No parsing of `<plan>...</plan>` or `<step n="..." status="...">` tags in `_run_agent`.
+  - No automatic writing / updating of `state/plan.md`.
+  - `plans` field removed from `GET /api/projects/{slug}` and per-agent stats.
+  - Cold-start preamble no longer injects unfinished plan.
+  - Frontend: `state.plans` removed, no more `.todo-panel` foreignObjects rendered next to graph nodes, no `buildTodoPanel` / `updateTodoPanelsLive`, no `plan_updated`/`plan_step` events, no `autoTickStep`.
+  - All related CSS deleted.
+- **Effects**:
+  - Agents will **never** see plan protocol instructions.
+  - Emitting `<plan>` or `<step>` tags does nothing (silently ignored).
+  - No todo list ever appears on the graph canvas.
+  - Existing `state/plan.md` files in agent folders are ignored.
+- **Location of removed code** (search for remnants):
+  - backend/main.py: PLAN_RE, STEP_RE, _PLAN_INSTRUCTIONS, _read_plan/_write_plan_file etc., plan handling in preamble & stream loop.
+  - frontend/app.js: all plan + todo panel logic.
+  - styles.css: .todo-panel rules.
+- **How to restore** (if needed in future): revert the removal commits / search-replaces. The original design is still described in older versions of this file and scheduler-spec.md (plan part).
+
+**Rationale**: User explicitly requested full removal ("tôi không cần nhìn todo list như vậy") to reduce prompt bloat and UI clutter.
+
+### 2. Global scheduler on/off toggle (Apple-style switch)
+- **Feature added**:
+  - In the 🕒 **Schedules** dropdown (topbar), the very first element is now a toggle switch labeled "Scheduler".
+  - Looks like iOS switch (`.sched-toggle`, `.sched-toggle-slider` in CSS).
+- **Backend implementation**:
+  - New `settings` table in `agentui.db`.
+  - Key: `scheduler_enabled` ("1" = on, "0" = off). Default = on.
+  - Helpers: `db.get_setting()`, `db.set_setting()`.
+  - `_scheduler_enabled()` helper.
+  - `_scheduler_tick()` early-returns if disabled → no fires, no scheduled runs.
+  - Schedule creation paths (`_build_schedule`, `api_create_schedule`, tag parsing via `_register_schedule`) reject with "scheduler is globally disabled".
+  - New endpoints:
+    - `GET /api/scheduler/enabled` → `{ "enabled": true/false }`
+    - `POST /api/scheduler/enabled` with body `{ "enabled": true/false }`
+- **Frontend**:
+  - `renderScheduleDropdown()` fetches status and renders the toggle at the top of the dropdown.
+  - Toggling calls the POST endpoint and re-renders.
+  - When disabled: shows red warning message in the dropdown. Existing schedules are still listed (so you can delete/pause them), but nothing will fire.
+  - Count badge on the 🕒 button only counts active ones (same as before).
+- **Effects when off**:
+  - No new `<schedule>` / `/schedule` / `/track` will succeed.
+  - Scheduler loop sleeps (still wakes every 30s but does nothing).
+  - Existing schedules stay in DB but are inert.
+  - User can still use the dropdown to delete old ones.
+  - Toggle can be turned back on at any time.
+- **Files changed**:
+  - backend/db.py: settings table + get/set.
+  - backend/main.py: enable check, new APIs, guards in creation & tick.
+  - frontend/app.js: toggle UI + fetch logic.
+  - frontend/styles.css: Apple-style switch CSS.
+
+**Rationale**: User wanted a simple, complete "off switch" for the whole recurring/scheduling system without deleting code, so it can be turned off when not needed (e.g. to avoid token burn or unwanted background activity).
+
+**How future agents can intervene**:
+- Check current state: `sqlite3 agentui.db "SELECT * FROM settings WHERE key='scheduler_enabled';"`
+- Force on/off from code: call the POST endpoint or directly `db.set_setting("scheduler_enabled", "0")`.
+- Re-enable plan/todo if desired: the removal is surgical — search for the deleted symbols above and restore the blocks (plan protocol is still described in the scheduler-spec.md history and older CLAUDE.md).
+- Debug scheduler while disabled: look at `_scheduler_enabled()` and the guards in `_build_schedule` / `_scheduler_tick`.
+
+### Notes for agents working on this codebase
+- These are **user-driven customizations**, not core design. They take precedence over the original "always-on" descriptions elsewhere in this file.
+- When adding new features (new slash commands, new UI panels, new control-plane tags), consider whether they should also respect the scheduler_enabled flag or plan-absence.
+- Token-related context: Removing plan saved ~240 tokens per turn. The scheduler toggle allows turning off the ~524-token `_SCHEDULE_INSTRUCTIONS` overhead + all recurring fires when not wanted (see earlier token analysis in conversation).
+- Always test with real `/schedule` and the toggle after changes.
+
+---
 
 ## Quick debugging
 
