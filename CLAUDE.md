@@ -18,7 +18,7 @@ This file is read on session start. Follow it.
 app/
 ├── backend/
 │   ├── main.py          FastAPI: /api/projects*, /tree, /file + /raw, /workspace/*, SSE chat with dispatch parsing + ledger enrichment + auto-continuation; _start_run (shared by /chat + scheduler), _scheduler_loop, <schedule>/<schedule_stop> parsing
-│   ├── adapters.py      claude_stream (PTY) + grok_stream (PTY, streaming-json, --resume, --best-of-n, --check, --memory)
+│   ├── adapters.py      claude_stream (PTY) + grok_stream + deepseek_stream (claude_stream w/ per-subprocess Anthropic-endpoint override) (PTY, streaming-json, --resume, --best-of-n, --check, --memory)
 │   ├── projects.py      registry + project.yaml loader, graph edges, workspace_root, agent bootstrap templates + create_agent atomic
 │   └── db.py            SQLite sessions, messages, agent_overrides, dispatch_results, node_positions, scheduled_tasks; cleanup_stale_running on startup
 ├── frontend/
@@ -48,9 +48,9 @@ cd app
 # → http://127.0.0.1:5174
 ```
 
-`run.sh` creates `.venv`, installs `fastapi uvicorn pyyaml`, runs uvicorn **without `--reload`**. Frontend changes need browser hard refresh (Cmd+Shift+R) because CDN scripts cache; **backend changes need a manual restart** (no reloader).
+`run.sh` creates `.venv`, installs `fastapi uvicorn pyyaml`, runs uvicorn with a **scoped `--reload`** (default on; `RELOAD=0 ./run.sh` to disable). Frontend changes still need a browser hard refresh (Cmd+Shift+R) because CDN scripts cache; backend `.py` edits now auto-reload.
 
-> ⚠️ Do NOT re-add `--reload`. `agentui.db` (+ `-wal`/`-journal`) lives inside the watched `app/` tree, so every DB write during an agent turn used to trigger a reload that cancelled the driver task and killed the `claude -p` subprocess — the "agent cut off mid-answer" bug. Run.sh is env-specific and not committed.
+> ⚠️ Reload is SCOPED on purpose: `--reload-dir backend` watches ONLY `app/backend/` (plus `--reload-exclude '*.db*'`). It must NEVER watch the whole `app/` tree, because `agentui.db` (+ `-wal`/`-journal`) lives there and every DB write during an agent turn would trigger a reload that cancels the driver task and kills the `claude -p` subprocess — the original "agent cut off mid-answer" bug. Keep the watch scoped to `backend/`; never add a bare `--reload`. Run.sh is env-specific and not committed.
 
 Port conflicts: `lsof -ti tcp:5174 | xargs kill -9`.
 
@@ -145,9 +145,10 @@ description: <one line>
 agents:
   - id: <UPPERCASE_ID>           # used in dispatch tags
     role: <one-line description>
-    model: claude | grok          # adapter selector
+    model: claude | grok | deepseek   # adapter selector
     claude_model: claude-fable-5 | claude-opus-4-8 | claude-opus-4-7 | claude-sonnet-4-6 | claude-haiku-4-5
     grok_model: grok-build | grok-composer-2.5-fast       # only when model: grok
+    deepseek_model: deepseek-v4-flash | deepseek-v4-pro   # only when model: deepseek
     effort: low | medium | high | xhigh | max   # optional
     system_prompt_file: <relative path to AGENT.md>
     cwd: <relative working dir>
@@ -297,12 +298,60 @@ sessions, the dispatch ledger, or orchestration state.
 
 ## Things NOT to do
 
-- ❌ Do not introduce `ANTHROPIC_API_KEY` paths. Subscription is the design choice. If you need an API path, gate it behind an explicit `model: claude-api` adapter, never silently.
+- ❌ Do not introduce `ANTHROPIC_API_KEY` paths for the **Claude** nodes. Subscription is the design choice. The only sanctioned API-key path is the explicit `model: deepseek` adapter (see "DeepSeek adapter" below): it sets `ANTHROPIC_API_KEY` + `ANTHROPIC_BASE_URL` **per-subprocess only** (never global), so Claude nodes and the user's normal `claude` CLI keep using OAuth untouched. Never set `ANTHROPIC_BASE_URL` globally.
 - ❌ Do not replace the PTY with `subprocess.PIPE`. Streaming will regress to "lag 2-5s then dump everything".
 - ❌ Do not rely on `claude -p --input-format stream-json` as a long-running input loop. It is not documented for that purpose; multiple turns happen via `--resume`.
 - ❌ Do not store secrets in `registry.yaml` or `project.yaml`. They are not gitignored but `agentui.db` is.
 - ❌ Do not run the UI publicly. Subscription terms permit personal use; shared hosting against your login would be reselling. Use SSH tunnel for remote access (see `DEPLOY.md`).
 - ❌ Do not bind uvicorn to 0.0.0.0. Always `127.0.0.1`.
+
+## DeepSeek adapter (`model: deepseek`)
+
+A DeepSeek node is a **first-class peer of a Claude node** — same harness, same
+tools, same `--resume` memory, same dispatch/scheduler/ledger — because it drives
+the *same* `claude -p` process, just pointed at DeepSeek's native Anthropic
+endpoint instead of Anthropic's.
+
+- **Why no proxy:** DeepSeek V4 is officially integrated with Claude Code and
+  serves the Anthropic Messages API directly at `https://api.deepseek.com/anthropic`
+  (1M context, thinking mode, function calling; reasoning effort auto-set to `max`
+  for Claude-Code-style requests). So `adapters.py:deepseek_stream` is a thin
+  wrapper over `claude_stream(extra_env=…)` — no LiteLLM / claude-code-router,
+  no httpx, no hand-built tool loop.
+- **Per-subprocess env only.** `deepseek_stream` injects `ANTHROPIC_BASE_URL`,
+  `ANTHROPIC_API_KEY`, `ANTHROPIC_AUTH_TOKEN` into THAT subprocess's `env=` (via
+  the new `extra_env` param threaded into `claude_stream`). It never mutates the
+  global `os.environ`. Result: Claude nodes + the user's terminal `claude` keep
+  using subscription OAuth, fully unaffected, even when a DeepSeek node runs
+  concurrently. This is what makes mixed Claude+DeepSeek turns safe.
+- **Setup (env vars, off-cluster):**
+  ```bash
+  export DEEPSEEK_API_KEY=sk-...          # required; read by deepseek_stream
+  # export DEEPSEEK_BASE_URL=...          # optional; defaults to the URL above
+  ```
+  No key goes in `registry.yaml` / `project.yaml` / the db.
+- **Models:** `deepseek-v4-flash` (fast/cheap, default) and `deepseek-v4-pro`
+  (top-tier). Selected via `deepseek_model` in `project.yaml` or `/model
+  deepseek-v4-pro`. The legacy `deepseek-chat` / `deepseek-reasoner` aliases
+  **retire 2026-07-24** — do not default to them.
+- **Genuine asymmetries vs Claude (cannot be erased):** DeepSeek is **billed
+  per-token** (API), unlike the Claude subscription. Context is 1M (at parity).
+- **Cumulative-usage gotcha (fixed in `_usage_ctx_tokens`):** DeepSeek's endpoint
+  reports `usage` SUMMED across every internal tool-use round (cumulative
+  `cache_read_input_tokens` reached ~1.8M in one turn) with an empty `iterations`
+  list. The naive sum pinned the context gauge at 100% and made auto-compact fire
+  every turn (thrashing `--resume`). `_usage_ctx_tokens(usage, window)` now detects
+  this (single-request total > window ⇒ cumulative) and falls back to
+  `input+output`. Claude's per-request totals stay < window, so it's unaffected.
+- **Reload caveat:** WatchFiles `--reload` uses inotify, which does NOT fire for
+  edits made on a DIFFERENT host over NFS. If you edit `backend/*.py` from
+  login01 but uvicorn runs on login02, the reload won't trigger — restart the
+  server on the host it runs on.
+- **project.yaml:** `model: deepseek` + `deepseek_model: deepseek-v4-flash`.
+  Schema field `deepseek_model` mirrors `grok_model` everywhere (loader,
+  `_clean_agent`, `_project_agent_entry`, `agent_overrides` table + get/set/list,
+  `AgentSettings`, `NewAgent`, context-window lookup, frontend model lists +
+  `/model` + add-agent form + `cmdStatus`).
 
 ## Add-agent endpoints
 

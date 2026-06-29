@@ -190,8 +190,23 @@ def _format_results_as_context(results: list) -> str:
         task_excerpt = (r.get("task") or "").strip().splitlines()[0] if r.get("task") else ""
         if len(task_excerpt) > 200:
             task_excerpt = task_excerpt[:200] + "…"
+        # Summary-only digest (spec §6.9): a one-line, mechanically-extracted header
+        # so the orchestrator can scan fast and deep-read ONLY the exceptions.
+        ps = _parse_structured(r.get("result_text") or "")
+        res, esc = ps.get("result") or {}, ps.get("escalate")
+        bits = []
+        if res.get("status"):
+            bits.append(f"status={res['status']}")
+        if res.get("goal_status"):
+            bits.append(f"goal={res['goal_status']}")
+        if esc:
+            bits.append(f"ESCALATE:{esc.get('type', '?')}")
+        if res.get("summary"):
+            bits.append(res["summary"][:120])
+        digest_line = ("[digest] " + " · ".join(bits) + "\n") if bits else ""
         blocks.append(
             f'<dispatch_result from="{r["target_agent"]}"{status_attr}>\n'
+            f'{digest_line}'
             f'(task: {task_excerpt})\n\n'
             f'{text}\n'
             f'</dispatch_result>'
@@ -202,9 +217,11 @@ def _format_results_as_context(results: list) -> str:
         "\n\n".join(blocks)
         + "\n\n---\n\nThe `<dispatch_result>` blocks above contain the actual outputs "
         "from workers you dispatched in your previous response(s). Reason over this "
-        "real data; **do NOT pretend you are still waiting for results**. If a result "
-        "is incomplete or in error/cancelled status, decide whether to retry, escalate, "
-        "or report to the user."
+        "real data; **do NOT pretend you are still waiting for results**. Scan the "
+        "`[digest]` lines first; **deep-read only the blocks where status=blocked, "
+        "goal=missed/partial, or an ESCALATE is present** — the rest you can accept on "
+        "the digest. If a result is incomplete or in error/cancelled status, decide "
+        "whether to retry, escalate, or report to the user."
     )
 
 
@@ -226,11 +243,14 @@ def api_project(slug: str):
         ov = overrides.get(a["id"]) or {}
         a["default_claude_model"] = a.get("claude_model") or "claude-sonnet-4-6"
         a["default_grok_model"] = a.get("grok_model") or "grok-build"
+        a["default_deepseek_model"] = a.get("deepseek_model") or "deepseek-v4-flash"
         a["default_effort"] = a.get("effort")
         if ov.get("claude_model"):
             a["claude_model"] = ov["claude_model"]
         if ov.get("grok_model"):
             a["grok_model"] = ov["grok_model"]
+        if ov.get("deepseek_model"):
+            a["deepseek_model"] = ov["deepseek_model"]
         if "effort" in ov:
             a["effort"] = ov["effort"]
     out["statuses"] = statuses
@@ -290,8 +310,15 @@ _MODEL_CONTEXT_WINDOWS = {
     "claude-opus-4-7": 1_000_000,
     "claude-sonnet-4-6": 1_000_000,
     "claude-haiku-4-5": 200_000,
+    # DeepSeek V4 (served via DeepSeek's native Anthropic endpoint → claude -p).
+    # V4 ships 1M context by default. deepseek-chat/deepseek-reasoner are the
+    # legacy aliases (retire 2026-07-24, mapped to v4-flash thinking/non-thinking).
+    "deepseek-v4-flash": 1_000_000,
+    "deepseek-v4-pro": 1_000_000,
+    "deepseek-chat": 1_000_000,
+    "deepseek-reasoner": 1_000_000,
 }
-_CONTEXT_WINDOWS = {"claude": 200_000, "grok": 256_000}  # adapter fallback
+_CONTEXT_WINDOWS = {"claude": 200_000, "grok": 256_000, "deepseek": 1_000_000}  # adapter fallback
 
 
 def _context_window_for(model_kind: str, model_id: Optional[str]) -> int:
@@ -300,7 +327,7 @@ def _context_window_for(model_kind: str, model_id: Optional[str]) -> int:
     return _CONTEXT_WINDOWS.get(model_kind, 200_000)
 
 
-def _usage_ctx_tokens(usage: dict) -> int:
+def _usage_ctx_tokens(usage: dict, window: int | None = None) -> int:
     """Context-window occupancy from a CLI usage blob = the LARGEST single API
     request in the turn, NOT the top-level sums (cumulative billing across
     agentic rounds — routinely exceeds the window). Shared by the stats endpoint
@@ -315,7 +342,20 @@ def _usage_ctx_tokens(usage: dict) -> int:
     iters = usage.get("iterations") or []
     if iters:
         return max(_req_total(it) for it in iters)
-    return _req_total(usage)
+    total = _req_total(usage)
+    # Cumulative-usage providers (e.g. DeepSeek via its Anthropic-compatible
+    # endpoint) report tokens SUMMED across every internal tool-use round, with
+    # NO per-iteration breakdown (iterations == []). The cumulative cache_read
+    # alone can reach several million in one agentic turn. A single request can
+    # never exceed the model's context window, so when the blob does, it is
+    # cumulative billing, not occupancy — fall back to the non-cumulative buckets
+    # (fresh input + output) which approximate the final request's footprint.
+    # Without this, the gauge pins at 100% and auto-compact fires every turn,
+    # thrashing the --resume session. Claude's per-request totals stay < window,
+    # so this branch never triggers for Claude.
+    if window and total > window:
+        return (usage.get("input_tokens") or 0) + (usage.get("output_tokens") or 0)
+    return total
 
 
 def _session_context_pct(sess: Optional[dict], model_kind: str,
@@ -331,7 +371,7 @@ def _session_context_pct(sess: Optional[dict], model_kind: str,
     window = _context_window_for(model_kind, model_id)
     if not window:
         return 0.0
-    return round(_usage_ctx_tokens(usage) / window * 100.0, 1)
+    return round(_usage_ctx_tokens(usage, window) / window * 100.0, 1)
 
 
 def _memory_info(project_root: str, agent: dict, cwd_abs: str) -> Optional[dict]:
@@ -439,6 +479,7 @@ def _write_children_rollups(project_root: str, project: dict, stats: dict) -> li
     would differ), so polling `/stats` on every graph refresh does not churn git.
     """
     agents = project["agents"]
+    agent_by_id = {a["id"]: a for a in agents}
     written: list[str] = []
     now = time.time()
     for parent in agents:
@@ -453,6 +494,9 @@ def _write_children_rollups(project_root: str, project: dict, stats: dict) -> li
             mtime = mem.get("mtime")
             last_act = st.get("updated_at")
             stale = bool(last_act and mtime and (last_act - mtime) > _STALE_MEMORY_GAP_S)
+            cdir = _agent_dir(project_root, agent_by_id[cid],
+                              projects.resolve_cwd(project_root, agent_by_id[cid].get("cwd", "."))) \
+                if cid in agent_by_id else None
             children[cid] = {
                 "status": _JOB_STATUS.get(st.get("status"), st.get("status") or "idle"),
                 "context_pct": st.get("context_pct"),
@@ -465,6 +509,11 @@ def _write_children_rollups(project_root: str, project: dict, stats: dict) -> li
                 "memory_headline": mem.get("headline") or None,
                 "memory_hash": _file_hash(project_root, mem.get("path")),
                 "stale_memory": stale,
+                # slim-overview routing fields (spec §3 / §6.3) — let BOSS route off
+                # the rollup without opening each child's full manifest.
+                "manifest_version": _read_manifest_version(cdir / "outputs" / "manifest.md") if cdir else None,
+                "overview_path": f"../{cid}/overview.md",
+                "body_incomplete": _read_overview_flag(cdir) if cdir else None,
             }
         digest = hashlib.sha256(
             json.dumps(children, sort_keys=True, ensure_ascii=False).encode("utf-8")
@@ -537,6 +586,8 @@ def api_project_stats(slug: str):
         ov = overrides.get(aid) or {}
         if model_kind == "grok":
             eff_model = ov.get("grok_model") or a.get("grok_model") or "grok-build"
+        elif model_kind == "deepseek":
+            eff_model = ov.get("deepseek_model") or a.get("deepseek_model") or "deepseek-v4-flash"
         else:
             eff_model = ov.get("claude_model") or a.get("claude_model") or "claude-sonnet-4-6"
         effort = ov.get("effort") if (ov and "effort" in ov) else a.get("effort")
@@ -547,7 +598,7 @@ def api_project_stats(slug: str):
         # output. Fall back to a chars/4 estimate only when no usage is recorded
         # yet (e.g. a session that has never completed a turn, or a grok node).
         if usage:
-            ctx_tokens = _usage_ctx_tokens(usage)
+            ctx_tokens = _usage_ctx_tokens(usage, window)
             token_source = "exact"
         else:
             sys_chars = 0
@@ -592,6 +643,7 @@ def api_project_rollup(slug: str):
 class AgentSettings(BaseModel):
     claude_model: Optional[str] = None
     grok_model: Optional[str] = None
+    deepseek_model: Optional[str] = None
     effort: Optional[str] = None
 
 
@@ -604,6 +656,7 @@ class NewAgent(BaseModel):
     model: str = "claude"
     claude_model: Optional[str] = None
     grok_model: Optional[str] = None
+    deepseek_model: Optional[str] = None
     effort: Optional[str] = None
     system_prompt_file: Optional[str] = ""
     cwd: Optional[str] = "."
@@ -908,6 +961,7 @@ def api_set_agent_settings(slug: str, agent_id: str, body: AgentSettings):
     db.set_agent_override(slug, agent_id,
                           claude_model=body.claude_model,
                           grok_model=body.grok_model,
+                          deepseek_model=body.deepseek_model,
                           effort=body.effort)
     return {"ok": True}
 
@@ -1228,9 +1282,21 @@ def _session_preamble(project_root: str, agent: dict, cwd_abs: str) -> str:
         except (OSError, ValueError):
             pass
 
+    # Slim self-overview (preferred): the agent's holistic "where am I" snapshot.
+    # Falls back to the input-contract head when absent/empty or body still a
+    # placeholder (body_incomplete) — the migration safety net, so behaviour is
+    # unchanged for any agent that has no overview yet.
+    ov = adir / "overview.md"
+    ov_text = _read_capped(ov, 1600) if ov.is_file() else ""
+    ov_usable = bool(ov_text) and "body_incomplete: true" not in ov_text.lower()
+    if ov_text:
+        parts.append(f"### Overview (slim self-snapshot, `overview.md`)\n{ov_text}")
+
     man = adir / "inputs" / "manifest.md"
     if man.is_file():
-        ex = _read_capped(man, 1200)
+        # When a usable overview is present, the upstream contract is secondary —
+        # cap it tighter to avoid double-loading; full head otherwise (fallback floor).
+        ex = _read_capped(man, 600 if ov_usable else 1200)
         if ex:
             parts.append(f"### Input contract (`inputs/manifest.md`)\n{ex}")
 
@@ -1313,6 +1379,7 @@ async def _run_agent(
     tracker: list,
     chain: tuple = (),
     grok_options: Optional[dict] = None,
+    retry_count: int = 0,
 ) -> str:
     """Run a single agent chat turn. Emit events via callback.
 
@@ -1360,6 +1427,43 @@ async def _run_agent(
             + seed_text + "\n\n---\n\n" + message
         )
     # ----- END SEED ENRICHMENT -----
+
+    # ----- VERSION-PIN DRIFT (spec §6.5) -----
+    # Stale input pins → prepend a high-priority control-plane warning so the agent
+    # re-syncs BEFORE acting on stale upstream. A warn+instruct (not a hard return)
+    # so the agent can run sync.sh itself this same turn — a hard block would
+    # deadlock (only the agent's own turn can fix the pin). It MUST NOT consume the
+    # drifted artifact until re-synced.
+    drift = _check_version_pins(project["root"], project, agent_id)
+    if drift:
+        message = (
+            "[CONTROL-PLANE DRIFT] Your input pins are STALE vs the producer's current "
+            "outputs/manifest.md:\n- " + "\n- ".join(drift) + "\n"
+            "Run `sync.sh " + agent_id + "` and re-read inputs BEFORE any work this turn; "
+            "do NOT consume the drifted artifact until the pin matches.\n\n" + message
+        )
+    # ----- END VERSION-PIN DRIFT -----
+
+    # ----- OPEN-DISSENT GATE (spec §15.2 forcing function) -----
+    # An orchestrator (agent with children) cannot silently proceed while a worker's
+    # dissent is open — prepend it so the model MUST ratify/overrule. The flag stays
+    # in db until a [DISSENT_RESOLVE], so this re-surfaces every turn until addressed.
+    if _get_children(project, agent_id):
+        _dissent_warn = _open_dissent_warning(slug)
+        if _dissent_warn:
+            message = _dissent_warn + message
+    # ----- END OPEN-DISSENT GATE -----
+
+    # ----- VERIFY-DELTA HINT (spec §16.1 incremental verification) -----
+    # An auditor that has declared `verified: PROD@ver` before → control-plane
+    # computes the deterministic skip-set (producers whose version is unchanged) and
+    # injects it, so the auditor re-verifies only the delta. No-op for non-auditors.
+    _vd = _verify_delta(slug, project, agent_id)
+    if _vd:
+        _vd_hint = _verify_delta_hint(_vd)
+        if _vd_hint:
+            message = _vd_hint + message
+    # ----- END VERIFY-DELTA HINT -----
 
     system_prompt = projects.resolve_system_prompt(project["root"], agent.get("system_prompt_file", ""))
     cwd = projects.resolve_cwd(project["root"], agent.get("cwd", "."))
@@ -1419,6 +1523,17 @@ async def _run_agent(
             check_loop=bool(gopts.get("check_loop")),
             memory_mode=gopts.get("memory_mode"),
         )
+    elif model == "deepseek":
+        # Same harness as claude (driven through the proxy); --resume works, so
+        # we keep the normal resume_sid path. Adapter injects the proxy env.
+        agen = stream_fn(
+            message=message,
+            system_prompt=system_prompt,
+            cwd=cwd,
+            model=override.get("deepseek_model") or agent.get("deepseek_model") or "deepseek-v4-flash",
+            effort=effort,
+            resume_session_id=resume_sid,
+        )
     else:
         agen = stream_fn(message=message, system_prompt=system_prompt, cwd=cwd)
 
@@ -1428,6 +1543,7 @@ async def _run_agent(
     sched_seen: set = set()
     sched_stop_seen: set = set()
     final_status = "ok"
+    last_usage: dict = {}          # real token usage of this turn (for context_log)
     new_chain = chain + (agent_id,)
 
     try:
@@ -1500,6 +1616,7 @@ async def _run_agent(
                     db.set_claude_session_id(sess["id"], data["claude_session_id"])
                 if data.get("usage"):
                     db.set_session_usage(sess["id"], data["usage"])
+                    last_usage = data["usage"]
                 await emit({"type": "meta", "agent": agent_id, "data": data})
             elif etype == "thinking":
                 await emit({"type": "thinking", "agent": agent_id, "text": evt.get("text", "")})
@@ -1526,6 +1643,73 @@ async def _run_agent(
         if seed_text and final_status == "ok":
             db.clear_session_seed(sess["id"])
         await emit({"type": "agent_done", "agent": agent_id, "text": final_text, "status": final_status})
+
+        # ----- PER-TURN CONTEXT LOG (feature C) — passive, ~0 token; toggle context_log_enabled -----
+        # One row per real model turn: constructed-context size (system_prompt + the
+        # fully-enriched message that was sent) + this turn's real token usage. No
+        # prompt change, just measurement. resumed=False marks cold-start turns (the
+        # ones that receive the overview injection) for a clean A/B.
+        try:
+            if db.get_setting("context_log_enabled", "1") == "1":
+                _cc = len(system_prompt or "") + len(message or "")
+                _u = last_usage or {}
+                db.add_context_log(
+                    project_slug=slug, agent_id=agent_id, status=final_status,
+                    ctx_chars=_cc, est_tokens=round(_cc / 4),
+                    input_tokens=_u.get("input_tokens"),
+                    cache_read=_u.get("cache_read_input_tokens"),
+                    cache_creation=_u.get("cache_creation_input_tokens"),
+                    output_tokens=_u.get("output_tokens"),
+                    resumed=bool(resume_sid),
+                )
+        except Exception:
+            pass
+        # ----- END CONTEXT LOG -----
+
+    # ----- STRUCTURED OUTPUT: parse [RESULT]/[ESCALATE], retry once, stamp overview (§6.4) -----
+    # Only on a clean turn with text. Absent blocks are fine (no retry). A single
+    # corrective retry on malformed shape; never loops (retry_count guard).
+    if final_status == "ok" and final_text:
+        parsed = _parse_structured(final_text)
+        if parsed["malformed"] and retry_count == 0:
+            corrective = (
+                "[CONTROL-PLANE] Your structured block was malformed: "
+                + (parsed["error"] or "unknown")
+                + ". Re-emit correctly per shared/overview_protocol.md (balanced tags; escalate "
+                "type ∈ {DATA,BOSS_DECISION,HUMAN,SUBTASK,TOOL,BLOCKED}; [HALT]/[DISSENT] REQUIRE `evidence`)."
+            )
+            return await _run_agent(slug, agent_id, corrective, emit, tracker,
+                                    chain, grok_options, retry_count=1)
+        if parsed["result"] and parsed["result"].get("verified"):
+            # Incremental-verify watermark (spec §16.1): record what the auditor
+            # verified + at which producer version, so next pass can skip unchanged.
+            for _prod, _ver in _parse_verified(parsed["result"]["verified"]).items():
+                db.set_verify_watermark(slug, agent_id, _prod, _ver)
+        if parsed["result"] or parsed["escalate"]:
+            adir = _agent_dir(project["root"], agent, cwd)
+            version = _read_manifest_version(adir / "outputs" / "manifest.md")
+            _stamp_overview(adir, version, parsed["escalate"])
+            if parsed["escalate"]:
+                # Route to the parent's ledger so the orchestrator picks it up next
+                # turn (§6.6). Auto-resolution per type (DATA pull / SUBTASK / TOOL) is
+                # deliberately left to BOSS/human — see _handle_escalate docstring.
+                routed = _handle_escalate(parsed["escalate"], slug, project, agent_id)
+                await emit({"type": "meta", "agent": agent_id,
+                            "data": {"escalate": parsed["escalate"], "routed_to": routed}})
+        # Agency mechanisms (spec §15.1/§15.2): soft-trigger (model emits) + hard-enforce here.
+        if parsed["halt"]:
+            routed = _handle_halt(parsed["halt"], slug, project, agent_id)
+            await emit({"type": "meta", "agent": agent_id,
+                        "data": {"halt": parsed["halt"], "routed_to": routed}})
+        if parsed["dissent"]:
+            routed = _handle_dissent(parsed["dissent"], slug, project, agent_id)  # opens BLOCKING-FLAG
+            await emit({"type": "meta", "agent": agent_id,
+                        "data": {"dissent": parsed["dissent"], "routed_to": routed}})
+        if parsed["dissent_resolve"]:
+            n = _handle_dissent_resolve(parsed["dissent_resolve"], slug, agent_id)  # clears the gate
+            await emit({"type": "meta", "agent": agent_id,
+                        "data": {"dissent_resolved": parsed["dissent_resolve"], "count": n}})
+    # ----- END STRUCTURED OUTPUT -----
 
     return "".join(assembled)
 
@@ -1565,6 +1749,346 @@ def _manifest_snapshot(slug: str, agent_id: str) -> Optional[dict]:
     except OSError:
         pass
     return {"mtime": st.st_mtime, "version": version}
+
+
+# ----- STRUCTURED OUTPUT: [RESULT] / [ESCALATE] parse + overview stamp (spec §4, §6.4) -----
+_RESULT_RE = re.compile(r"\[RESULT\](?P<body>.*?)\[/RESULT\]", re.DOTALL | re.IGNORECASE)
+_ESCALATE_RE = re.compile(r"\[ESCALATE\](?P<body>.*?)\[/ESCALATE\]", re.DOTALL | re.IGNORECASE)
+_HALT_RE = re.compile(r"\[HALT\](?P<body>.*?)\[/HALT\]", re.DOTALL | re.IGNORECASE)
+_DISSENT_RE = re.compile(r"\[DISSENT\](?P<body>.*?)\[/DISSENT\]", re.DOTALL | re.IGNORECASE)
+_DISSENT_RESOLVE_RE = re.compile(r"\[DISSENT_RESOLVE\](?P<body>.*?)\[/DISSENT_RESOLVE\]", re.DOTALL | re.IGNORECASE)
+_KV_RE = re.compile(r"^\s*(?P<k>\w+)\s*:\s*(?P<v>.+?)\s*$", re.MULTILINE)
+_ESC_TYPES = {"DATA", "BOSS_DECISION", "HUMAN", "SUBTASK", "TOOL", "BLOCKED"}
+_HALT_REASONS = {"saturated", "dead_end", "false_premise", "diminishing_returns"}
+_DISSENT_VERDICTS = {"ratify", "overrule"}
+
+
+def _kv(body: str) -> dict:
+    return {m.group("k").lower(): m.group("v").strip() for m in _KV_RE.finditer(body)}
+
+
+def _parse_structured(text: str) -> dict:
+    """Parse the optional structured blocks an agent emits at end of turn:
+    [RESULT] / [ESCALATE] / [HALT] / [DISSENT] / [DISSENT_RESOLVE].
+
+    Malformed = an unbalanced open tag, an [ESCALATE] type not in _ESC_TYPES, or a
+    [HALT]/[DISSENT] missing its REQUIRED evidence (the anti-self-certification
+    guardrail — a worker may surface a judgment, never on a bare claim).
+    Absence of any block is NOT malformed (analysis turns emit none).
+    """
+    out: dict = {"result": None, "escalate": None, "halt": None, "dissent": None,
+                 "dissent_resolve": None, "malformed": False, "error": ""}
+
+    def _flag(msg: str) -> None:
+        out["malformed"] = True
+        out["error"] = (out["error"] + "; " + msg).strip("; ")
+
+    for tag in ("[RESULT]", "[ESCALATE]", "[HALT]", "[DISSENT]", "[DISSENT_RESOLVE]"):
+        close = tag[:1] + "/" + tag[1:]
+        if text.count(tag) != text.count(close):
+            _flag(f"unbalanced {tag} tags")
+
+    rm = _RESULT_RE.search(text)
+    if rm:
+        out["result"] = _kv(rm.group("body"))
+    em = _ESCALATE_RE.search(text)
+    if em:
+        esc = _kv(em.group("body"))
+        t = (esc.get("type") or "").upper()
+        if t not in _ESC_TYPES:
+            _flag(f"[ESCALATE] type '{t}' invalid")
+        else:
+            esc["type"] = t
+        out["escalate"] = esc
+
+    # [HALT] (spec §15.1): worker self-halts a futile task. EVIDENCE is required —
+    # a halt without quantitative evidence is a lazy claim, rejected.
+    hm = _HALT_RE.search(text)
+    if hm:
+        h = _kv(hm.group("body"))
+        if not (h.get("evidence") or "").strip():
+            _flag("[HALT] missing required `evidence`")
+        out["halt"] = h
+
+    # [DISSENT] (spec §15.2): worker blocks a wrong DIRECTION. evidence + against required.
+    dm = _DISSENT_RE.search(text)
+    if dm:
+        d = _kv(dm.group("body"))
+        if not (d.get("evidence") or "").strip():
+            _flag("[DISSENT] missing required `evidence`")
+        if not (d.get("against") or "").strip():
+            _flag("[DISSENT] missing required `against`")
+        out["dissent"] = d
+
+    # [DISSENT_RESOLVE] (orchestrator only): ratify|overrule an open dissent.
+    drm = _DISSENT_RESOLVE_RE.search(text)
+    if drm:
+        dr = _kv(drm.group("body"))
+        v = (dr.get("verdict") or "").lower()
+        if v not in _DISSENT_VERDICTS:
+            _flag(f"[DISSENT_RESOLVE] verdict '{v}' invalid")
+        else:
+            dr["verdict"] = v
+        out["dissent_resolve"] = dr
+    return out
+
+
+def _read_manifest_version(out_manifest: Path) -> Optional[str]:
+    """Version from a `outputs/manifest.md` — frontmatter `version:` or `## Version`
+    heading style (same convention as _manifest_snapshot). None when absent."""
+    try:
+        lines = out_manifest.read_text(encoding="utf-8", errors="replace").splitlines()[:40]
+    except OSError:
+        return None
+    for i, line in enumerate(lines):
+        m = re.match(r"\s*version:\s*([\w.\-]+)", line, re.IGNORECASE)
+        if m:
+            return m.group(1)
+        if re.match(r"#+\s*version\s*$", line.strip(), re.IGNORECASE):
+            for nxt in lines[i + 1:i + 4]:
+                nxt = nxt.strip()
+                if nxt:
+                    vm = re.match(r"([\w.\-]+)", nxt)
+                    return vm.group(1) if vm else None
+    return None
+
+
+def _stamp_overview(agent_dir: Path, version: Optional[str], escalate: Optional[dict]) -> None:
+    """Overwrite the MACHINE fields of overview.md (agent owns the BODY, we own
+    the header echo). manifest_version ← real version; last_updated ← today;
+    body_incomplete ← heuristic (placeholder / near-empty BODY); open_escalation
+    ← escalate summary when present. No-op when the agent has no overview yet."""
+    ov = agent_dir / "overview.md"
+    if not ov.is_file():
+        return
+    try:
+        txt = ov.read_text(encoding="utf-8")
+    except OSError:
+        return
+
+    bm = re.search(r"<!-- OVERVIEW:BODY -->(.*?)<!-- /OVERVIEW:BODY -->", txt, re.DOTALL)
+    body = bm.group(1) if bm else ""
+    incomplete = ("(chờ" in body) or (len(body.strip()) < 40)
+    today = time.strftime("%Y-%m-%d")
+
+    def _set(key: str, val: str) -> None:
+        nonlocal txt
+        txt = re.sub(rf"(?m)^({re.escape(key)}:).*$",
+                     lambda m: f"{m.group(1)} {val}", txt, count=1)
+
+    if version:
+        _set("manifest_version", version)
+    _set("body_incomplete", "true" if incomplete else "false")
+    _set("last_updated", today)
+    if escalate:
+        summary = (f"{escalate.get('type', '?')}→{escalate.get('target', '?')}: "
+                   f"{escalate.get('reason', '')}")[:120]
+        _set("open_escalation", summary)
+
+    try:
+        ov.write_text(txt, encoding="utf-8")
+    except OSError:
+        pass
+
+
+def _read_overview_flag(agent_dir: Path) -> Optional[bool]:
+    """`body_incomplete` from an agent's overview.md HEADER. None when no overview."""
+    ov = agent_dir / "overview.md"
+    try:
+        for line in ov.read_text(encoding="utf-8", errors="replace").splitlines()[:30]:
+            m = re.match(r"\s*body_incomplete:\s*(true|false)", line, re.IGNORECASE)
+            if m:
+                return m.group(1).lower() == "true"
+    except OSError:
+        return None
+    return None
+
+
+def _check_version_pins(project_root: str, project: dict, agent_id: str) -> list[str]:
+    """Drift report: input pins in `<agent>/inputs/manifest.md` that no longer
+    match the producer's current `outputs/manifest.md` version. Empty = clean.
+
+    Best-effort + fail-open: an unparseable inputs file yields no drift (never a
+    spurious block). Generic `- <PRODUCER>: <ver>` line shape (all-caps id).
+    """
+    agents = {a["id"]: a for a in project["agents"]}
+    agent = agents.get(agent_id)
+    if not agent:
+        return []
+    adir = _agent_dir(project_root, agent, projects.resolve_cwd(project_root, agent.get("cwd", ".")))
+    try:
+        lines = (adir / "inputs" / "manifest.md").read_text(encoding="utf-8", errors="replace").splitlines()
+    except OSError:
+        return []
+    drift: list[str] = []
+    for line in lines:
+        m = re.match(r"\s*-\s*([A-Z][A-Z0-9_]*)\s*:\s*([\w.\-]+)", line)
+        if not m:
+            continue
+        prod, pinned = m.group(1), m.group(2)
+        prod_agent = agents.get(prod)
+        if not prod_agent:
+            continue
+        pdir = _agent_dir(project_root, prod_agent,
+                          projects.resolve_cwd(project_root, prod_agent.get("cwd", ".")))
+        current = _read_manifest_version(pdir / "outputs" / "manifest.md")
+        if current and pinned and current != pinned:
+            drift.append(f"{prod} pinned={pinned} current={current}")
+    return drift
+
+
+def _handle_escalate(esc: dict, slug: str, project: dict, agent_id: str) -> Optional[str]:
+    """Route a worker's [ESCALATE] to its parent's dispatch ledger so the
+    orchestrator picks it up next turn (reuses the ledger — no separate table).
+
+    NOTE: type-specific AUTO-resolution (DATA auto-pull+stamp, SUBTASK auto-dispatch,
+    TOOL exec) is deliberately NOT performed here. Those need project-specific
+    extraction and carry correctness risk (pulling a wrong/stale section, running an
+    arbitrary tool). Surfacing to the orchestrator keeps BOSS/human in the loop.
+    Returns the parent agent id routed to, or None for a top-level agent.
+    """
+    agents = {a["id"]: a for a in project["agents"]}
+    agent = agents.get(agent_id)
+    if not agent:
+        return None
+    parents = agent.get("parents") or []
+    parent = parents[0] if parents else None
+    if not parent:
+        return None  # top-level agent → already surfaced via the meta event
+    db.record_dispatch_result(
+        project_slug=slug, source_agent=parent, target_agent=agent_id,
+        task=f"ESCALATE:{esc.get('type', '?')} → {esc.get('target', '?')}",
+        result_text="[ESCALATION from worker — route per type, do NOT ignore]\n"
+                    + json.dumps(esc, ensure_ascii=False, indent=2),
+        status="ok",
+    )
+    return parent
+
+
+def _parent_of(project: dict, agent_id: str) -> Optional[str]:
+    agent = next((a for a in project["agents"] if a["id"] == agent_id), None)
+    parents = (agent or {}).get("parents") or []
+    return parents[0] if parents else None
+
+
+def _handle_halt(halt: dict, slug: str, project: dict, agent_id: str) -> Optional[str]:
+    """Worker self-halted a futile task (spec §15.1). Log it (audit halt-rate) and
+    surface to the parent's ledger as a recommendation. NO auto-resume — the turn
+    already ended; BOSS reads it next turn and may overturn (re-dispatch)."""
+    db.add_halt_log(slug, agent_id, reason=halt.get("reason", ""), evidence=halt.get("evidence", ""),
+                    recommendation=halt.get("recommendation", ""), confidence=halt.get("confidence", ""))
+    parent = _parent_of(project, agent_id)
+    if parent:
+        db.record_dispatch_result(
+            project_slug=slug, source_agent=parent, target_agent=agent_id,
+            task=f"HALT:{halt.get('reason', '?')}",
+            result_text="[SELF-HALT from worker — judgment, not failure. Ratify or overturn]\n"
+                        + json.dumps(halt, ensure_ascii=False, indent=2),
+            status="ok",
+        )
+    return parent
+
+
+def _handle_dissent(dissent: dict, slug: str, project: dict, agent_id: str) -> Optional[str]:
+    """Worker dissents a DIRECTION (spec §15.2). Record a BLOCKING-FLAG (the HARD
+    forcing half — gated in _run_agent) + surface to the parent's ledger."""
+    db.add_dissent_flag(slug, source_agent=agent_id, against=dissent.get("against", ""),
+                        reason=dissent.get("reason", ""), evidence=dissent.get("evidence", ""),
+                        severity=(dissent.get("severity") or "blocking").lower())
+    parent = _parent_of(project, agent_id)
+    if parent:
+        db.record_dispatch_result(
+            project_slug=slug, source_agent=parent, target_agent=agent_id,
+            task=f"DISSENT against: {dissent.get('against', '?')}",
+            result_text="[DISSENT from worker — you MUST ratify or overrule before proceeding on this]\n"
+                        + json.dumps(dissent, ensure_ascii=False, indent=2),
+            status="ok",
+        )
+    return parent
+
+
+def _handle_dissent_resolve(dr: dict, slug: str, agent_id: str) -> int:
+    """Orchestrator resolves an open dissent (ratify|overrule). Clears the gate."""
+    return db.resolve_dissent(slug, against=dr.get("against", ""), verdict=dr.get("verdict", ""),
+                              resolved_by=agent_id, resolution_reason=dr.get("reason", ""))
+
+
+def _open_dissent_warning(slug: str) -> str:
+    """Forcing function (spec §15.2): text prepended to an orchestrator's turn while
+    any dissent is open, so it CANNOT silently proceed. Empty when none open."""
+    flags = db.get_open_dissents(slug)
+    if not flags:
+        return ""
+    lines = [f"- against \"{f['against']}\" (from {f['source_agent']}, {f.get('severity') or 'blocking'}): "
+             f"{f.get('reason') or ''} | evidence: {(f.get('evidence') or '')[:200]}" for f in flags]
+    return (
+        "[CONTROL-PLANE OPEN DISSENT] A worker has blocked one or more directions. You MUST address each "
+        "before proceeding on it — emit `[DISSENT_RESOLVE]\\nagainst: <…>\\nverdict: ratify|overrule\\nreason: <…>\\n[/DISSENT_RESOLVE]`:\n"
+        + "\n".join(lines) + "\n\n"
+    )
+
+
+def _parse_verified(s: str) -> dict:
+    """Parse a [RESULT] `verified:` field — 'PROD@ver, PROD@ver' → {PROD: ver}."""
+    out: dict = {}
+    for tok in re.split(r"[,\n]", s or ""):
+        m = re.match(r"\s*([A-Za-z][\w-]*)\s*@\s*([\w.\-]+)", tok)
+        if m:
+            out[m.group(1).upper()] = m.group(2)
+    return out
+
+
+def _verify_delta(slug: str, project: dict, agent_id: str) -> Optional[dict]:
+    """Incremental verification (spec §16.1): compare an auditor's stored watermarks
+    vs producers' CURRENT versions → {skip, reverify}. None when no watermark yet
+    (the agent never declared `verified:` → not an incremental auditor)."""
+    wm = db.get_verify_watermarks(slug, agent_id)
+    if not wm:
+        return None
+    agents = {a["id"]: a for a in project["agents"]}
+    skip, reverify = [], []
+    for prod, vver in wm.items():
+        pa = agents.get(prod)
+        cur = None
+        if pa:
+            pdir = _agent_dir(project["root"], pa, projects.resolve_cwd(project["root"], pa.get("cwd", ".")))
+            cur = _read_manifest_version(pdir / "outputs" / "manifest.md")
+        if cur and cur == vver:
+            skip.append(f"{prod}@{vver}")
+        else:
+            reverify.append(f"{prod} (verified@{vver} → now {cur or '?'})")
+    return {"skip": skip, "reverify": reverify}
+
+
+def _verify_delta_hint(delta: Optional[dict]) -> str:
+    """Forcing hint prepended to an auditor's turn: the deterministic SKIP set it
+    must trust (don't re-audit unchanged), turning O(N) re-audit into O(Δ)."""
+    if not delta or not delta.get("skip"):
+        return ""
+    txt = ("[CONTROL-PLANE VERIFY-DELTA] Incremental verification (spec §16.1). You already verified these "
+           "at the SAME producer version — do NOT re-resolve/re-audit, trust your prior verdict:\n  SKIP: "
+           + ", ".join(delta["skip"]) + "\n")
+    if delta.get("reverify"):
+        txt += "  RE-VERIFY (changed/new since your watermark): " + ", ".join(delta["reverify"]) + "\n"
+    txt += ("Re-verify ONLY the changed/new set; run cheap mechanical checks (count-reconcile/dedup/drift) "
+            "every pass but reserve identifier-resolution/web for the RE-VERIFY set + publish-gate. Advance "
+            "your watermark by emitting `verified: PROD@ver, …` in [RESULT].\n\n")
+    return txt
+
+
+def _parse_goal(task: str) -> Optional[dict]:
+    """Extract a `goal:` sub-block from an Outcome dispatch body (spec §14.2). The
+    control-plane cannot read arbitrary project metrics, so this only captures the
+    contract fields — the gate enforces PROCESS (no self-certification), not the value."""
+    if not re.search(r"(?mi)^\s*goal:", task) and "mode: outcome" not in task.lower():
+        return None
+    fields: dict = {}
+    for key in ("type", "predicate", "baseline_value", "metric_pinned", "acceptance_by"):
+        m = re.search(rf"(?mi)^\s*{key}:\s*(.+)$", task)
+        if m:
+            fields[key] = m.group(1).strip()
+    return fields or None
+# ----- END STRUCTURED OUTPUT -----
 
 
 async def _dispatched_run(slug, source_id, target_id, task, emit, tracker, chain):
@@ -1630,6 +2154,28 @@ async def _dispatched_run(slug, source_id, target_id, task, emit, tracker, chain
                 f"(version {manifest_before.get('version') or '?'} → {after.get('version') or '?'})."
             )
 
+    # Goal-gate (spec §6.8/§14.4): an Outcome dispatch carries a goal contract. The
+    # control-plane cannot read arbitrary project metrics, so it enforces PROCESS, not
+    # the value: a worker's self-reported goal_status is a CLAIM, never acceptance —
+    # acceptance is by the external authority. (Budget/loop is bounded by the existing
+    # continuation cap; metric plateau detection would need a project-specific reader.)
+    if status == "ok":
+        goal = _parse_goal(task)
+        if goal:
+            claimed = (_parse_structured(result_text or "").get("result") or {}).get("goal_status")
+            acc = goal.get("acceptance_by", "control_plane")
+            note = (f"\n\n[control-plane goal-gate] acceptance_by={acc}. Worker self-reported "
+                    f"goal_status={claimed or 'none'} — a CLAIM, not acceptance. Do NOT accept on "
+                    "self-report")
+            if acc and acc.lower().replace("-", "_") != "control_plane":
+                note += f"; route to {acc} to verify before consuming."
+            else:
+                note += "; verify the pinned predicate/metric yourself before consuming."
+            if goal.get("type", "").lower().startswith("direction") and goal.get("baseline_value"):
+                note += (f" Directional: require new > baseline {goal['baseline_value']} on "
+                         f"{goal.get('metric_pinned', 'the pinned metric')}.")
+            result_text = (result_text or "") + note
+
     db.record_dispatch_result(
         project_slug=slug, source_agent=source_id, target_agent=target_id,
         task=task,
@@ -1678,6 +2224,8 @@ async def _auto_compact_if_needed(slug: str, agent_id: str, emit) -> bool:
     ov = db.get_agent_override(slug, agent_id) or {}
     if model_kind == "grok":
         eff_model = ov.get("grok_model") or agent.get("grok_model") or "grok-build"
+    elif model_kind == "deepseek":
+        eff_model = ov.get("deepseek_model") or agent.get("deepseek_model") or "deepseek-v4-flash"
     else:
         eff_model = ov.get("claude_model") or agent.get("claude_model") or "claude-sonnet-4-6"
     pct = _session_context_pct(sess, model_kind, eff_model)
@@ -2038,6 +2586,25 @@ def api_set_scheduler_enabled(payload: dict = Body(default={"enabled": True})):
         # one-shots. Only the 0→1 transition triggers this.
         _skip_overdue_on_resume()
     return {"enabled": _scheduler_enabled()}
+
+
+# ---------- Per-turn context log (feature C): report + on/off toggle ----------
+
+@app.get("/api/context-log/report")
+def api_context_log_report(project: Optional[str] = None):
+    return {"rows": db.context_log_report(project)}
+
+
+@app.get("/api/context-log/enabled")
+def api_get_context_log_enabled():
+    return {"enabled": db.get_setting("context_log_enabled", "1") == "1"}
+
+
+@app.post("/api/context-log/enabled")
+def api_set_context_log_enabled(payload: dict = Body(default={"enabled": True})):
+    en = bool(payload.get("enabled", True)) if isinstance(payload, dict) else True
+    db.set_setting("context_log_enabled", "1" if en else "0")
+    return {"enabled": db.get_setting("context_log_enabled", "1") == "1"}
 
 
 # ---------- Scheduler loop (fires due schedules; see docs/scheduler-spec.md) ----------

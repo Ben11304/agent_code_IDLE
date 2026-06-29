@@ -1,3 +1,7 @@
 projects:
-  - /Users/viethuy/Working_space/ConstructionVLM-Eval-AGENT
-  - /Users/viethuy/Working_space/energy-infrastructure-risk/.claude/AGENT
+  - /users/PGS0407/binben14/VietHuy/ConstructionVLM-Eval-AGENT
+  - /users/PGS0407/binben14/VietHuy/DFU-Pipeline-AGENT
+  - /users/PGS0407/binben14/VietHuy/ConSynth-X/AGENT
+  - /users/PGS0407/binben14/VietHuy/Hoang/ADE
+  - /users/PGS0407/binben14/VietHuy/Sci_Agent
+  - /users/PGS0407/binben14/VietHuy/AECPlayGround-AGENT

@@ -48,6 +48,7 @@ def init_db() -> None:
                 agent_id TEXT NOT NULL,
                 claude_model TEXT,
                 grok_model TEXT,
+                deepseek_model TEXT,
                 effort TEXT,
                 updated_at REAL NOT NULL,
                 PRIMARY KEY (project_slug, agent_id)
@@ -103,10 +104,62 @@ def init_db() -> None:
                 key TEXT PRIMARY KEY,
                 value TEXT NOT NULL
             );
+            CREATE TABLE IF NOT EXISTS context_log (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                project_slug TEXT NOT NULL,
+                agent_id TEXT NOT NULL,
+                status TEXT,
+                ctx_chars INTEGER NOT NULL,
+                est_tokens INTEGER NOT NULL,
+                input_tokens INTEGER,
+                cache_read INTEGER,
+                cache_creation INTEGER,
+                output_tokens INTEGER,
+                resumed INTEGER,
+                created_at REAL NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_ctxlog_proj_agent
+                ON context_log(project_slug, agent_id, created_at);
+            CREATE TABLE IF NOT EXISTS dissent_flags (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                project_slug TEXT NOT NULL,
+                source_agent TEXT NOT NULL,
+                against TEXT NOT NULL,
+                reason TEXT,
+                evidence TEXT,
+                severity TEXT,
+                status TEXT NOT NULL DEFAULT 'open',
+                verdict TEXT,
+                resolved_by TEXT,
+                resolution_reason TEXT,
+                created_at REAL NOT NULL,
+                resolved_at REAL
+            );
+            CREATE INDEX IF NOT EXISTS idx_dissent_open
+                ON dissent_flags(project_slug, status);
+            CREATE TABLE IF NOT EXISTS halt_log (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                project_slug TEXT NOT NULL,
+                agent_id TEXT NOT NULL,
+                reason TEXT,
+                evidence TEXT,
+                recommendation TEXT,
+                confidence TEXT,
+                created_at REAL NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS verify_watermark (
+                project_slug TEXT NOT NULL,
+                auditor TEXT NOT NULL,
+                producer TEXT NOT NULL,
+                verified_version TEXT,
+                verified_at REAL NOT NULL,
+                PRIMARY KEY (project_slug, auditor, producer)
+            );
             """
         )
         # backward-compat: add grok_model column if older db
         _ensure_column(c, "agent_overrides", "grok_model", "TEXT")
+        _ensure_column(c, "agent_overrides", "deepseek_model", "TEXT")
         # latest real token usage from the CLI (JSON: input/output/cache buckets)
         _ensure_column(c, "sessions", "usage", "TEXT")
         # one-time context seed (compact recap) prepended to this session's next turn
@@ -240,7 +293,7 @@ def clear_session_seed(session_id: str) -> None:
 def get_agent_override(project_slug: str, agent_id: str) -> dict | None:
     with _conn() as c:
         row = c.execute(
-            "SELECT claude_model, grok_model, effort FROM agent_overrides "
+            "SELECT claude_model, grok_model, deepseek_model, effort FROM agent_overrides "
             "WHERE project_slug=? AND agent_id=?",
             (project_slug, agent_id),
         ).fetchone()
@@ -249,6 +302,7 @@ def get_agent_override(project_slug: str, agent_id: str) -> dict | None:
     return {
         "claude_model": row["claude_model"],
         "grok_model": row["grok_model"],
+        "deepseek_model": row["deepseek_model"],
         "effort": row["effort"],
     }
 
@@ -256,27 +310,30 @@ def get_agent_override(project_slug: str, agent_id: str) -> dict | None:
 def set_agent_override(project_slug: str, agent_id: str,
                        claude_model: str | None,
                        grok_model: str | None,
+                       deepseek_model: str | None,
                        effort: str | None) -> None:
     with _conn() as c:
         c.execute(
-            "INSERT INTO agent_overrides(project_slug, agent_id, claude_model, grok_model, effort, updated_at) "
-            "VALUES (?, ?, ?, ?, ?, ?) "
+            "INSERT INTO agent_overrides(project_slug, agent_id, claude_model, grok_model, deepseek_model, effort, updated_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?) "
             "ON CONFLICT(project_slug, agent_id) DO UPDATE SET "
             "claude_model=excluded.claude_model, grok_model=excluded.grok_model, "
+            "deepseek_model=excluded.deepseek_model, "
             "effort=excluded.effort, updated_at=excluded.updated_at",
-            (project_slug, agent_id, claude_model, grok_model, effort, time.time()),
+            (project_slug, agent_id, claude_model, grok_model, deepseek_model, effort, time.time()),
         )
 
 
 def list_agent_overrides(project_slug: str) -> dict[str, dict]:
     with _conn() as c:
         rows = c.execute(
-            "SELECT agent_id, claude_model, grok_model, effort FROM agent_overrides WHERE project_slug=?",
+            "SELECT agent_id, claude_model, grok_model, deepseek_model, effort FROM agent_overrides WHERE project_slug=?",
             (project_slug,),
         ).fetchall()
     return {r["agent_id"]: {
         "claude_model": r["claude_model"],
         "grok_model": r["grok_model"],
+        "deepseek_model": r["deepseek_model"],
         "effort": r["effort"],
     } for r in rows}
 
@@ -550,3 +607,124 @@ def set_setting(key: str, value: str) -> None:
             "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
             (key, value),
         )
+
+
+# ---------------------------------------------------------------------------
+# Per-turn context log (feature C) — passive measurement, ~free. One row per
+# model turn: the constructed-context size (system_prompt + enriched message)
+# plus the real token usage. Lets you A/B overview-mode vs manifest-mode on the
+# constructed context, free of the prompt-cache confound. Gated by
+# settings.context_log_enabled (default "1").
+# ---------------------------------------------------------------------------
+
+def add_context_log(project_slug: str, agent_id: str, status: str | None,
+                    ctx_chars: int, est_tokens: int,
+                    input_tokens=0, cache_read=0, cache_creation=0,
+                    output_tokens=0, resumed: bool = False) -> None:
+    with _conn() as c:
+        c.execute(
+            "INSERT INTO context_log(project_slug, agent_id, status, ctx_chars, est_tokens, "
+            "input_tokens, cache_read, cache_creation, output_tokens, resumed, created_at) "
+            "VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+            (project_slug, agent_id, status, int(ctx_chars), int(est_tokens),
+             int(input_tokens or 0), int(cache_read or 0), int(cache_creation or 0),
+             int(output_tokens or 0), 1 if resumed else 0, time.time()),
+        )
+
+
+# ---------------------------------------------------------------------------
+# Dissent flags (spec §15.2) + halt log (spec §15.1) — agency enforcement state.
+# Dissent is the HARD half: a blocking-flag the orchestrator cannot silently
+# bypass (gated in main._run_agent). Halt-log is an audit trail (halt-rate).
+# ---------------------------------------------------------------------------
+
+def add_dissent_flag(project_slug: str, source_agent: str, against: str,
+                     reason: str = "", evidence: str = "", severity: str = "blocking") -> None:
+    with _conn() as c:
+        c.execute(
+            "INSERT INTO dissent_flags(project_slug, source_agent, against, reason, evidence, "
+            "severity, status, created_at) VALUES (?,?,?,?,?,?,'open',?)",
+            (project_slug, source_agent, against, reason, evidence, severity, time.time()),
+        )
+
+
+def get_open_dissents(project_slug: str) -> list[dict]:
+    with _conn() as c:
+        rows = c.execute(
+            "SELECT * FROM dissent_flags WHERE project_slug=? AND status='open' ORDER BY created_at",
+            (project_slug,),
+        ).fetchall()
+    return [dict(r) for r in rows]
+
+
+def resolve_dissent(project_slug: str, against: str, verdict: str,
+                    resolved_by: str, resolution_reason: str = "") -> int:
+    """Mark open dissents matching `against` resolved. Returns rows affected."""
+    with _conn() as c:
+        cur = c.execute(
+            "UPDATE dissent_flags SET status='resolved', verdict=?, resolved_by=?, "
+            "resolution_reason=?, resolved_at=? WHERE project_slug=? AND against=? AND status='open'",
+            (verdict, resolved_by, resolution_reason, time.time(), project_slug, against),
+        )
+        return cur.rowcount
+
+
+def add_halt_log(project_slug: str, agent_id: str, reason: str = "", evidence: str = "",
+                 recommendation: str = "", confidence: str = "") -> None:
+    with _conn() as c:
+        c.execute(
+            "INSERT INTO halt_log(project_slug, agent_id, reason, evidence, recommendation, "
+            "confidence, created_at) VALUES (?,?,?,?,?,?,?)",
+            (project_slug, agent_id, reason, evidence, recommendation, confidence, time.time()),
+        )
+
+
+# ---------------------------------------------------------------------------
+# Verify watermark (spec §16.1) — incremental verification. An auditor declares
+# `verified: PROD@ver` in its [RESULT]; control-plane stores it, then on the next
+# audit pass computes the delta (producer version unchanged → SKIP re-verify).
+# Turns O(N per change) re-audit into O(Δ). The version-compare is deterministic
+# (hard); the judgment "is it real" stays the auditor's (soft).
+# ---------------------------------------------------------------------------
+
+def set_verify_watermark(project_slug: str, auditor: str, producer: str, verified_version: str) -> None:
+    with _conn() as c:
+        c.execute(
+            "INSERT INTO verify_watermark(project_slug, auditor, producer, verified_version, verified_at) "
+            "VALUES (?,?,?,?,?) ON CONFLICT(project_slug, auditor, producer) "
+            "DO UPDATE SET verified_version=excluded.verified_version, verified_at=excluded.verified_at",
+            (project_slug, auditor, producer, verified_version, time.time()),
+        )
+
+
+def get_verify_watermarks(project_slug: str, auditor: str) -> dict:
+    with _conn() as c:
+        rows = c.execute(
+            "SELECT producer, verified_version FROM verify_watermark WHERE project_slug=? AND auditor=?",
+            (project_slug, auditor),
+        ).fetchall()
+    return {r["producer"]: r["verified_version"] for r in rows}
+
+
+def context_log_report(project_slug: str | None = None) -> list[dict]:
+    """Per-(project, agent) aggregate over the context log: turn count, average
+    constructed-context tokens/chars, average cache_creation + output, and how
+    many turns were cold-start (resumed=0 → the ones that get the overview
+    injection). Ordered by heaviest constructed context first."""
+    where = "WHERE project_slug=?" if project_slug else ""
+    args = (project_slug,) if project_slug else ()
+    with _conn() as c:
+        rows = c.execute(
+            f"""SELECT project_slug, agent_id,
+                       COUNT(*)              AS turns,
+                       ROUND(AVG(est_tokens)) AS avg_ctx_tok,
+                       ROUND(AVG(ctx_chars))  AS avg_ctx_chars,
+                       ROUND(AVG(cache_creation)) AS avg_cache_cr,
+                       ROUND(AVG(output_tokens))  AS avg_out,
+                       SUM(CASE WHEN resumed=0 THEN 1 ELSE 0 END) AS coldstart_turns
+                FROM context_log {where}
+                GROUP BY project_slug, agent_id
+                ORDER BY avg_ctx_tok DESC""",
+            args,
+        ).fetchall()
+    return [dict(r) for r in rows]

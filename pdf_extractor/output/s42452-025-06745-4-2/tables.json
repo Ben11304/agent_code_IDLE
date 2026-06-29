@@ -1,0 +1,66 @@
+[
+  {
+    "page": 6,
+    "table_index": 0,
+    "data": [
+      [
+        "Class",
+        "Image"
+      ],
+      [
+        "Grade 0",
+        ""
+      ],
+      [
+        "Grade 1",
+        ""
+      ],
+      [
+        "Grade 2",
+        ""
+      ],
+      [
+        "Grade 3",
+        ""
+      ],
+      [
+        "Grade 4",
+        ""
+      ]
+    ]
+  },
+  {
+    "page": 2,
+    "table_index": "wagner_from_text",
+    "data": [
+      [
+        "Grade",
+        "Description"
+      ],
+      [
+        "Grade 0",
+        "Intact skin, or No ulcer in a high-risk foot"
+      ],
+      [
+        "Grade 1",
+        "Superficial ulcer or Superficial ulcer involving full skin thickness but not underlying tissues"
+      ],
+      [
+        "Grade 2",
+        "Deep ulcer to tendon or Deep ulcer, penetrating down to ligaments and muscle, but no bone involvement or abscess formation"
+      ],
+      [
+        "Grade 3",
+        "Deep ulcer with abscess or Deep ulcer with cellulitis or abscess formation, often with osteomyelitis"
+      ],
+      [
+        "Grade 4",
+        "Whole foot gangrene or Localized gangrene"
+      ],
+      [
+        "Grade 5",
+        "Extensive gangrene involving the whole foot"
+      ]
+    ]
+  }
+]

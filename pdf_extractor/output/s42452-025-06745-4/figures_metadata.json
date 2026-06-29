@@ -1,0 +1,206 @@
+[
+  {
+    "page": 1,
+    "filename": "fig_p1_0_0.png",
+    "bbox": [
+      51.02362060546875,
+      180.2324676513672,
+      183.02362060546875,
+      191.032470703125
+    ],
+    "label": "Figure on page 1",
+    "path": "figures/fig_p1_0_0.png"
+  },
+  {
+    "page": 6,
+    "filename": "fig_p6_0_0.png",
+    "bbox": [
+      155.06576538085938,
+      95.17529296875,
+      473.32977294921875,
+      659.3193359375
+    ],
+    "label": "Figure on page 6",
+    "path": "figures/fig_p6_0_0.png"
+  },
+  {
+    "page": 7,
+    "filename": "fig_p7_0_0.png",
+    "bbox": [
+      53.85779571533203,
+      57.75581359863281,
+      541.4177856445312,
+      287.19580078125
+    ],
+    "label": "Figure on page 7",
+    "path": "figures/fig_p7_0_0.png"
+  },
+  {
+    "page": 8,
+    "filename": "fig_p8_0_0.png",
+    "bbox": [
+      53.85779571533203,
+      57.75579833984375,
+      541.4177856445312,
+      463.5957946777344
+    ],
+    "label": "Figure on page 8",
+    "path": "figures/fig_p8_0_0.png"
+  },
+  {
+    "page": 9,
+    "filename": "fig_p9_0_0.png",
+    "bbox": [
+      184.25196838378906,
+      220.4627685546875,
+      544.251953125,
+      348.6227722167969
+    ],
+    "label": "Figure on page 9",
+    "path": "figures/fig_p9_0_0.png"
+  },
+  {
+    "page": 9,
+    "filename": "fig_p9_1_0.png",
+    "bbox": [
+      184.25196838378906,
+      57.75578308105469,
+      544.251953125,
+      203.915771484375
+    ],
+    "label": "Figure on page 9",
+    "path": "figures/fig_p9_1_0.png"
+  },
+  {
+    "page": 10,
+    "filename": "fig_p10_0_0.png",
+    "bbox": [
+      184.25196838378906,
+      57.755828857421875,
+      544.251953125,
+      262.7158203125
+    ],
+    "label": "Figure on page 10",
+    "path": "figures/fig_p10_0_0.png"
+  },
+  {
+    "page": 11,
+    "filename": "fig_p11_0_0.png",
+    "bbox": [
+      184.25196838378906,
+      496.93780517578125,
+      544.251953125,
+      715.5778198242188
+    ],
+    "label": "Figure on page 11",
+    "path": "figures/fig_p11_0_0.png"
+  },
+  {
+    "page": 11,
+    "filename": "fig_p11_1_0.png",
+    "bbox": [
+      184.25196838378906,
+      272.03082275390625,
+      544.251953125,
+      479.63079833984375
+    ],
+    "label": "Figure on page 11",
+    "path": "figures/fig_p11_1_0.png"
+  },
+  {
+    "page": 12,
+    "filename": "fig_p12_0_0.png",
+    "bbox": [
+      184.25196838378906,
+      543.9778442382812,
+      544.251953125,
+      715.5778198242188
+    ],
+    "label": "Figure on page 12",
+    "path": "figures/fig_p12_0_0.png"
+  },
+  {
+    "page": 13,
+    "filename": "fig_p13_0_0.png",
+    "bbox": [
+      184.25196838378906,
+      332.9627685546875,
+      544.251953125,
+      552.4427490234375
+    ],
+    "label": "Figure on page 13",
+    "path": "figures/fig_p13_0_0.png"
+  },
+  {
+    "page": 13,
+    "filename": "fig_p13_1_0.png",
+    "bbox": [
+      184.25196838378906,
+      57.75579833984375,
+      544.251953125,
+      305.3157958984375
+    ],
+    "label": "Figure on page 13",
+    "path": "figures/fig_p13_1_0.png"
+  },
+  {
+    "page": 14,
+    "filename": "fig_p14_0_0.png",
+    "bbox": [
+      184.25196838378906,
+      311.66680908203125,
+      544.251953125,
+      520.5867919921875
+    ],
+    "label": "Figure on page 14",
+    "path": "figures/fig_p14_0_0.png"
+  },
+  {
+    "page": 14,
+    "filename": "fig_p14_1_0.png",
+    "bbox": [
+      184.25196838378906,
+      558.6177978515625,
+      544.251953125,
+      715.5777587890625
+    ],
+    "label": "Figure on page 14",
+    "path": "figures/fig_p14_1_0.png"
+  },
+  {
+    "page": 14,
+    "filename": "fig_p14_2_0.png",
+    "bbox": [
+      184.25196838378906,
+      57.75581359863281,
+      544.251953125,
+      273.63580322265625
+    ],
+    "label": "Figure on page 14",
+    "path": "figures/fig_p14_2_0.png"
+  },
+  {
+    "page": 15,
+    "filename": "fig_p15_0_0.png",
+    "bbox": [
+      184.25196838378906,
+      419.8487548828125,
+      544.251953125,
+      628.0487670898438
+    ],
+    "label": "Figure on page 15",
+    "path": "figures/fig_p15_0_0.png"
+  },
+  {
+    "page": 15,
+    "filename": "fig_p15_1_0.png",
+    "bbox": [
+      184.25196838378906,
+      194.94175720214844,
+      544.251953125,
+      395.5817565917969
+    ],
+    "label": "Figure on page 15",
+    "path": "figures/fig_p15_1_0.png"
+  }
+]

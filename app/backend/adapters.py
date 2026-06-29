@@ -23,6 +23,15 @@ class AdapterError(Exception):
     pass
 
 
+# StreamReader line-buffer cap for the stream-json reader. claude/grok emit one
+# JSON event per line; a single event can be large when the model writes a whole
+# file in one tool block (e.g. a LaTeX manuscript or two big TikZ figures). The
+# old 1 MiB cap made readline() drop the line AND raise ValueError ("Separator is
+# not found, and chunk exceed the limit") — which crashed the whole turn. We raise
+# the cap and, in the read loop, recover from an oversized line instead of raising.
+_READER_LIMIT = 64 * 2 ** 20  # 64 MiB
+
+
 # ---------------------------------------------------------------------------
 # Claude adapter — wraps `claude -p` (Claude Code CLI, subscription auth).
 # ---------------------------------------------------------------------------
@@ -34,6 +43,7 @@ async def claude_stream(
     model: str = "claude-sonnet-4-6",
     effort: str | None = None,
     resume_session_id: str | None = None,
+    extra_env: dict | None = None,
 ) -> AsyncIterator[dict]:
     if shutil.which("claude") is None:
         yield {"type": "error", "message": "claude CLI not found on PATH"}
@@ -70,12 +80,16 @@ async def claude_stream(
         stdout=slave_fd,
         stderr=asyncio.subprocess.PIPE,
         cwd=cwd,
-        env={**os.environ, "FORCE_COLOR": "0", "NO_COLOR": "1", "TERM": "dumb"},
+        # extra_env (per-subprocess only — never mutate the global os.environ) is
+        # how the DeepSeek adapter points THIS claude -p at a local Anthropic-
+        # compatible proxy without touching the user's normal Claude CLI / OAuth.
+        env={**os.environ, "FORCE_COLOR": "0", "NO_COLOR": "1", "TERM": "dumb",
+             **(extra_env or {})},
     )
     os.close(slave_fd)
 
     loop = asyncio.get_event_loop()
-    reader = asyncio.StreamReader(limit=2 ** 20)
+    reader = asyncio.StreamReader(limit=_READER_LIMIT)
     protocol = asyncio.StreamReaderProtocol(reader)
     transport, _ = await loop.connect_read_pipe(
         lambda: protocol, os.fdopen(master_fd, "rb", buffering=0)
@@ -85,7 +99,18 @@ async def claude_stream(
     claude_session_id: str | None = None
 
     try:
-        async for raw_line in reader:
+        while True:
+            try:
+                raw_line = await reader.readline()
+            except (ValueError, asyncio.LimitOverrunError):
+                # A single stream-json event exceeded the reader buffer (e.g. a
+                # whole file written in one tool block). readline() has already
+                # dropped the oversized line; skip it and keep streaming instead
+                # of letting the exception crash the entire turn.
+                yield {"type": "status", "status": "responding"}
+                continue
+            if not raw_line:
+                break  # EOF
             line = raw_line.decode("utf-8", errors="replace").strip()
             if not line:
                 continue
@@ -243,7 +268,7 @@ async def grok_stream(
     os.close(slave_fd)
 
     loop = asyncio.get_event_loop()
-    reader = asyncio.StreamReader(limit=2 ** 20)
+    reader = asyncio.StreamReader(limit=_READER_LIMIT)
     protocol = asyncio.StreamReaderProtocol(reader)
     transport, _ = await loop.connect_read_pipe(
         lambda: protocol, os.fdopen(master_fd, "rb", buffering=0)
@@ -254,7 +279,18 @@ async def grok_stream(
     in_text = False
 
     try:
-        async for raw_line in reader:
+        while True:
+            try:
+                raw_line = await reader.readline()
+            except (ValueError, asyncio.LimitOverrunError):
+                # A single stream-json event exceeded the reader buffer (e.g. a
+                # whole file written in one tool block). readline() has already
+                # dropped the oversized line; skip it and keep streaming instead
+                # of letting the exception crash the entire turn.
+                yield {"type": "status", "status": "responding"}
+                continue
+            if not raw_line:
+                break  # EOF
             line = raw_line.decode("utf-8", errors="replace").strip()
             if not line:
                 continue
@@ -309,10 +345,61 @@ async def grok_stream(
 
 
 # ---------------------------------------------------------------------------
+# DeepSeek adapter — drives the SAME `claude -p` harness, pointed at DeepSeek's
+# NATIVE Anthropic-compatible endpoint (https://api.deepseek.com/anthropic).
+# DeepSeek V4 is officially integrated with Claude Code: it speaks the Anthropic
+# Messages API directly, supports 1M context, thinking mode, function calling,
+# and auto-sets reasoning effort to "max" for Claude-Code-style agent requests.
+# So a DeepSeek node inherits the full agent harness for free — file tools,
+# permission mode, --resume memory, thinking, --effort, dispatch parsing, PTY
+# streaming — with NO translation proxy in between.
+#
+# The override is injected via extra_env so it applies ONLY to this subprocess.
+# The user's normal `claude` CLI and the Claude nodes are untouched — they keep
+# using subscription OAuth. Do NOT set ANTHROPIC_BASE_URL globally anywhere.
+#
+# DEEPSEEK_BASE_URL can override the endpoint (e.g. to route via a local proxy
+# instead), but the default needs no extra process running.
+# ---------------------------------------------------------------------------
+
+async def deepseek_stream(
+    message: str,
+    system_prompt: str,
+    cwd: str,
+    model: str = "deepseek-v4-flash",
+    effort: str | None = None,
+    resume_session_id: str | None = None,
+) -> AsyncIterator[dict]:
+    key = os.environ.get("DEEPSEEK_API_KEY")
+    if not key:
+        yield {"type": "error",
+               "message": "DEEPSEEK_API_KEY not set in the environment"}
+        return
+    base_url = os.environ.get("DEEPSEEK_BASE_URL", "https://api.deepseek.com/anthropic")
+    extra_env = {
+        "ANTHROPIC_BASE_URL": base_url,
+        "ANTHROPIC_API_KEY": key,
+        "ANTHROPIC_AUTH_TOKEN": key,
+    }
+    async for ev in claude_stream(
+        message=message,
+        system_prompt=system_prompt,
+        cwd=cwd,
+        model=model,
+        effort=effort,
+        resume_session_id=resume_session_id,
+        extra_env=extra_env,
+    ):
+        yield ev
+
+
+# ---------------------------------------------------------------------------
 
 def get_stream(model: str):
     if model == "claude":
         return claude_stream
     if model == "grok":
         return grok_stream
+    if model == "deepseek":
+        return deepseek_stream
     raise AdapterError(f"unknown model adapter: {model}")

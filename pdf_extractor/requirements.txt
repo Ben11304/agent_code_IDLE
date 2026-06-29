@@ -1,0 +1,5 @@
+# Core dependencies for PyMuPDF-based paper extractor
+pymupdf>=1.23.0
+pdfplumber>=0.11.0
+tqdm>=4.65.0
+pillow>=10.0.0

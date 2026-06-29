@@ -1325,6 +1325,9 @@ function modelLabel(a) {
   if (a.model === "grok") {
     return (a.grok_model || "grok-build");
   }
+  if (a.model === "deepseek") {
+    return (a.deepseek_model || "deepseek-v4-flash");
+  }
   return (a.claude_model || "claude-sonnet-4-6").replace(/^claude-/, "");
 }
 
@@ -1588,6 +1591,8 @@ function renderChatHeader(w) {
 
   const modelText = agent.model === "grok"
     ? (agent.grok_model || agent.default_grok_model || "grok-build")
+    : agent.model === "deepseek"
+    ? (agent.deepseek_model || agent.default_deepseek_model || "deepseek-v4-flash")
     : (agent.claude_model || agent.default_claude_model || "claude-sonnet-4-6").replace(/^claude-/, "");
   const curEffort = agent.effort || "";
 
@@ -1617,9 +1622,11 @@ function renderChatHeader(w) {
       // Preserve the agent's current model; only effort changes.
       const a = state.projectCache[w.projectSlug]?.agents.find((x) => x.id === w.agentId) || agent;
       if (a.model === "grok") {
-        await updateAgentSettings(w, null, a.grok_model || "grok-build", eff);
+        await updateAgentSettings(w, null, a.grok_model || "grok-build", null, eff);
+      } else if (a.model === "deepseek") {
+        await updateAgentSettings(w, null, null, a.deepseek_model || "deepseek-v4-flash", eff);
       } else {
-        await updateAgentSettings(w, a.claude_model || "claude-sonnet-4-6", null, eff);
+        await updateAgentSettings(w, a.claude_model || "claude-sonnet-4-6", null, null, eff);
       }
     });
     // Stop drags on the select from moving the window / pannning the canvas.
@@ -1627,7 +1634,7 @@ function renderChatHeader(w) {
   }
 }
 
-async function updateAgentSettings(w, claudeModel, grokModel, effort) {
+async function updateAgentSettings(w, claudeModel, grokModel, deepseekModel, effort) {
   const slug = w.projectSlug;
   const agentId = w.agentId;
   const hint = w.el.querySelector(".save-hint");
@@ -1639,6 +1646,7 @@ async function updateAgentSettings(w, claudeModel, grokModel, effort) {
       body: JSON.stringify({
         claude_model: claudeModel,
         grok_model: grokModel,
+        deepseek_model: deepseekModel,
         effort: effort || null,
       }),
     });
@@ -2211,15 +2219,29 @@ const _GROK_MODEL_ALIAS = {
   "composer-2.5": "grok-composer-2.5-fast",
   "fast": "grok-composer-2.5-fast",
 };
+const _DEEPSEEK_MODEL_ALIAS = {
+  "flash": "deepseek-v4-flash",
+  "deepseek-v4-flash": "deepseek-v4-flash",
+  "v4-flash": "deepseek-v4-flash",
+  "pro": "deepseek-v4-pro",
+  "deepseek-v4-pro": "deepseek-v4-pro",
+  "v4-pro": "deepseek-v4-pro",
+  // legacy aliases (retire 2026-07-24)
+  "chat": "deepseek-chat",
+  "reasoner": "deepseek-reasoner",
+};
 
 async function cmdModel(w, arg) {
   const proj = state.projectCache[w.projectSlug];
   const agent = proj.agents.find((a) => a.id === w.agentId);
   const isGrok = agent.model === "grok";
+  const isDeepseek = agent.model === "deepseek";
 
   if (!arg) {
     addSystemBubble(w, isGrok
       ? "Syntax: `/model <grok-build|grok-composer>`"
+      : isDeepseek
+      ? "Syntax: `/model <deepseek-v4-flash|deepseek-v4-pro>`"
       : "Syntax: `/model <fable-5|opus-4-8|opus-4-7|sonnet|haiku>`");
     return;
   }
@@ -2228,14 +2250,21 @@ async function cmdModel(w, arg) {
   if (isGrok) {
     const target = _GROK_MODEL_ALIAS[arg.toLowerCase()] || (arg.startsWith("grok-") ? arg : null);
     if (!target) { addSystemBubble(w, `invalid grok model: \`${arg}\``); return; }
-    await updateAgentSettings(w, null, target, eff);
+    await updateAgentSettings(w, null, target, null, eff);
     addSystemBubble(w, `✓ grok_model → \`${target}\` (applies from the next chat turn)`);
+    return;
+  }
+  if (isDeepseek) {
+    const target = _DEEPSEEK_MODEL_ALIAS[arg.toLowerCase()] || (arg.startsWith("deepseek-") ? arg : null);
+    if (!target) { addSystemBubble(w, `invalid deepseek model: \`${arg}\``); return; }
+    await updateAgentSettings(w, null, null, target, eff);
+    addSystemBubble(w, `✓ deepseek_model → \`${target}\` (applies from the next chat turn)`);
     return;
   }
 
   const target = _CLAUDE_MODEL_ALIAS[arg.toLowerCase()] || (arg.startsWith("claude-") ? arg : null);
   if (!target) { addSystemBubble(w, `invalid claude model: \`${arg}\``); return; }
-  await updateAgentSettings(w, target, null, eff);
+  await updateAgentSettings(w, target, null, null, eff);
   addSystemBubble(w, `✓ claude_model → \`${target}\` (applies from the next chat turn)`);
 }
 
@@ -2249,9 +2278,11 @@ async function cmdEffort(w, arg) {
   const proj = state.projectCache[w.projectSlug];
   const agent = proj.agents.find((a) => a.id === w.agentId);
   if (agent.model === "grok") {
-    await updateAgentSettings(w, null, agent.grok_model || "grok-build", eff);
+    await updateAgentSettings(w, null, agent.grok_model || "grok-build", null, eff);
+  } else if (agent.model === "deepseek") {
+    await updateAgentSettings(w, null, null, agent.deepseek_model || "deepseek-v4-flash", eff);
   } else {
-    await updateAgentSettings(w, agent.claude_model || "claude-sonnet-4-6", null, eff);
+    await updateAgentSettings(w, agent.claude_model || "claude-sonnet-4-6", null, null, eff);
   }
   addSystemBubble(w, `✓ effort → \`${arg}\``);
 }
@@ -2421,6 +2452,7 @@ function openNewProjectDialog() {
       <select class="np-model">
         <option value="claude" selected>claude</option>
         <option value="grok">grok</option>
+        <option value="deepseek">deepseek</option>
       </select>
       <input class="np-parents" placeholder="parents (CSV)"
         value="${preset && preset.parents ? escapeHtml(preset.parents) : ""}" />
@@ -2518,6 +2550,8 @@ function openAddAgentDialog(slug) {
     `<option value="${o.value}">${o.label}</option>`).join("");
   const grokOpts = `<option value="grok-build">grok-build</option>
     <option value="grok-composer-2.5-fast">grok-composer 2.5</option>`;
+  const deepseekOpts = `<option value="deepseek-v4-flash">deepseek-v4-flash (fast)</option>
+    <option value="deepseek-v4-pro">deepseek-v4-pro (top)</option>`;
   const parentOpts = existing.map((id) =>
     `<option value="${escapeHtml(id)}">${escapeHtml(id)}</option>`).join("");
 
@@ -2544,6 +2578,7 @@ function openAddAgentDialog(slug) {
             <select name="model">
               <option value="claude" selected>claude</option>
               <option value="grok">grok</option>
+              <option value="deepseek">deepseek</option>
             </select>
           </label>
           <label data-for="claude">Claude model
@@ -2556,6 +2591,12 @@ function openAddAgentDialog(slug) {
             <select name="grok_model">
               <option value="">(default grok-build)</option>
               ${grokOpts}
+            </select>
+          </label>
+          <label data-for="deepseek" style="display:none">DeepSeek model
+            <select name="deepseek_model">
+              <option value="">(default deepseek-v4-flash)</option>
+              ${deepseekOpts}
             </select>
           </label>
           <label>Effort
@@ -2616,11 +2657,13 @@ function openAddAgentDialog(slug) {
   const modelSelect = form.querySelector('select[name="model"]');
   const claudeWrap = form.querySelector('[data-for="claude"]');
   const grokWrap = form.querySelector('[data-for="grok"]');
+  const deepseekWrap = form.querySelector('[data-for="deepseek"]');
 
   function syncAdapter() {
-    const isGrok = modelSelect.value === "grok";
-    claudeWrap.style.display = isGrok ? "none" : "";
-    grokWrap.style.display = isGrok ? "" : "none";
+    const v = modelSelect.value;
+    claudeWrap.style.display = v === "claude" ? "" : "none";
+    grokWrap.style.display = v === "grok" ? "" : "none";
+    deepseekWrap.style.display = v === "deepseek" ? "" : "none";
   }
   modelSelect.onchange = syncAdapter;
   syncAdapter();
@@ -2641,13 +2684,16 @@ function openAddAgentDialog(slug) {
     const fd = new FormData(form);
     const parents = Array.from(form.querySelector('select[name="parents"]').selectedOptions)
       .map((o) => o.value);
-    const isGrok = fd.get("model") === "grok";
+    const adapter = fd.get("model");
+    const isGrok = adapter === "grok";
+    const isDeepseek = adapter === "deepseek";
     return {
       id: (fd.get("id") || "").trim().toUpperCase(),
       role: (fd.get("role") || "").trim(),
-      model: fd.get("model"),
-      claude_model: isGrok ? null : ((fd.get("claude_model") || "").trim() || null),
+      model: adapter,
+      claude_model: (isGrok || isDeepseek) ? null : ((fd.get("claude_model") || "").trim() || null),
       grok_model: isGrok ? ((fd.get("grok_model") || "").trim() || null) : null,
+      deepseek_model: isDeepseek ? ((fd.get("deepseek_model") || "").trim() || null) : null,
       effort: (fd.get("effort") || "").trim() || null,
       system_prompt_file: (fd.get("system_prompt_file") || "").trim() || null,
       cwd: (fd.get("cwd") || ".").trim() || ".",
@@ -2892,12 +2938,17 @@ async function cmdStatus(w) {
   const proj = state.projectCache[w.projectSlug];
   const agent = proj.agents.find((a) => a.id === w.agentId);
   const isGrok = agent.model === "grok";
-  const cur = isGrok ? (agent.grok_model || "grok-build") : (agent.claude_model || "claude-sonnet-4-6");
-  const def = isGrok ? (agent.default_grok_model || "grok-build") : (agent.default_claude_model || "claude-sonnet-4-6");
+  const isDeepseek = agent.model === "deepseek";
+  const cur = isGrok ? (agent.grok_model || "grok-build")
+    : isDeepseek ? (agent.deepseek_model || "deepseek-v4-flash")
+    : (agent.claude_model || "claude-sonnet-4-6");
+  const def = isGrok ? (agent.default_grok_model || "grok-build")
+    : isDeepseek ? (agent.default_deepseek_model || "deepseek-v4-flash")
+    : (agent.default_claude_model || "claude-sonnet-4-6");
   const lines = [
     `**Agent**: \`${agent.id}\``,
     `**Project**: ${proj.name}`,
-    `**Adapter**: ${isGrok ? "grok" : "claude"}`,
+    `**Adapter**: ${agent.model || "claude"}`,
     `**Model**: \`${cur}\` (default: \`${def}\`)`,
     `**Effort**: \`${agent.effort || "default"}\``,
     `**Status**: ${proj.statuses[agent.id] || "idle"}`,
