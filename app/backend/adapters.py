@@ -394,6 +394,52 @@ async def deepseek_stream(
 
 
 # ---------------------------------------------------------------------------
+# GLM adapter (Zhipu) — identical strategy to DeepSeek: drive the SAME `claude -p`
+# harness, pointed at GLM's NATIVE Anthropic-compatible endpoint. Z.ai / Zhipu
+# officially integrate GLM with Claude Code (the CLI speaks the Anthropic Messages
+# API directly), so a GLM node inherits the full agent harness for free — file
+# tools, permission mode, --resume memory, thinking, --effort, dispatch parsing,
+# PTY streaming — with NO translation proxy in between.
+#
+# Default endpoint is Z.ai (international). Inside China, set GLM_BASE_URL to
+# https://open.bigmodel.cn/api/anthropic. Override is injected via extra_env so it
+# applies ONLY to this subprocess — Claude nodes + the user's terminal `claude`
+# keep using subscription OAuth, fully unaffected. Never set ANTHROPIC_BASE_URL
+# globally. GLM is billed per-token (API), unlike the Claude subscription.
+# ---------------------------------------------------------------------------
+
+async def glm_stream(
+    message: str,
+    system_prompt: str,
+    cwd: str,
+    model: str = "glm-4.6",
+    effort: str | None = None,
+    resume_session_id: str | None = None,
+) -> AsyncIterator[dict]:
+    key = os.environ.get("GLM_API_KEY")
+    if not key:
+        yield {"type": "error",
+               "message": "GLM_API_KEY not set in the environment"}
+        return
+    base_url = os.environ.get("GLM_BASE_URL", "https://api.z.ai/api/anthropic")
+    extra_env = {
+        "ANTHROPIC_BASE_URL": base_url,
+        "ANTHROPIC_API_KEY": key,
+        "ANTHROPIC_AUTH_TOKEN": key,
+    }
+    async for ev in claude_stream(
+        message=message,
+        system_prompt=system_prompt,
+        cwd=cwd,
+        model=model,
+        effort=effort,
+        resume_session_id=resume_session_id,
+        extra_env=extra_env,
+    ):
+        yield ev
+
+
+# ---------------------------------------------------------------------------
 
 def get_stream(model: str):
     if model == "claude":
@@ -402,4 +448,6 @@ def get_stream(model: str):
         return grok_stream
     if model == "deepseek":
         return deepseek_stream
+    if model == "glm":
+        return glm_stream
     raise AdapterError(f"unknown model adapter: {model}")

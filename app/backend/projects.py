@@ -112,6 +112,7 @@ def get_project(slug: str) -> dict[str, Any] | None:
                     "claude_model": a.get("claude_model", "claude-sonnet-4-6"),
                     "grok_model": a.get("grok_model", "grok-build"),
                     "deepseek_model": a.get("deepseek_model", "deepseek-v4-flash"),
+                    "glm_model": a.get("glm_model", "glm-4.6"),
                     "effort": a.get("effort"),
                     "cwd": a.get("cwd", "."),
                     "system_prompt_file": a.get("system_prompt_file", ""),
@@ -372,6 +373,8 @@ def _clean_agent(a: dict[str, Any]) -> dict[str, Any]:
         out["grok_model"] = a["grok_model"]
     if a.get("deepseek_model"):
         out["deepseek_model"] = a["deepseek_model"]
+    if a.get("glm_model"):
+        out["glm_model"] = a["glm_model"]
     if a.get("effort"):
         out["effort"] = a["effort"]
     if a.get("system_prompt_file"):
@@ -583,6 +586,8 @@ def _project_agent_entry(a: dict[str, Any]) -> dict[str, Any]:
         out["grok_model"] = a.get("grok_model") or "grok-build"
     if a.get("model") == "deepseek":
         out["deepseek_model"] = a.get("deepseek_model") or "deepseek-v4-flash"
+    if a.get("model") == "glm":
+        out["glm_model"] = a.get("glm_model") or "glm-4.6"
     if a.get("effort"):
         out["effort"] = a["effort"]
     out["system_prompt_file"] = f"{a['id']}/AGENT.md"

@@ -244,6 +244,7 @@ def api_project(slug: str):
         a["default_claude_model"] = a.get("claude_model") or "claude-sonnet-4-6"
         a["default_grok_model"] = a.get("grok_model") or "grok-build"
         a["default_deepseek_model"] = a.get("deepseek_model") or "deepseek-v4-flash"
+        a["default_glm_model"] = a.get("glm_model") or "glm-4.6"
         a["default_effort"] = a.get("effort")
         if ov.get("claude_model"):
             a["claude_model"] = ov["claude_model"]
@@ -317,8 +318,11 @@ _MODEL_CONTEXT_WINDOWS = {
     "deepseek-v4-pro": 1_000_000,
     "deepseek-chat": 1_000_000,
     "deepseek-reasoner": 1_000_000,
+    # GLM (Zhipu) via its native Anthropic-compatible endpoint → claude -p.
+    "glm-4.6": 200_000,
+    "glm-4.5-air": 128_000,
 }
-_CONTEXT_WINDOWS = {"claude": 200_000, "grok": 256_000, "deepseek": 1_000_000}  # adapter fallback
+_CONTEXT_WINDOWS = {"claude": 200_000, "grok": 256_000, "deepseek": 1_000_000, "glm": 200_000}  # adapter fallback
 
 
 def _context_window_for(model_kind: str, model_id: Optional[str]) -> int:
@@ -588,6 +592,8 @@ def api_project_stats(slug: str):
             eff_model = ov.get("grok_model") or a.get("grok_model") or "grok-build"
         elif model_kind == "deepseek":
             eff_model = ov.get("deepseek_model") or a.get("deepseek_model") or "deepseek-v4-flash"
+        elif model_kind == "glm":
+            eff_model = ov.get("glm_model") or a.get("glm_model") or "glm-4.6"
         else:
             eff_model = ov.get("claude_model") or a.get("claude_model") or "claude-sonnet-4-6"
         effort = ov.get("effort") if (ov and "effort" in ov) else a.get("effort")
@@ -1534,6 +1540,17 @@ async def _run_agent(
             effort=effort,
             resume_session_id=resume_sid,
         )
+    elif model == "glm":
+        # Same harness as claude/deepseek; adapter injects GLM's Anthropic
+        # endpoint env per-subprocess. --resume works normally.
+        agen = stream_fn(
+            message=message,
+            system_prompt=system_prompt,
+            cwd=cwd,
+            model=override.get("glm_model") or agent.get("glm_model") or "glm-4.6",
+            effort=effort,
+            resume_session_id=resume_sid,
+        )
     else:
         agen = stream_fn(message=message, system_prompt=system_prompt, cwd=cwd)
 
@@ -2226,6 +2243,8 @@ async def _auto_compact_if_needed(slug: str, agent_id: str, emit) -> bool:
         eff_model = ov.get("grok_model") or agent.get("grok_model") or "grok-build"
     elif model_kind == "deepseek":
         eff_model = ov.get("deepseek_model") or agent.get("deepseek_model") or "deepseek-v4-flash"
+    elif model_kind == "glm":
+        eff_model = ov.get("glm_model") or agent.get("glm_model") or "glm-4.6"
     else:
         eff_model = ov.get("claude_model") or agent.get("claude_model") or "claude-sonnet-4-6"
     pct = _session_context_pct(sess, model_kind, eff_model)
