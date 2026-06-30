@@ -244,7 +244,7 @@ def api_project(slug: str):
         a["default_claude_model"] = a.get("claude_model") or "claude-sonnet-4-6"
         a["default_grok_model"] = a.get("grok_model") or "grok-build"
         a["default_deepseek_model"] = a.get("deepseek_model") or "deepseek-v4-flash"
-        a["default_glm_model"] = a.get("glm_model") or "glm-4.6"
+        a["default_glm_model"] = a.get("glm_model") or "glm-4.6"  # glm-4.6 | glm-5.2
         a["default_effort"] = a.get("effort")
         if ov.get("claude_model"):
             a["claude_model"] = ov["claude_model"]
@@ -252,6 +252,10 @@ def api_project(slug: str):
             a["grok_model"] = ov["grok_model"]
         if ov.get("deepseek_model"):
             a["deepseek_model"] = ov["deepseek_model"]
+        if ov.get("glm_model"):
+            a["glm_model"] = ov["glm_model"]
+        if ov.get("model"):
+            a["model"] = ov["model"]  # adapter override wins over project.yaml
         if "effort" in ov:
             a["effort"] = ov["effort"]
     out["statuses"] = statuses
@@ -320,6 +324,7 @@ _MODEL_CONTEXT_WINDOWS = {
     "deepseek-reasoner": 1_000_000,
     # GLM (Zhipu) via its native Anthropic-compatible endpoint → claude -p.
     "glm-4.6": 200_000,
+    "glm-5.2": 1_000_000,
     "glm-4.5-air": 128_000,
 }
 _CONTEXT_WINDOWS = {"claude": 200_000, "grok": 256_000, "deepseek": 1_000_000, "glm": 200_000}  # adapter fallback
@@ -650,6 +655,7 @@ class AgentSettings(BaseModel):
     claude_model: Optional[str] = None
     grok_model: Optional[str] = None
     deepseek_model: Optional[str] = None
+    glm_model: Optional[str] = None
     effort: Optional[str] = None
 
 
@@ -663,6 +669,7 @@ class NewAgent(BaseModel):
     claude_model: Optional[str] = None
     grok_model: Optional[str] = None
     deepseek_model: Optional[str] = None
+    glm_model: Optional[str] = None
     effort: Optional[str] = None
     system_prompt_file: Optional[str] = ""
     cwd: Optional[str] = "."
@@ -676,8 +683,8 @@ def _validate_new_agent(slug: str, body: "NewAgent") -> dict:
         raise HTTPException(404, "project not found")
     if not _AGENT_ID_RE.match(body.id):
         raise HTTPException(400, "id must be uppercase letters/digits/underscore starting with a letter")
-    if body.model not in ("claude", "grok"):
-        raise HTTPException(400, "model must be 'claude' or 'grok'")
+    if body.model not in ("claude", "grok", "deepseek", "glm"):
+        raise HTTPException(400, "model must be 'claude', 'grok', 'deepseek', or 'glm'")
     existing = {a["id"] for a in project["agents"]}
     if body.id in existing:
         raise HTTPException(409, f"agent id already exists: {body.id}")
@@ -924,8 +931,8 @@ def _validate_project_agents(agents: list) -> None:
     for a in agents:
         if not _AGENT_ID_RE.match(a.get("id") or ""):
             raise HTTPException(400, f"invalid agent id (must be UPPERCASE): {a.get('id')}")
-        if a.get("model", "claude") not in ("claude", "grok"):
-            raise HTTPException(400, f"model must be claude|grok: {a.get('id')}")
+        if a.get("model", "claude") not in ("claude", "grok", "deepseek", "glm"):
+            raise HTTPException(400, f"model must be claude|grok|deepseek|glm: {a.get('id')}")
         for p in a.get("parents") or []:
             if p not in ids:
                 raise HTTPException(400, f"parent '{p}' is not in the project (agent {a.get('id')})")
@@ -968,7 +975,36 @@ def api_set_agent_settings(slug: str, agent_id: str, body: AgentSettings):
                           claude_model=body.claude_model,
                           grok_model=body.grok_model,
                           deepseek_model=body.deepseek_model,
+                          glm_model=body.glm_model,
                           effort=body.effort)
+    return {"ok": True}
+
+
+class AdapterSwitch(BaseModel):
+    adapter: str   # claude | grok | deepseek | glm
+    model: Optional[str] = None  # specific model id for the new adapter (optional)
+
+
+# Default model per adapter when the caller omits `model`.
+_ADAPTER_DEFAULT_MODEL = {
+    "claude": "claude-sonnet-4-6",
+    "grok": "grok-build",
+    "deepseek": "deepseek-v4-flash",
+    "glm": "glm-4.6",
+}
+
+
+@app.post("/api/projects/{slug}/agents/{agent_id}/adapter")
+def api_set_agent_adapter(slug: str, agent_id: str, body: AdapterSwitch):
+    """Switch an agent's adapter (claude|grok|deepseek|glm) at runtime — stored
+    as an override that wins over project.yaml, so no file edit / restart needed.
+    Lets a user move a node e.g. opus(claude) -> glm-5.2 from the chat UI."""
+    found = projects.get_agent(slug, agent_id)
+    if not found:
+        raise HTTPException(404, "agent not found")
+    if body.adapter not in ("claude", "grok", "deepseek", "glm"):
+        raise HTTPException(400, "adapter must be 'claude', 'grok', 'deepseek', or 'glm'")
+    db.set_agent_adapter(slug, agent_id, body.adapter, body.model or _ADAPTER_DEFAULT_MODEL[body.adapter])
     return {"ok": True}
 
 
@@ -1483,9 +1519,9 @@ async def _run_agent(
 
     _adir = _agent_dir(project["root"], agent, cwd)
 
-    model = agent.get("model", "claude")
-    stream_fn = get_stream(model)
     override = db.get_agent_override(slug, agent_id) or {}
+    model = override.get("model") or agent.get("model", "claude")
+    stream_fn = get_stream(model)
     effort = override.get("effort") if "effort" in override else agent.get("effort")
 
     # Resume guard. Only continue a prior CLI session if its last turn ended
@@ -3090,5 +3126,15 @@ async def _kill_all_terminals():
         _term_kill(tid)
 
 
+class _NoCacheStaticFiles(StaticFiles):
+    """StaticFiles that always sends Cache-Control: no-store so the browser
+    never serves a stale app.js/styles.css during development (the recurring
+    'I edited app.js but the UI shows the old behavior' failure)."""
+    async def get_response(self, path: str, scope):
+        resp = await super().get_response(path, scope)
+        resp.headers["Cache-Control"] = "no-store, must-revalidate"
+        return resp
+
+
 if FRONTEND_DIR.exists():
-    app.mount("/", StaticFiles(directory=str(FRONTEND_DIR), html=True), name="frontend")
+    app.mount("/", _NoCacheStaticFiles(directory=str(FRONTEND_DIR), html=True), name="frontend")

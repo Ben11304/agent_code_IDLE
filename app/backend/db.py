@@ -49,6 +49,8 @@ def init_db() -> None:
                 claude_model TEXT,
                 grok_model TEXT,
                 deepseek_model TEXT,
+                glm_model TEXT,
+                model TEXT,  -- adapter override (claude|grok|deepseek|glm); wins over project.yaml
                 effort TEXT,
                 updated_at REAL NOT NULL,
                 PRIMARY KEY (project_slug, agent_id)
@@ -160,6 +162,8 @@ def init_db() -> None:
         # backward-compat: add grok_model column if older db
         _ensure_column(c, "agent_overrides", "grok_model", "TEXT")
         _ensure_column(c, "agent_overrides", "deepseek_model", "TEXT")
+        _ensure_column(c, "agent_overrides", "glm_model", "TEXT")
+        _ensure_column(c, "agent_overrides", "model", "TEXT")  # adapter override
         # latest real token usage from the CLI (JSON: input/output/cache buckets)
         _ensure_column(c, "sessions", "usage", "TEXT")
         # one-time context seed (compact recap) prepended to this session's next turn
@@ -293,7 +297,7 @@ def clear_session_seed(session_id: str) -> None:
 def get_agent_override(project_slug: str, agent_id: str) -> dict | None:
     with _conn() as c:
         row = c.execute(
-            "SELECT claude_model, grok_model, deepseek_model, effort FROM agent_overrides "
+            "SELECT claude_model, grok_model, deepseek_model, glm_model, model, effort FROM agent_overrides "
             "WHERE project_slug=? AND agent_id=?",
             (project_slug, agent_id),
         ).fetchone()
@@ -303,6 +307,8 @@ def get_agent_override(project_slug: str, agent_id: str) -> dict | None:
         "claude_model": row["claude_model"],
         "grok_model": row["grok_model"],
         "deepseek_model": row["deepseek_model"],
+        "glm_model": row["glm_model"],
+        "model": row["model"],
         "effort": row["effort"],
     }
 
@@ -311,29 +317,60 @@ def set_agent_override(project_slug: str, agent_id: str,
                        claude_model: str | None,
                        grok_model: str | None,
                        deepseek_model: str | None,
+                       glm_model: str | None,
                        effort: str | None) -> None:
     with _conn() as c:
         c.execute(
-            "INSERT INTO agent_overrides(project_slug, agent_id, claude_model, grok_model, deepseek_model, effort, updated_at) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?) "
+            "INSERT INTO agent_overrides(project_slug, agent_id, claude_model, grok_model, deepseek_model, glm_model, effort, updated_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?) "
             "ON CONFLICT(project_slug, agent_id) DO UPDATE SET "
             "claude_model=excluded.claude_model, grok_model=excluded.grok_model, "
-            "deepseek_model=excluded.deepseek_model, "
+            "deepseek_model=excluded.deepseek_model, glm_model=excluded.glm_model, "
             "effort=excluded.effort, updated_at=excluded.updated_at",
-            (project_slug, agent_id, claude_model, grok_model, deepseek_model, effort, time.time()),
+            (project_slug, agent_id, claude_model, grok_model, deepseek_model, glm_model, effort, time.time()),
         )
+
+
+def set_agent_adapter(project_slug: str, agent_id: str, adapter: str, model_id: str | None) -> None:
+    """Switch an agent's adapter (claude|grok|deepseek|glm) at runtime without
+    editing project.yaml. Sets ONLY the `model` override column + the matching
+    *_model column for that adapter; leaves the other *_model columns and effort
+    untouched (so switching back restores the prior model)."""
+    col = {
+        "claude": "claude_model",
+        "grok": "grok_model",
+        "deepseek": "deepseek_model",
+        "glm": "glm_model",
+    }.get(adapter)
+    if col is None:
+        raise ValueError(f"unknown adapter: {adapter}")
+    with _conn() as c:
+        c.execute(
+            "INSERT INTO agent_overrides(project_slug, agent_id, model, effort, updated_at) "
+            "VALUES (?, ?, ?, NULL, ?) "
+            "ON CONFLICT(project_slug, agent_id) DO UPDATE SET "
+            "model=excluded.model, updated_at=excluded.updated_at",
+            (project_slug, agent_id, adapter, time.time()),
+        )
+        if model_id:
+            c.execute(
+                f"UPDATE agent_overrides SET {col}=? WHERE project_slug=? AND agent_id=?",
+                (model_id, project_slug, agent_id),
+            )
 
 
 def list_agent_overrides(project_slug: str) -> dict[str, dict]:
     with _conn() as c:
         rows = c.execute(
-            "SELECT agent_id, claude_model, grok_model, deepseek_model, effort FROM agent_overrides WHERE project_slug=?",
+            "SELECT agent_id, claude_model, grok_model, deepseek_model, glm_model, model, effort FROM agent_overrides WHERE project_slug=?",
             (project_slug,),
         ).fetchall()
     return {r["agent_id"]: {
         "claude_model": r["claude_model"],
         "grok_model": r["grok_model"],
         "deepseek_model": r["deepseek_model"],
+        "glm_model": r["glm_model"],
+        "model": r["model"],
         "effort": r["effort"],
     } for r in rows}
 
