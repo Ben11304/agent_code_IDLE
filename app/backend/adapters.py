@@ -14,6 +14,7 @@ import fcntl
 import json
 import os
 import pty
+import random
 import shutil
 import termios
 from typing import AsyncIterator
@@ -362,6 +363,92 @@ async def grok_stream(
 # instead), but the default needs no extra process running.
 # ---------------------------------------------------------------------------
 
+# ---------------------------------------------------------------------------
+# Overload retry for the API-key adapters (deepseek, glm).
+#
+# api.z.ai (and api.deepseek.com) return HTTP 529 "overloaded" (Z.ai code 1305)
+# when the ACCOUNT'S CONCURRENCY LIMIT is exceeded — NOT a global outage. A
+# single sequential request always succeeds; only concurrent bursts trip it
+# (reproduced: 6 concurrent glm-5.2 requests → 3×529). The AEC system dispatches
+# up to 5 agents at once, so this fires regularly under multi-agent load.
+#
+# The 529 is transient — a slot frees the moment another agent's request lands.
+# So re-running the same `claude -p` turn after a short backoff almost always
+# succeeds. This wrapper inspects the terminal event of each attempt; if it
+# carries an overload signature, it backs off and retries the whole turn,
+# preserving live streaming for the eventual success. Live deltas from a
+# successful attempt are yielded as they arrive; only the terminal event is
+# held back until we know it is not a retryable error.
+# ---------------------------------------------------------------------------
+
+# substrings (lower-cased) that mark a terminal event as a retryable overload
+_OVERLOAD_PATTERNS = (
+    "529", "1305", "overloaded", "temporarily overloaded",
+    "429", "rate limit", "rate_limit", "too many requests",
+    "service may be temporarily",
+)
+# backoff seconds before each retry (index 0 → before retry #1)
+_OVERLOAD_BACKOFF = (5.0, 12.0, 25.0)
+
+
+def _event_is_overload(ev: dict) -> bool:
+    """True if a terminal event (agent_done / error) carries an overload
+    signature in its text/message (529 / 429 / overloaded)."""
+    if not isinstance(ev, dict):
+        return False
+    txt = ev.get("text") or ev.get("message") or ""
+    if not txt:
+        return False
+    low = txt.lower()
+    return any(p in low for p in _OVERLOAD_PATTERNS)
+
+
+async def _claude_stream_with_overload_retry(
+    *,
+    message: str,
+    system_prompt: str,
+    cwd: str,
+    model: str,
+    effort: str | None,
+    resume_session_id: str | None,
+    extra_env: dict | None,
+    label: str = "model",
+) -> AsyncIterator[dict]:
+    """Run claude_stream, retrying the whole turn when the terminal event is an
+    overload error (529/429). Live events stream through; only the terminal
+    agent_done/error is buffered per attempt so an overload can be swallowed and
+    the turn re-attempted without the UI seeing a dead error bubble."""
+    max_retries = len(_OVERLOAD_BACKOFF)
+    agent_id = None
+    for attempt in range(max_retries + 1):
+        terminal = None
+        async for ev in claude_stream(
+            message=message,
+            system_prompt=system_prompt,
+            cwd=cwd,
+            model=model,
+            effort=effort,
+            resume_session_id=resume_session_id,
+            extra_env=extra_env,
+        ):
+            if agent_id is None and isinstance(ev, dict) and ev.get("agent"):
+                agent_id = ev.get("agent")
+            if isinstance(ev, dict) and ev.get("type") in ("agent_done", "error"):
+                terminal = ev  # hold back until we know it's not overload
+                continue
+            yield ev
+        if terminal is None:
+            return  # stream ended without a terminal event — nothing to retry
+        if not _event_is_overload(terminal) or attempt >= max_retries:
+            yield terminal
+            return
+        # overload → backoff + retry
+        delay = _OVERLOAD_BACKOFF[attempt] + random.uniform(0.0, 2.0)
+        yield {"type": "thinking", "agent": agent_id,
+               "text": f"⚠ {label} gateway overloaded (529) — retry {attempt + 1}/{max_retries} in {delay:.0f}s" }
+        await asyncio.sleep(delay)
+
+
 async def deepseek_stream(
     message: str,
     system_prompt: str,
@@ -381,7 +468,7 @@ async def deepseek_stream(
         "ANTHROPIC_API_KEY": key,
         "ANTHROPIC_AUTH_TOKEN": key,
     }
-    async for ev in claude_stream(
+    async for ev in _claude_stream_with_overload_retry(
         message=message,
         system_prompt=system_prompt,
         cwd=cwd,
@@ -389,6 +476,7 @@ async def deepseek_stream(
         effort=effort,
         resume_session_id=resume_session_id,
         extra_env=extra_env,
+        label="deepseek",
     ):
         yield ev
 
@@ -427,7 +515,7 @@ async def glm_stream(
         "ANTHROPIC_API_KEY": key,
         "ANTHROPIC_AUTH_TOKEN": key,
     }
-    async for ev in claude_stream(
+    async for ev in _claude_stream_with_overload_retry(
         message=message,
         system_prompt=system_prompt,
         cwd=cwd,
@@ -435,6 +523,7 @@ async def glm_stream(
         effort=effort,
         resume_session_id=resume_session_id,
         extra_env=extra_env,
+        label="glm",
     ):
         yield ev
 
