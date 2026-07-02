@@ -2247,8 +2247,13 @@ async def _dispatched_run(slug, source_id, target_id, task, emit, tracker, chain
 
 # Above this share of the context window, the next user turn triggers an
 # automatic compact (summary → fresh seeded session) BEFORE the turn runs.
-# 80% leaves enough headroom for the summary turn itself to complete.
-_AUTO_COMPACT_PCT = 80.0
+# 40% (was 80%): lowered 2026-07-01 because reasoning adapters (glm-5.2 etc.)
+# over-think on large cached context — observed a BOSS session reach 459k
+# cached input tokens (46% of its 1M window) with 80% never firing, driving
+# ~38k-token thinking traces and verbose output. 40% fires compaction early
+# enough (≈400k on a 1M window) to keep context lean across all adapters.
+# 40% still leaves ample headroom for the summary turn itself to complete.
+_AUTO_COMPACT_PCT = 40.0
 
 # Continuation budget per user turn: how many times the orchestrator may react
 # to completed dispatches (and chain new ones) within one SSE response.
