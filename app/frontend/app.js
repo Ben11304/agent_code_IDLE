@@ -785,6 +785,7 @@ function createWindowDom(w) {
     const el = document.createElement("div");
     el.className = "graph-canvas";
     el.dataset.id = w.id;
+    el.style.zIndex = 0; // pin canvas below every floating chat/file window
     root.appendChild(el);
     w.el = el;
     w.contentEl = el;
@@ -1161,7 +1162,7 @@ function nodeCardHtml(a, status, expanded, stats, slug) {
   }
   let botBadge = "";
   if (a.telegram_bot) {
-    botBadge = `<span class="ac-bot" title="Agent này đang được điều khiển qua Telegram bot ${escapeHtml(a.telegram_bot)}">🤖 ${escapeHtml(a.telegram_bot)}</span>`;
+    botBadge = `<span class="ac-bot" title="Agent này đang được điều khiển qua Telegram bot ${escapeHtml(a.telegram_bot)}">🤖</span>`;
   }
   let html = `
     <div class="ac-head">
@@ -3179,6 +3180,55 @@ function makeBubbleFactory(w, rootAgent) {
   return bubbleFor;
 }
 
+// ---------- Tool-access card (which files/commands an agent touched) ----------
+// One collapsible card per agent bubble; each tool_use event appends a row so
+// the user can SEE what the agent loaded/edited/ran instead of guessing.
+function _toolItem(tool, input) {
+  const t = (tool || "").toLowerCase();
+  const j = input || {};
+  // MCP tools arrive as mcp__server__method; show the leaf method name.
+  const leaf = tool && tool.indexOf("__") >= 0 ? tool.split("__").pop() : tool;
+  let glyph = "🛠", text = tool || "?";
+  if (t === "read" && j.file_path) { glyph = "📖"; text = j.file_path; }
+  else if (t === "edit" && j.file_path) { glyph = "✏️"; text = j.file_path; }
+  else if (t === "write" && j.file_path) { glyph = "📝"; text = j.file_path; }
+  else if (t === "glob" && j.pattern) { glyph = "🔎"; text = j.pattern; }
+  else if (t === "grep" && (j.pattern || j.query)) { glyph = "🔎"; text = j.pattern || j.query; }
+  else if (t === "bash" && j.command) { glyph = "$"; text = j.command; }
+  else if (leaf && leaf !== tool) { glyph = "🔍"; text = leaf + (j.query ? ": " + j.query : ""); }
+  return { glyph, text };
+}
+function ensureToolCard(b) {
+  if (b.toolCard) return;
+  const card = document.createElement("div");
+  card.className = "tool-card";
+  card.innerHTML = `
+    <div class="tc-head"><span class="tc-glyph">📂</span><span class="tc-summary">0 accesses</span><span class="tc-toggle" title="show files/commands used this turn">▸</span></div>
+    <div class="tc-body" hidden></div>`;
+  const body = card.querySelector(".tc-body");
+  card.querySelector(".tc-head").onclick = () => {
+    body.hidden = !body.hidden;
+    card.querySelector(".tc-toggle").textContent = body.hidden ? "▸" : "▾";
+  };
+  b.bubble.insertBefore(card, b.contentEl);
+  b.toolCard = card;
+  b.toolList = body;
+  b.toolCount = 0;
+}
+function addToolItem(b, tool, input) {
+  ensureToolCard(b);
+  b.toolCount += 1;
+  const { glyph, text } = _toolItem(tool, input);
+  const short = text.length > 90 ? text.slice(0, 87) + "…" : text;
+  const row = document.createElement("div");
+  row.className = "tc-item";
+  row.title = text;
+  row.innerHTML = `<span class="tc-ic">${escapeHtml(String(glyph))}</span><span class="tc-tx">${escapeHtml(short)}</span>`;
+  b.toolList.appendChild(row);
+  b.toolCard.querySelector(".tc-summary").textContent =
+    `${b.toolCount} ${b.toolCount === 1 ? "access" : "accesses"}`;
+}
+
 // Read an SSE response into the window. Tracks w.lastSeq / w.sawComplete /
 // w.runId so a dropped connection can re-attach to the detached run and
 // resume from the next event.
@@ -3373,6 +3423,13 @@ function handleEventInWindow(w, slug, evt, bubbleFor, rootAgent) {
           b.thinkBlock.style.display = "none";
         }
       }
+      // Worker (dispatched child): mirror a short live tail into the card's
+      // status line so the user sees what the child is currently writing,
+      // without auto-expanding the (collapsed) transcript body.
+      if (agent !== rootAgent) {
+        const tail = (b.assembled.replace(/\s+/g, " ").trim()).slice(-80);
+        if (tail) workerCardStatus(w, agent, "✎ " + tail);
+      }
       const m = w.el.querySelector(".messages");
       m.scrollTop = m.scrollHeight;
       break;
@@ -3389,8 +3446,22 @@ function handleEventInWindow(w, slug, evt, bubbleFor, rootAgent) {
       if (!b.thinkBlock.classList.contains("collapsed")) {
         b.thinkBody.scrollTop = b.thinkBody.scrollHeight;
       }
+      // Worker: mirror a short live tail of the thinking into the card status
+      // so the user sees the child reasoning, not just a static "thinking…".
+      if (agent !== rootAgent) {
+        const tail = (b.thinkAccum.replace(/\s+/g, " ").trim()).slice(-80);
+        if (tail) workerCardStatus(w, agent, "💭 " + tail);
+      }
       const m = w.el.querySelector(".messages");
       m.scrollTop = m.scrollHeight;
+      break;
+    }
+    case "tool_use": {
+      // An agent invoked a tool (Read/Grep/Glob/Edit/Write/Bash/MCP...).
+      // Append a row to that agent's tool-access card so the user can see
+      // exactly which files/commands were loaded this turn.
+      const tb = bubbleFor(agent);
+      addToolItem(tb, evt.tool, evt.input || {});
       break;
     }
     case "status": {

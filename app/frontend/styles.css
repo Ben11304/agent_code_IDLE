@@ -548,6 +548,26 @@ html, body { margin: 0; height: 100%; background: var(--bg); color: var(--text);
   font-size: 11px; cursor: pointer; font-family: var(--mono); }
 .wc-open:hover { background: var(--accent); color: #fff; }
 
+/* Tool-access card — files/commands an agent touched this turn */
+.tool-card { margin: 6px 0 2px 0; border: 1px dashed var(--border);
+  border-radius: 6px; font-size: 11px; color: var(--text-dim);
+  font-family: var(--mono); overflow: hidden; }
+.tc-head { display: flex; align-items: center; gap: 6px; padding: 4px 8px;
+  cursor: pointer; user-select: none; }
+.tc-head:hover { background: var(--hover); }
+.tc-glyph { flex-shrink: 0; }
+.tc-summary { flex: 1 1 auto; min-width: 0; white-space: nowrap;
+  overflow: hidden; text-overflow: ellipsis; }
+.tc-toggle { flex-shrink: 0; opacity: 0.7; }
+.tc-body { padding: 4px 8px 6px 8px; border-top: 1px solid var(--border);
+  display: flex; flex-direction: column; gap: 2px; max-height: 220px;
+  overflow-y: auto; }
+.tc-item { display: flex; align-items: baseline; gap: 6px; min-width: 0;
+  white-space: nowrap; }
+.tc-ic { flex-shrink: 0; width: 1.4em; text-align: center; opacity: 0.85; }
+.tc-tx { min-width: 0; overflow: hidden; text-overflow: ellipsis; }
+
+
 /* Control-plane separator — machine-to-machine traffic, not a bubble */
 .ctrl-sep { display: flex; align-items: center; gap: 10px; align-self: stretch;
   margin: 2px 0; color: var(--text-faint); font-size: 10.5px; font-family: var(--mono); }

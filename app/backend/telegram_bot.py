@@ -310,6 +310,26 @@ async def _drive(update, context, run):
             ok = evt.get("status") == "ok"
             progress.append(f"  {'✓' if ok else '✗'} {tgt}")
             dirty = True
+        elif et == "tool_use":
+            # Surface file/command access so the user sees what the agent
+            # (root or worker) is loading this turn — mirrors the UI card.
+            tool = evt.get("tool") or "?"
+            inp = evt.get("input") or {}
+            tl = tool.lower()
+            leaf = tool.split("__")[-1] if "__" in tool else tool
+            if tl == "read" and inp.get("file_path"):
+                txt = "📖 " + str(inp["file_path"])
+            elif tl in ("edit", "write") and inp.get("file_path"):
+                txt = "✏️ " + str(inp["file_path"])
+            elif tl in ("grep", "glob"):
+                txt = "🔎 " + str(inp.get("pattern") or inp.get("query") or leaf)
+            elif tl == "bash" and inp.get("command"):
+                txt = "$ " + str(inp["command"])
+            else:
+                txt = "🔍 " + leaf + (": " + str(inp["query"]) if inp.get("query") else "")
+            who = "" if evt.get("agent") == _AGENT_ID else f"[{evt.get('agent')}] "
+            progress.append(f"  {who}{txt}".splitlines()[0][:120])
+            dirty = True
         elif et == "error":
             had_error = evt.get("message", "unknown error")
             dirty = True

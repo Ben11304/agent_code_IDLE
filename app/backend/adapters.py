@@ -98,6 +98,13 @@ async def claude_stream(
 
     assembled: list[str] = []
     claude_session_id: str | None = None
+    # tool_use blocks arrive split across three stream events:
+    # content_block_start (name + empty input) → content_block_delta
+    # (input_json_delta partial_json chunks) → content_block_stop (input done).
+    # Track them per block index so we can yield one tool_use event with the
+    # fully-assembled input (file_path / command / pattern ...) when the block
+    # closes — the UI renders a "files / commands accessed" bubble from these.
+    tool_inputs: dict[int, dict] = {}
 
     try:
         while True:
@@ -133,6 +140,7 @@ async def claude_stream(
             elif etype == "stream_event":
                 ev = evt.get("event") or {}
                 ev_type = ev.get("type")
+                idx = ev.get("index")
                 if ev_type == "content_block_start":
                     block = ev.get("content_block") or {}
                     btype = block.get("type")
@@ -140,6 +148,10 @@ async def claude_stream(
                         yield {"type": "status", "status": "thinking"}
                     elif btype == "text":
                         yield {"type": "status", "status": "responding"}
+                    elif btype == "tool_use" and idx is not None:
+                        # Start accumulating the tool's input JSON (streams in
+                        # via input_json_delta partial_json chunks).
+                        tool_inputs[idx] = {"name": block.get("name") or "?", "json": ""}
                 elif ev_type == "content_block_delta":
                     delta = ev.get("delta") or {}
                     dtype = delta.get("type")
@@ -152,6 +164,18 @@ async def claude_stream(
                         if text:
                             assembled.append(text)
                             yield {"type": "delta", "text": text}
+                    elif dtype == "input_json_delta" and idx in tool_inputs:
+                        tool_inputs[idx]["json"] += delta.get("partial_json") or ""
+                elif ev_type == "content_block_stop" and idx in tool_inputs:
+                    # Tool input is complete — parse it and surface one event so
+                    # the UI can show which file/command the agent accessed.
+                    info = tool_inputs.pop(idx)
+                    parsed: dict = {}
+                    try:
+                        parsed = json.loads(info["json"] or "{}")
+                    except json.JSONDecodeError:
+                        parsed = {}
+                    yield {"type": "tool_use", "tool": info["name"], "input": parsed}
             elif etype == "assistant":
                 msg = evt.get("message") or {}
                 for block in msg.get("content", []):

@@ -1680,8 +1680,12 @@ async def _run_agent(
                 await emit({"type": "meta", "agent": agent_id, "data": data})
             elif etype == "thinking":
                 await emit({"type": "thinking", "agent": agent_id, "text": evt.get("text", "")})
-            elif etype == "status":
-                await emit({"type": "status", "agent": agent_id, "status": evt.get("status", "")})
+            elif etype == "tool_use":
+                # Adapter surfaced a tool call (Read/Grep/Glob/Edit/Write/Bash/
+                # MCP...) with its parsed input. Forward as-is so the UI can
+                # render a "files / commands accessed" bubble per agent.
+                await emit({"type": "tool_use", "agent": agent_id,
+                            "tool": evt.get("tool"), "input": evt.get("input") or {}})
             elif etype == "done":
                 pass  # finalize below
             elif etype == "error":
