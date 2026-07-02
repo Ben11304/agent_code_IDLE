@@ -225,6 +225,9 @@ html, body { margin: 0; height: 100%; background: var(--bg); color: var(--text);
 .ac-head .ac-sched { font-size: 10px; font-family: var(--mono); color: var(--accent);
   background: var(--accent-soft); border-radius: 6px; padding: 0 5px; flex: 0 0 auto;
   margin-right: 4px; white-space: nowrap; }
+.ac-head .ac-bot { font-size: 10px; font-family: var(--mono); color: #2aabe2;
+  background: color-mix(in srgb, #2aabe2 18%, transparent); border-radius: 6px;
+  padding: 0 5px; flex: 0 0 auto; margin-right: 4px; white-space: nowrap; }
 
 /* corner toasts (scheduled fires surface here with chats closed) */
 .toast-host { position: fixed; right: 16px; bottom: 64px; z-index: 9000;

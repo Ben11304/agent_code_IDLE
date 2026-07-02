@@ -3,3 +3,5 @@ uvicorn[standard]>=0.27
 websockets>=12.0
 pyyaml>=6.0
 ruamel.yaml>=0.17
+# Telegram control channel (optional — only used when TELEGRAM_BOT_TOKEN is set).
+python-telegram-bot>=21.0

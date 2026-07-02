@@ -1159,11 +1159,16 @@ function nodeCardHtml(a, status, expanded, stats, slug) {
     const title = scheds.map((s) => `${schedLabel(s)} · next ${fmtCountdown(s.next_run_at)}`).join("\n");
     schedBadge = `<span class="ac-sched" title="${escapeHtml(title)}">🕒 ${fmtCountdown(next)}</span>`;
   }
+  let botBadge = "";
+  if (a.telegram_bot) {
+    botBadge = `<span class="ac-bot" title="Agent này đang được điều khiển qua Telegram bot ${escapeHtml(a.telegram_bot)}">🤖 ${escapeHtml(a.telegram_bot)}</span>`;
+  }
   let html = `
     <div class="ac-head">
       <span class="ac-dot" style="background:${statusColor(status)}"></span>
       <span class="ac-id">${escapeHtml(a.id)}</span>
       ${schedBadge}
+      ${botBadge}
       <span class="ac-expand" title="${expanded ? "collapse" : "expand"}">${chev}</span>
     </div>
     <div class="ac-model">${escapeHtml(modelLabel(a))}</div>`;

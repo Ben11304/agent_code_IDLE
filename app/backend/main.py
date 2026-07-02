@@ -23,6 +23,7 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
 from . import db, projects
+from . import telegram_bot as tg
 from .adapters import get_stream
 
 TREE_EXCLUDE = {
@@ -261,6 +262,12 @@ def api_project(slug: str):
     out["statuses"] = statuses
     out["positions"] = db.get_node_positions(slug)
     out["schedules"] = [_schedule_public(t) for t in db.list_scheduled_tasks(slug)]
+    # Telegram control channel: stamp the one agent it drives (if any) so the
+    # graph UI can show a "connected to <bot>" badge on its node.
+    conn = tg.connection()
+    if conn and conn["slug"] == slug:
+        for a in out["agents"]:
+            a["telegram_bot"] = conn["bot"] if a["id"] == conn["agent_id"] else None
     return out
 
 
@@ -3123,12 +3130,18 @@ async def _start_terminal_reaper():
 @app.on_event("startup")
 async def _start_scheduler():
     asyncio.create_task(_scheduler_loop())
+    # Telegram control channel (BOSS by default). No-op when no bot token is
+    # configured — runs inside this loop alongside the scheduler.
+    if tg.is_enabled():
+        asyncio.create_task(tg.start_telegram())
 
 
 @app.on_event("shutdown")
 async def _kill_all_terminals():
     for tid in list(_terminals.keys()):
         _term_kill(tid)
+    if tg.is_enabled():
+        await tg.stop_telegram()
 
 
 class _NoCacheStaticFiles(StaticFiles):

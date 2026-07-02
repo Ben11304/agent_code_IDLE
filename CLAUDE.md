@@ -20,6 +20,7 @@ app/
 │   ├── main.py          FastAPI: /api/projects*, /tree, /file + /raw, /workspace/*, SSE chat with dispatch parsing + ledger enrichment + auto-continuation; _start_run (shared by /chat + scheduler), _scheduler_loop, <schedule>/<schedule_stop> parsing
 │   ├── adapters.py      claude_stream (PTY) + grok_stream + deepseek_stream (claude_stream w/ per-subprocess Anthropic-endpoint override) (PTY, streaming-json, --resume, --best-of-n, --check, --memory)
 │   ├── projects.py      registry + project.yaml loader, graph edges, workspace_root, agent bootstrap templates + create_agent atomic
+│   ├── telegram_bot.py  OPTIONAL Telegram control channel: drives one orchestrator (default energy/BOSS) via _start_run + direct _Run queue subscribe (no SSE). No-op without TELEGRAM_BOT_TOKEN.
 │   └── db.py            SQLite sessions, messages, agent_overrides, dispatch_results, node_positions, scheduled_tasks; cleanup_stale_running on startup
 ├── frontend/
 │   ├── index.html       Loads marked + DOMPurify from CDN, sidebar + workspace + taskbar
@@ -227,6 +228,31 @@ Both tags (parsed live in `_run_agent` like `<dispatch>`) and the `/schedule` `/
 Endpoints: `GET/POST /api/projects/{slug}/schedules`, `PATCH /…/{id}?active=` (pause/resume), `DELETE /…/{id}`.
 
 > ⚠️ A scheduler firing `claude -p` every 30 min on an OSC **login node** is exactly the persistent-agent activity OSC flagged (killed ~7GB of processes, threatened account restriction). Run AgentUI **off-cluster** before enabling recurring schedules. Not enforced in code.
+
+## Telegram control channel (optional, `backend/telegram_bot.py`)
+
+A **second subscriber** to the same `_start_run` machinery the web UI uses — lets you drive one orchestrator agent (default **energy/BOSS**) from a phone. An incoming authorized Telegram message becomes a normal agent turn; `telegram_bot.py` attaches an `asyncio.Queue` to the run's `_Run.subscribers` and drains events exactly like `_run_subscriber_sse` (minus the SSE formatting), collecting the root agent's `delta`/`agent_done` text + `dispatch_started`/`dispatch_complete` lines and streaming them back via throttled live message edits.
+
+- **It is the same `_Run`**, not a duplicate: the web UI streams the identical turn in parallel, and everything persists to the same sessions/messages tables. The one-active-run-per-agent policy still holds — if BOSS is mid-turn, the bot replies "đang chạy" instead of queueing.
+- **Disabled by default.** No `TELEGRAM_BOT_TOKEN` ⇒ `is_enabled()` is False, startup skips it, all web-UI behaviour is unchanged. Needs `python-telegram-bot>=21` (in `requirements.txt`).
+- **Long polling, not webhook** — fits localhost + SSH tunnel, never exposes a public URL (respects the "never bind 0.0.0.0 / don't run publicly" rules).
+- **Auth = chat-id allow-list** (`TELEGRAM_CHAT_IDS`). The bot spends your Claude subscription and can dispatch real work, so it MUST stay locked to your account. No allow-list configured ⇒ refuses everyone (fail closed). No token in code/git — loaded from the gitignored `VietHuy/.env` by `run.sh`, same pattern as `DEEPSEEK_API_KEY`.
+- **Commands mirror the UI slash commands** via `db`/`main` helpers (not the REST API): `/help /status /stop /clear /model /effort`.
+
+Config (env, from `VietHuy/.env`):
+
+| Var | Default | Purpose |
+|---|---|---|
+| `TELEGRAM_BOT_TOKEN` | — | BotFather token. Absent ⇒ disabled. |
+| `TELEGRAM_CHAT_IDS` | — | Comma-sep numeric chat ids on the allow-list. |
+| `TELEGRAM_AGENT_SLUG` | `energy` | Project slug to drive. |
+| `TELEGRAM_AGENT_ID` | `BOSS` | Agent id to drive (kept configurable to repoint later). |
+
+Find your chat id: DM the bot any message, then `curl https://api.telegram.org/bot<TOKEN>/getUpdates`.
+
+When extending: the bot only reads `_start_run`, `_active_run` (both module-level in `main.py`) and the `db` override/session helpers — it never touches `adapters.py`, the PTY contract, the dispatch ledger, or the scheduler. The dispatch event lines in the streamed preview are cosmetic; the worker results still reach BOSS through the ledger exactly as in a web-UI turn.
+
+> ⚠️ Same OSC caveat as the scheduler: this drives `claude -p` via BOSS on your subscription. Run AgentUI **off-cluster** if you'll be triggering dispatches from your phone.
 
 ## SSE event types (backend → frontend)
 

@@ -26,5 +26,13 @@ Thumbs.db
 # Logs
 *.log
 
+# Secrets / local env (Telegram token, DeepSeek key, etc.)
+.env
+.env.*
+!.env.example
+
+# CodeGraph index (regenerable local state — created by `codegraph init`)
+.codegraph/
+
 # Node
 node_modules/
