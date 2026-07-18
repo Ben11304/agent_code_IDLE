@@ -50,8 +50,25 @@ async def claude_stream(
         yield {"type": "error", "message": "claude CLI not found on PATH"}
         return
 
+    # The CLI's built-in subagent tool (`Agent`, formerly `Task`) MUST stay off.
+    # Left enabled, an orchestrator spawns an in-process subagent instead of emitting
+    # the <dispatch agent="..."> tag this control plane is built on. That subagent is
+    # invisible to us: no dispatch_started/complete SSE (graph never lights up), no
+    # dispatch_results ledger row (no provenance), and — worst — the REAL worker agent
+    # never runs, so none of its AGENT.md (role, research-integrity rules, manifest
+    # version discipline) applies to the work done in its name. Observed 2026-07-12:
+    # aecbench/BOSS on claude-sonnet-5 reported "RESEARCHER manifest 0.30.0 synced"
+    # across 7 turns while the real RESEARCHER session had been idle for 15 hours and
+    # the ledger recorded zero dispatches. Disabling the tool removes the shortcut, so
+    # the model has to use <dispatch> — which restores the core invariant: if the graph
+    # does not light up, the dispatch did not happen.
+    #
+    # Placement matters: --disallowed-tools is VARIADIC, so it must never sit directly
+    # before the positional prompt or it swallows the message as a tool name. Keep it
+    # ahead of --model (always present), which terminates the variadic.
     cmd = ["claude", "-p", "--output-format", "stream-json", "--verbose",
            "--include-partial-messages", "--permission-mode", "bypassPermissions",
+           "--disallowed-tools", "Agent", "Task",
            "--model", model]
     if effort:
         cmd += ["--effort", effort]
@@ -130,11 +147,36 @@ async def claude_stream(
             etype = evt.get("type")
             if etype == "system" and evt.get("subtype") == "init":
                 claude_session_id = evt.get("session_id")
+                # The CLI declares its whole loaded surface here — tools, skills,
+                # plugins, subagents, MCP servers. This is the ONLY accurate source:
+                # it is what the CLI actually resolved for THIS cwd + settings, not a
+                # guess parsed from config files. Forward it as-is.
+                # NOTE: hooks (e.g. the rtk command-rewriter) are NOT in this payload —
+                # the CLI does not report them, so they cannot be surfaced from init.
+                mcp = [
+                    {"name": s.get("name"), "status": s.get("status")}
+                    for s in (evt.get("mcp_servers") or []) if isinstance(s, dict)
+                ]
+                plugins = [
+                    {"name": p.get("name"), "source": p.get("source")}
+                    for p in (evt.get("plugins") or []) if isinstance(p, dict)
+                ]
                 yield {
                     "type": "meta",
                     "data": {
                         "claude_session_id": claude_session_id,
                         "model": evt.get("model"),
+                        "cwd": evt.get("cwd"),
+                        "tools": evt.get("tools") or [],
+                        "skills": evt.get("skills") or [],
+                        "plugins": plugins,
+                        "subagents": evt.get("agents") or [],
+                        "mcp_servers": mcp,
+                        "slash_commands": evt.get("slash_commands") or [],
+                        "permission_mode": evt.get("permissionMode"),
+                        "output_style": evt.get("output_style"),
+                        "cli_version": evt.get("claude_code_version"),
+                        "init": True,
                     },
                 }
             elif etype == "stream_event":
@@ -520,6 +562,31 @@ async def deepseek_stream(
 # globally. GLM is billed per-token (API), unlike the Claude subscription.
 # ---------------------------------------------------------------------------
 
+def _load_glm_env_file() -> dict:
+    """Parse ~/.config/glm/env — the SAME config file the user's `glm` CLI
+    wrapper (~/bin/glm) sources. By reading the token from here, the UI's GLM
+    nodes reuse the ONE token already granted to the terminal, instead of a
+    second key in VietHuy/.env. File-based (not env-var based), so it does NOT
+    depend on the uvicorn worker process having GLM_API_KEY exported — which
+    fixes the 'GLM_API_KEY not set' failure when the worker doesn't inherit
+    run.sh's env. Same key/endpoint/model the user gets from `glm -p`."""
+    path = os.path.expanduser("~/.config/glm/env")
+    out: dict = {}
+    try:
+        with open(path, encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line or line.startswith("#") or "=" not in line:
+                    continue
+                k, _, v = line.partition("=")
+                v = v.strip().strip('"').strip("'")
+                if v:
+                    out[k.strip()] = v
+    except OSError:
+        pass
+    return out
+
+
 async def glm_stream(
     message: str,
     system_prompt: str,
@@ -528,16 +595,24 @@ async def glm_stream(
     effort: str | None = None,
     resume_session_id: str | None = None,
 ) -> AsyncIterator[dict]:
-    key = os.environ.get("GLM_API_KEY")
+    # Token source = the user's ~/.config/glm/env (the `glm` wrapper config),
+    # falling back to GLM_API_KEY env var if the file is absent. ONE token,
+    # same as the terminal's `glm -p`.
+    cfg = _load_glm_env_file()
+    key = cfg.get("GLM_API_KEY") or os.environ.get("GLM_API_KEY")
     if not key:
         yield {"type": "error",
-               "message": "GLM_API_KEY not set in the environment"}
+               "message": "GLM key not found. Put GLM_API_KEY in ~/.config/glm/env (the `glm` wrapper config) or export GLM_API_KEY."}
         return
-    base_url = os.environ.get("GLM_BASE_URL", "https://api.z.ai/api/anthropic")
+    base_url = (cfg.get("GLM_BASE_URL") or os.environ.get("GLM_BASE_URL")
+                or "https://api.z.ai/api/anthropic")
     extra_env = {
         "ANTHROPIC_BASE_URL": base_url,
         "ANTHROPIC_API_KEY": key,
         "ANTHROPIC_AUTH_TOKEN": key,
+        # per-node model selection (glm-4.6 / glm-5.2) wins over the wrapper's
+        # default GLM_MODEL, so /adapter and project.yaml still control it.
+        "ANTHROPIC_MODEL": model,
     }
     async for ev in _claude_stream_with_overload_retry(
         message=message,

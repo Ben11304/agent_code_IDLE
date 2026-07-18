@@ -22,7 +22,7 @@ from fastapi.responses import StreamingResponse, FileResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
-from . import db, projects
+from . import db, projects, tokens, progress_store, agent_log, fixed_cost
 from . import telegram_bot as tg
 from .adapters import get_stream
 
@@ -43,6 +43,12 @@ app.add_middleware(
 )
 
 db.init_db()
+# Snapshot the sessions the previous process left mid-turn BEFORE the reaper flips
+# them to 'cancelled'. Their turn's finally-booking never ran, so their transcript
+# tail is unbooked — the crash leg of the rotation-loss fix. The actual booking runs
+# at the BOTTOM of this module (_startup_token_sweep) because _book_session_tokens
+# is not defined yet at this point.
+_orphan_sessions = db.list_running_sessions()
 _orphan_count = db.cleanup_stale_running()
 if _orphan_count:
     print(f"[startup] reset {_orphan_count} orphan 'running' session(s) to 'cancelled'")
@@ -70,6 +76,11 @@ _SCHEDULE_INSTRUCTIONS = (
     "You CANNOT run background timers, cron jobs, pollers, heartbeats, or detached processes. A turn ends and "
     "your CLI process EXITS. The ONLY thing that can ever wake you up again is a `<schedule>` tag parsed by the "
     "control plane. No tag = nothing runs = you will NEVER be re-invoked.\n\n"
+    "**DO NOT invoke the `schedule` Agent Skill (or any cron/routine skill) to satisfy this.** That skill creates "
+    "a cloud routine that runs on Anthropic's servers with NO access to this machine (no SLURM/`sacct`/`ssh`, no "
+    "local files) and cannot be shown in this UI's 🕒 Schedules dropdown. For recurring work HERE, the ONLY correct "
+    "mechanism is emitting the `<schedule>` tag below — it runs on THIS host (full shell, SLURM, files) and shows "
+    "up in the UI. Ignore the skill's matching name; it is the wrong tool for tracking work on this machine.\n\n"
     "**Trigger — whenever the user asks you to track / monitor / watch / poll / check periodically / keep them "
     "posted / report every N minutes / run until done — or in Vietnamese: 'theo dõi', 'tracking', 'mỗi 30 phút', "
     "'định kỳ', 'báo cáo định kỳ', 'tự chạy tới đích', 'cho đến khi xong' — you MUST emit a `<schedule>` tag in "
@@ -95,10 +106,27 @@ _SCHEDULE_INSTRUCTIONS = (
 # matches this AND the agent's response emitted no <schedule> tag, the driver fires
 # one corrective continuation (delivered via the prompt channel, so it reaches the
 # model even on a resumed session where --append-system-prompt may not).
+    # EVERY alternative here must require scheduling CONTEXT, never a bare noun. A single
+    # loose word turns ordinary prose into a phantom schedule request: the word "recurring"
+    # in a paper's "six recurring failure patterns" fired this, so the driver sent BOSS a
+    # SCHEDULE_NUDGE, BOSS spent its final synthesis turn retracting a promise it never made,
+    # and the user's actual question went unanswered. Bare "schedule" / "cron" / "<n> p" were
+    # the same trap ("the project schedule", "15 p"). Keep the verbs and the cadences; the
+    # cost of a miss (user re-asks) is far below the cost of a false fire (answer destroyed).
 _TRACK_INTENT_RE = re.compile(
-    r"(tracking|track this|track it|track the|monitor|keep me posted|keep an eye|periodically|"
-    r"recurring|every\s+\d+\s*(m|min|minute|mins|minutes|h|hr|hour|hours)\b|"
-    r"theo\s*d[õo]i|đ[ịi]nh\s*k[ỳy]|b[áa]o\s*c[áa]o\s*đ[ịi]nh\s*k[ỳy]|m[ỗo]i\s+\d+\s*(ph[úu]t|gi[ờo]|p|h|m)|"
+    r"(track this|track it|track the|keep me posted|keep an eye|"
+    r"(run|check|report|update|ping|poll)\s+(me\s+)?periodically|"
+    r"recurring\s+(run|check|task|job|report|schedule|turn|reminder)|"
+    r"(set|create|add|make|start)\s+(up\s+)?(a\s+)?(schedule|cron)\b|cron\s+job|"
+    r"every\s+\d+\s*(m|min|minute|mins|minutes|h|hr|hour|hours)\b|"
+    # explicit "schedule" verbs (EN + VI): "set a schedule", "lên lịch", "lên schedule",
+    # "tạo/đặt lịch", "lập lịch" — the phrasings that previously slipped through and made
+    # the agent reach for the cloud `schedule` skill instead of emitting a <schedule> tag.
+    r"l[êe]n\s+(l[ịi]ch|schedule)|l[ậa]p\s+l[ịi]ch|t[ạa]o\s+(l[ịi]ch|schedule)|đ[ặa]t\s+l[ịi]ch|"
+    r"theo\s*d[õo]i|đ[ịi]nh\s*k[ỳy]|b[áa]o\s*c[áa]o\s*đ[ịi]nh\s*k[ỳy]|"
+    # cadence: "mỗi 30 phút" / "mỗi 30p" — anchored on "mỗi", so a bare "15 p" in prose
+    # (which used to match) no longer fires.
+    r"m[ỗo]i\s+\d+\s*(ph[úu]t|gi[ờo]|p|h|m)\b|"
     r"cho\s+đ[ếe]n\s+khi\s+xong|t[ựu]\s+ch[ạa]y|until\s+(it'?s\s+)?(done|finished|complete|over))",
     re.IGNORECASE)
 
@@ -320,6 +348,7 @@ _MODEL_CONTEXT_WINDOWS = {
     "claude-fable-5": 1_000_000,
     "claude-opus-4-8": 1_000_000,
     "claude-opus-4-7": 1_000_000,
+    "claude-sonnet-5": 1_000_000,
     "claude-sonnet-4-6": 1_000_000,
     "claude-haiku-4-5": 200_000,
     # DeepSeek V4 (served via DeepSeek's native Anthropic endpoint → claude -p).
@@ -343,11 +372,15 @@ def _context_window_for(model_kind: str, model_id: Optional[str]) -> int:
     return _CONTEXT_WINDOWS.get(model_kind, 200_000)
 
 
-def _usage_ctx_tokens(usage: dict, window: int | None = None) -> int:
+def _usage_ctx_tokens(usage: dict, window: int | None = None) -> Optional[int]:
     """Context-window occupancy from a CLI usage blob = the LARGEST single API
     request in the turn, NOT the top-level sums (cumulative billing across
     agentic rounds — routinely exceeds the window). Shared by the stats endpoint
-    and the auto-compact threshold check."""
+    and the auto-compact threshold check.
+
+    Returns None when the blob cannot express occupancy at all; the caller must
+    then fall back to a chars/4 estimate (_ctx_estimate_tokens).
+    """
     def _req_total(d: dict) -> int:
         return (
             (d.get("input_tokens") or 0)
@@ -357,37 +390,65 @@ def _usage_ctx_tokens(usage: dict, window: int | None = None) -> int:
         )
     iters = usage.get("iterations") or []
     if iters:
+        # Per-request breakdown available → the largest request IS the occupancy.
         return max(_req_total(it) for it in iters)
     total = _req_total(usage)
-    # Cumulative-usage providers (e.g. DeepSeek via its Anthropic-compatible
-    # endpoint) report tokens SUMMED across every internal tool-use round, with
-    # NO per-iteration breakdown (iterations == []). The cumulative cache_read
-    # alone can reach several million in one agentic turn. A single request can
-    # never exceed the model's context window, so when the blob does, it is
-    # cumulative billing, not occupancy — fall back to the non-cumulative buckets
-    # (fresh input + output) which approximate the final request's footprint.
-    # Without this, the gauge pins at 100% and auto-compact fires every turn,
-    # thrashing the --resume session. Claude's per-request totals stay < window,
-    # so this branch never triggers for Claude.
     if window and total > window:
-        return (usage.get("input_tokens") or 0) + (usage.get("output_tokens") or 0)
+        # No per-iteration breakdown AND the top-level sum exceeds the window, so
+        # the blob is cumulative across tool-use rounds (billing, not occupancy).
+        # This is NOT DeepSeek-only: Claude emits it too whenever `iterations` comes
+        # back empty — observed on cveval/VLM (2.5M summed) and dfu-pipeline/INTEGRITY
+        # (1.3M summed), both claude-sonnet-4-6.
+        #
+        # Occupancy is genuinely UNRECOVERABLE from this blob. The old code returned
+        # `input + output` here, which measures the size of the NEW turn, not the
+        # resumed session — the bulk of a --resume context is `cache_read`, which that
+        # expression drops. It read INTEGRITY (1.3M summed) as 6,278 tokens = 0.6%, so
+        # auto-compact could never fire on precisely the heaviest, most tool-happy
+        # agents. Return None and let the caller estimate instead of reporting a
+        # confidently-wrong low number.
+        return None
     return total
 
 
-def _session_context_pct(sess: Optional[dict], model_kind: str,
-                         model_id: Optional[str] = None) -> float:
-    """Context % of a session's last completed turn, 0.0 when unknown (no usage
-    recorded yet — fresh session, or a grok node which reports no usage)."""
-    if not sess or not sess.get("usage"):
-        return 0.0
+def _ctx_estimate_tokens(root: str, agent: dict, est_chars: int) -> int:
+    """Chars/4 context estimate: every persisted message of the session plus the
+    agent's system prompt. The fallback numerator whenever the CLI's usage blob is
+    missing (fresh session, grok node) or unusable (cumulative — see above). Coarse,
+    but it grows monotonically with the session, so a threshold built on it actually
+    trips; a 0.0 default would silently disable auto-compact."""
+    sys_chars = 0
     try:
-        usage = json.loads(sess["usage"])
-    except (ValueError, TypeError):
-        return 0.0
+        sp = projects.resolve_system_prompt(root, agent.get("system_prompt_file", ""))
+        sys_chars = len(sp or "")
+    except Exception:
+        pass
+    return (est_chars + sys_chars) // 4
+
+
+def _session_context_pct(sess: Optional[dict], model_kind: str,
+                         model_id: Optional[str] = None,
+                         est_tokens: int = 0) -> float:
+    """Context % of a session's last completed turn.
+
+    Numerator prefers the CLI's real usage. When that blob is absent (fresh session,
+    or a grok node which reports none) or unusable (cumulative — _usage_ctx_tokens
+    returns None), it falls back to `est_tokens`, the caller's chars/4 estimate. The
+    fallback is what keeps the auto-compact threshold alive on heavy agents; without
+    it those sessions read ~0% forever and never rotate.
+    """
     window = _context_window_for(model_kind, model_id)
     if not window:
         return 0.0
-    return round(_usage_ctx_tokens(usage, window) / window * 100.0, 1)
+    tokens: Optional[int] = None
+    if sess and sess.get("usage"):
+        try:
+            tokens = _usage_ctx_tokens(json.loads(sess["usage"]), window)
+        except (ValueError, TypeError):
+            tokens = None
+    if tokens is None:
+        tokens = est_tokens
+    return round(min(100.0, tokens / window * 100.0), 1)
 
 
 def _memory_info(project_root: str, agent: dict, cwd_abs: str) -> Optional[dict]:
@@ -575,6 +636,7 @@ def api_project_stats(slug: str):
         raise HTTPException(404, "project not found")
     root = project["root"]
     overrides = db.list_agent_overrides(slug)
+    token_totals = db.agent_token_totals(slug)
     stats: dict = {}
     for a in project["agents"]:
         aid = a["id"]
@@ -598,8 +660,11 @@ def api_project_stats(slug: str):
                 except (ValueError, TypeError):
                     usage = None
 
-        model_kind = a.get("model", "claude")
         ov = overrides.get(aid) or {}
+        # Adapter override wins, same as _run_agent — otherwise the panel reports the
+        # yaml adapter while the agent runs on another (BOSS: yaml glm, /adapter claude),
+        # picking the wrong context window and mislabelling the node.
+        model_kind = ov.get("model") or a.get("model", "claude")
         if model_kind == "grok":
             eff_model = ov.get("grok_model") or a.get("grok_model") or "grok-build"
         elif model_kind == "deepseek":
@@ -613,25 +678,35 @@ def api_project_stats(slug: str):
         window = _context_window_for(model_kind, eff_model)
         # Prefer the CLI's real token usage from the last turn. Context-window
         # occupancy = every input bucket (fresh + cache create + cache read) +
-        # output. Fall back to a chars/4 estimate only when no usage is recorded
-        # yet (e.g. a session that has never completed a turn, or a grok node).
-        if usage:
-            ctx_tokens = _usage_ctx_tokens(usage, window)
+        # output. Fall back to a chars/4 estimate when no usage is recorded yet
+        # (a session that has never completed a turn, or a grok node) OR when the
+        # blob is cumulative and cannot express occupancy (_usage_ctx_tokens → None).
+        # Preferred source: the CLI transcript. It reports the usage the SERVER returned
+        # per request, so max(input+cache_creation+cache_read) IS the context occupancy —
+        # no cumulative-vs-occupancy ambiguity and nothing the CLI injected is missed.
+        scanned = tokens.scan(sess["claude_session_id"]) \
+            if sess and sess.get("claude_session_id") else None
+        ctx_tokens = scanned["occupancy"] if scanned else None
+        token_source = "transcript"
+        if ctx_tokens is None:
+            ctx_tokens = _usage_ctx_tokens(usage, window) if usage else None
             token_source = "exact"
-        else:
-            sys_chars = 0
-            try:
-                sp = projects.resolve_system_prompt(root, a.get("system_prompt_file", ""))
-                sys_chars = len(sp or "")
-            except Exception:
-                pass
-            ctx_tokens = (est_chars + sys_chars) // 4
+        if ctx_tokens is None:
+            ctx_tokens = _ctx_estimate_tokens(root, a, est_chars)
             token_source = "estimate"
         pct = round(min(100.0, ctx_tokens / window * 100.0), 1) if window else 0.0
+
+        init_meta = None
+        if sess and sess.get("init_meta"):
+            try:
+                init_meta = json.loads(sess["init_meta"])
+            except (ValueError, TypeError):
+                init_meta = None
 
         cwd_abs = projects.resolve_cwd(root, a.get("cwd", "."))
         stats[aid] = {
             "status": status,
+            "init": init_meta,
             "model_kind": model_kind,
             "model": eff_model,
             "effort": effort,
@@ -641,6 +716,12 @@ def api_project_stats(slug: str):
             "token_source": token_source,
             "context_window": window,
             "context_pct": pct,
+            # Lifetime billing for this agent (sum of booked turns) + this session's
+            # scan. Billing != occupancy: cache_read is re-charged every request.
+            "tokens": token_totals.get(aid),
+            "session_tokens": {k: scanned[k] for k in
+                               ("requests", "input_tokens", "cache_creation",
+                                "cache_read", "output_tokens", "billed_total")} if scanned else None,
             "has_session": has_session,
             "num_sessions": len(sessions),
             "memory": _memory_info(root, a, cwd_abs),
@@ -742,32 +823,43 @@ def _bootstrap_prompt(slug: str, body: "NewAgent", parent_id: str) -> str:
         f'<file path="{body.id}/RELATIVE_PATH">\n'
         "...content...\n"
         "</file>\n\n"
-        "Required files (5):\n"
+        "Required files (6):\n"
         f"1. `{body.id}/AGENT.md`\n"
-        f"2. `{body.id}/inputs/manifest.md`\n"
-        f"3. `{body.id}/outputs/manifest.md`\n"
-        f"4. `{body.id}/state/progress.md`\n"
-        f"5. `{body.id}/context/code_map.md`\n\n"
+        f"2. `{body.id}/overview.md`\n"
+        f"3. `{body.id}/inputs/manifest.md`\n"
+        f"4. `{body.id}/outputs/manifest.md`\n"
+        f"5. `{body.id}/state/progress.md`\n"
+        f"6. `{body.id}/context/code_map.md`\n\n"
         "## Content guidelines\n"
         "- `AGENT.md` is the system prompt. Under 80 lines. Required sections in order: "
         "  (a) **NOTICE** (refuse to act on missing info, override all other rules), "
-        "  (b) **Role**, "
-        "  (c) **Required reads** in strict order — point at REAL files (always include the "
-        "  five shared files `../shared/{research_integrity,tool_conventions,handoff_schema,"
-        "glossary,scope_decisions}.md`, then this agent's `./inputs/manifest.md`, "
-        "`./context/code_map.md`, and `./state/progress.md` LAST), "
-        "  (d) **Scope IN/OUT**, "
-        "  (e) **Pre-flight checklist**, "
-        "  (f) **Deliverables** — list the SPECIFIC files this agent must keep current. "
-        "  At minimum this MUST include: prepend a dated entry to `./state/progress.md` "
+        "  (b) **Boot** — ONE ordered read-list (NO second 'Required reads' section). It must "
+        "  read ONLY slim things: the shared rules it needs (`../shared/{research_integrity,"
+        "scope_decisions}.md` + others on-demand), this file, its own `./overview.md`, and the "
+        "  tiny `./inputs/manifest.md` (pinned versions). A PARENT reads `./state/children_status.json` "
+        "  instead of each child's overview. Then an 'On-demand only (NOT at boot)' note: open the "
+        "  full `./inputs/<PRODUCER>.md` blob + the artifacts it points to ONLY when consuming a "
+        "  specific artifact — never for routing. **Do NOT read `./state/progress.md` at boot** — "
+        "  the control-plane auto-injects the recent slice (`progress.json`, ~2 days) into the "
+        "  cold-start preamble; the agent only APPENDS to it. "
+        "  (c) **Role**, "
+        "  (d) **Boundaries** (three tiers: Always / Ask first→ESCALATION / Never), "
+        "  (e) **Deliverables** — list the SPECIFIC files this agent must keep current. "
+        "  At minimum: prepend a `## YYYY-MM-DD HH:MM — headline` entry to `./state/progress.md` "
         "  on every meaningful turn, and bump `./outputs/manifest.md` (with a Bump-log entry) "
-        "  on every produced/modified artifact. Also list any domain-specific deliverables "
-        "  with REAL paths (e.g. `paper/latex/asce2027_paper.tex`, `results/<run_id>/predictions.parquet`, "
-        "  `documentation/METHODOLOGY.md` §X). "
-        "  (g) **Output contract** including the 3-statement-type rule (fact / literature claim / design decision), "
-        "  (h) **Escalation triggers**. "
+        "  on every produced/modified artifact. Also list domain-specific deliverables "
+        "  with REAL paths (e.g. `paper/latex/asce2027_paper.tex`, `results/<run_id>/predictions.parquet`). "
+        "  (f) **Handoff** (input = inputs/manifest.md pinned; output = outputs/manifest.md pointing to PATHS, not data), "
+        "  (g) **Hard rules** including the 3-statement-type rule (fact / literature claim / design decision) "
+        "  and no-fabrication (→ `[VERIFY]`). "
         "NO routing tables, NO worker lists, NO 'dispatch this' patterns — the control plane "
         "injects current children at runtime.\n"
+        "- `overview.md` — the slim state pane the parent reads to route. Three comment-delimited "
+        "sections: `<!-- OVERVIEW:HEADER -->` (machine fields `status`, `manifest_version: 0.1.0`, "
+        "`ready_for_parent`, `body_incomplete: true` — the control-plane stamps these), "
+        "`<!-- OVERVIEW:BODY -->` (holistic current state, overwritten each turn, ≤200 words, one "
+        "`label:` per line), `<!-- OVERVIEW:FOOTER -->` (`last_artifact`, `manifest_ref`, "
+        "`open_escalation`, `last_updated`). Bootstrap the BODY as `- (chờ first task)`.\n"
         "- `inputs/manifest.md` — YAML frontmatter (`schema_version: 1`, `agent`, "
         "`direction: inputs`, `updated`) + a table with columns: Source agent | Synced "
         "version | Artifact / path | Used for which section. One row per upstream artifact this "
@@ -780,8 +872,11 @@ def _bootstrap_prompt(slug: str, body: "NewAgent", parent_id: str) -> str:
         "AgentUI`, **Artifacts** table (Artifact path | Consumer agents | Current version | "
         "Updated | Checksum/note). The agent will keep this current per Deliverables.\n"
         "- `state/progress.md` — `# <ID> Progress log (newest on top)` + a Convention block "
-        "instructing to PREPEND a dated section every meaningful turn (format: `## YYYY-MM-DD — headline` "
-        "followed by 2–5 bullets with evidence). One initial entry dated today recording the bootstrap.\n"
+        "instructing to PREPEND a dated section every meaningful turn (format: `## YYYY-MM-DD HH:MM — headline` "
+        "— the time is REQUIRED, the control-plane reads it for freshness — followed by 2–5 bullets "
+        "with evidence). Note that the control-plane rotates this into `progress.json` and auto-injects "
+        "the recent slice, so the agent APPENDS but never reads the full log at boot. One initial entry "
+        "dated today recording the bootstrap.\n"
         "- `context/code_map.md` — sections: **Owned** (this agent's files + domain artifacts "
         "with REAL paths), **Read-only references** (`../shared/`, upstream agents), "
         "**Out of scope** (other agents' folders).\n\n"
@@ -801,6 +896,7 @@ def _validate_bootstrap_files(files: list, agent_id: str) -> list[str]:
     paths = {f["path"] for f in files}
     for required in [
         f"{agent_id}/AGENT.md",
+        f"{agent_id}/overview.md",
         f"{agent_id}/inputs/manifest.md",
         f"{agent_id}/outputs/manifest.md",
         f"{agent_id}/state/progress.md",
@@ -969,6 +1065,9 @@ def api_clear_session(slug: str, agent_id: str):
     found = projects.get_agent(slug, agent_id)
     if not found:
         raise HTTPException(404, "agent not found")
+    # Rotation point: last chance to book the outgoing session's unbooked token usage —
+    # after new_session() every scan reads the NEW transcript only.
+    _book_current_session_tokens(slug, agent_id)
     sess = db.new_session(slug, agent_id)
     return {"ok": True, "new_session_id": sess["id"]}
 
@@ -1307,11 +1406,13 @@ def _session_preamble(project_root: str, agent: dict, cwd_abs: str) -> str:
     adir = _agent_dir(project_root, agent, cwd_abs)
     parts: list[str] = []
 
-    prog = adir / "state" / "progress.md"
-    if prog.is_file():
-        ex = _progress_excerpt(prog)
-        if ex:
-            parts.append(f"### Your memory (`state/progress.md`, newest first)\n{ex}")
+    # Structured progress log: newest KEEP_DAYS days, always newest-first regardless of
+    # how the file is ordered on disk (the old markdown excerpt guessed the ordering and
+    # loaded the OLDEST day for agents that append oldest-first). Falls back to parsing
+    # legacy progress.md for agents not yet migrated to progress.json.
+    prog_txt = progress_store.recent_text(adir, keep_days=_PROGRESS_KEEP_DAYS)
+    if prog_txt:
+        parts.append(f"### Your memory (`state/progress.json`, newest first)\n{prog_txt}")
 
     roll = adir / "state" / "children_status.json"
     if roll.is_file():
@@ -1604,6 +1705,7 @@ async def _run_agent(
     sched_stop_seen: set = set()
     final_status = "ok"
     last_usage: dict = {}          # real token usage of this turn (for context_log)
+    claude_sid: Optional[str] = None   # CLI session id — keys the transcript token scan
     new_chain = chain + (agent_id,)
 
     try:
@@ -1673,7 +1775,13 @@ async def _run_agent(
             elif etype == "meta":
                 data = evt.get("data") or {}
                 if data.get("claude_session_id"):
-                    db.set_claude_session_id(sess["id"], data["claude_session_id"])
+                    claude_sid = data["claude_session_id"]
+                    db.set_claude_session_id(sess["id"], claude_sid)
+                if data.get("init"):
+                    # The init card and the node panel's tools list must be visible on
+                    # an idle agent and survive a browser reload, so the payload is
+                    # persisted here rather than living only in the SSE stream.
+                    db.set_session_init(sess["id"], data)
                 if data.get("usage"):
                     db.set_session_usage(sess["id"], data["usage"])
                     last_usage = data["usage"]
@@ -1729,6 +1837,24 @@ async def _run_agent(
         except Exception:
             pass
         # ----- END CONTEXT LOG -----
+
+        # ----- EXACT TOKEN ACCOUNTING (toggle: token_count_enabled) -----
+        # Harvest the CLI's own transcript, which records the usage the SERVER returned
+        # for every API request of this turn — including everything the CLI injected on
+        # its own (CLAUDE.md, skills, tool schemas, tool results). Booked as a delta
+        # against what earlier turns of this claude session already recorded.
+        try:
+            # to_thread — same event-loop-starvation reason as the compact-path scan.
+            delta = await asyncio.to_thread(_book_session_tokens, slug, agent_id, claude_sid)
+            if delta:
+                await emit({"type": "token_turn", "agent": agent_id, "usage": {
+                    "requests": delta["requests"],
+                    "output_tokens": delta["output_tokens"],
+                    "occupancy": delta["occupancy"],
+                }})
+        except Exception:
+            pass
+        # ----- END EXACT TOKEN ACCOUNTING -----
 
     # ----- STRUCTURED OUTPUT: parse [RESULT]/[ESCALATE], retry once, stamp overview (§6.4) -----
     # Only on a clean turn with text. Absent blocks are fine (no retry). A single
@@ -2165,6 +2291,14 @@ async def _dispatched_run(slug, source_id, target_id, task, emit, tracker, chain
     result_text = ""
     manifest_before = _manifest_snapshot(slug, target_id)
     try:
+        # Auto-compact the WORKER before it runs its dispatched task. Without this,
+        # a worker only ever reaches _run_agent via dispatch (never _start_run), so
+        # the auto-compact checkpoint in _start_run.driver() never fires for it and
+        # its context grows unbounded across successive dispatches (observed:
+        # RESEARCHER in the aecbench project past 65% with no rotation). Same
+        # pre-turn semantics as the top-level path: it uses the last completed
+        # turn's usage, skips torn sessions, and no-ops below the threshold.
+        await _auto_compact_if_needed(slug, target_id, emit)
         result_text = await _run_agent(slug, target_id, task, emit, tracker, chain) or ""
         # _run_agent sets final_status internally (e.g. to "error" on
         # adapter error events) and updates the worker session row before
@@ -2264,7 +2398,18 @@ async def _dispatched_run(slug, source_id, target_id, task, emit, tracker, chain
 # ~38k-token thinking traces and verbose output. 40% fires compaction early
 # enough (≈400k on a 1M window) to keep context lean across all adapters.
 # 40% still leaves ample headroom for the summary turn itself to complete.
-_AUTO_COMPACT_PCT = 40.0
+#
+# Per-adapter since 2026-07-11: 40% was tuned for the WORST adapter and then applied
+# to every node. Claude does not over-think on large cached context, so compacting it
+# at 400k of a 1M window doubles the compaction rate for no benefit — and each compact
+# costs a full extra turn on the largest session plus a lossy recap. Claude keeps the
+# original 70%; the reasoning adapters keep the 40% that was measured for them.
+_AUTO_COMPACT_PCT = 40.0                        # default: glm / deepseek / grok
+_AUTO_COMPACT_PCT_BY_KIND = {"claude": 70.0}
+
+
+def _auto_compact_pct(model_kind: str) -> float:
+    return _AUTO_COMPACT_PCT_BY_KIND.get(model_kind, _AUTO_COMPACT_PCT)
 
 # Continuation budget per user turn: how many times the orchestrator may react
 # to completed dispatches (and chain new ones) within one SSE response.
@@ -2284,13 +2429,21 @@ async def _auto_compact_if_needed(slug: str, agent_id: str, emit) -> bool:
     found = projects.get_agent(slug, agent_id)
     if not found:
         return False
-    _, agent = found
+    project, agent = found
+    root = project["root"]
     sessions = db.list_sessions(slug, agent_id)
     sess = sessions[0] if sessions else None
     if not sess or sess.get("last_status") != "ok" or not sess.get("claude_session_id"):
         return False
-    model_kind = agent.get("model", "claude")
     ov = db.get_agent_override(slug, agent_id) or {}
+    # The ADAPTER override must win here exactly as it does in _run_agent (`override
+    # .get("model") or agent.get("model")`). Reading only project.yaml made this the
+    # one place that disagreed with the process actually running: aecbench/BOSS is
+    # `model: glm` in yaml but was switched to claude-opus-4-8 via /adapter, so the
+    # turn ran on Claude while the threshold was computed for glm — 40% instead of
+    # 70%. It auto-compacted at 40.4/41.6/40.7%, rotating BOSS's session ~2x more
+    # often than intended and dropping context it still needed.
+    model_kind = ov.get("model") or agent.get("model", "claude")
     if model_kind == "grok":
         eff_model = ov.get("grok_model") or agent.get("grok_model") or "grok-build"
     elif model_kind == "deepseek":
@@ -2299,8 +2452,22 @@ async def _auto_compact_if_needed(slug: str, agent_id: str, emit) -> bool:
         eff_model = ov.get("glm_model") or agent.get("glm_model") or "glm-4.6"
     else:
         eff_model = ov.get("claude_model") or agent.get("claude_model") or "claude-sonnet-4-6"
-    pct = _session_context_pct(sess, model_kind, eff_model)
-    if pct < _AUTO_COMPACT_PCT:
+    # Numerator, best source first: the CLI transcript gives real per-request occupancy,
+    # so the chars/4 estimate (which cannot see tool output the CLI read internally, and
+    # therefore under-counts exactly the tool-heavy agents that need compacting) is now
+    # only a last resort for sessions with no transcript at all (grok).
+    window = _context_window_for(model_kind, eff_model)
+    # to_thread: the scan parses a transcript that can reach tens of MB over NFS.
+    # Inline it would block the event loop — which also runs every PTY reader, so a
+    # slow scan here froze a LIVE claude child mid-turn (observed 2026-07-16).
+    scanned = await asyncio.to_thread(tokens.scan, sess["claude_session_id"])
+    if scanned and window:
+        pct = round(min(100.0, scanned["occupancy"] / window * 100.0), 1)
+    else:
+        est_chars = sum(len(m.get("content") or "") for m in db.get_messages(sess["id"]))
+        est_tokens = _ctx_estimate_tokens(root, agent, est_chars)
+        pct = _session_context_pct(sess, model_kind, eff_model, est_tokens)
+    if pct < _auto_compact_pct(model_kind):
         return False
 
     await emit({"type": "compact_started", "agent": agent_id, "auto": True, "pct": pct})
@@ -2308,6 +2475,9 @@ async def _auto_compact_if_needed(slug: str, agent_id: str, emit) -> bool:
     summary = (await _run_agent(slug, agent_id, _COMPACT_PROMPT, emit, tracker) or "").strip()
     if tracker:
         await asyncio.gather(*tracker, return_exceptions=True)
+    # Rotation point: book the outgoing session's remaining usage (idempotent — the
+    # compact turn's own finally-booking normally leaves a zero delta here).
+    await asyncio.to_thread(_book_current_session_tokens, slug, agent_id)
     new_sess = db.new_session(slug, agent_id)
     if summary:
         db.set_session_seed(new_sess["id"], summary)
@@ -2318,8 +2488,8 @@ async def _auto_compact_if_needed(slug: str, agent_id: str, emit) -> bool:
         )
     else:
         # Summary turn failed (likely the old session was too overloaded to
-        # answer). Still rotate to a fresh session — staying at >80% is worse.
-        # The cold-start preamble (state/progress.md) covers recovery.
+        # answer). Still rotate to a fresh session — staying above the threshold
+        # is worse. The cold-start preamble (state/progress.md) covers recovery.
         db.add_message(
             new_sess["id"], "assistant",
             f"📦 **Auto-compact @ {pct}% context** — recap empty (old session overloaded?); "
@@ -2498,6 +2668,7 @@ def _start_run(slug: str, agent_id: str, message: str, *,
             # on scheduled fires or continuations. Without it, the agent's "tracking is
             # active" narration silently registers nothing — the failure we're fixing.
             if (origin == "user" and not saw_sched
+                    and _scheduler_enabled()
                     and _looks_like_tracking_intent(message)):
                 ncur: list = []
                 await _run_agent(slug, agent_id, _SCHEDULE_NUDGE, emit, ncur)
@@ -2739,6 +2910,244 @@ def _scheduler_enabled() -> bool:
     return db.get_setting("scheduler_enabled", "1") == "1"
 
 
+def _token_counting_enabled() -> bool:
+    """Global switch (same pattern as the scheduler toggle). Off by default: when on,
+    every turn that finishes gets its transcript scanned and booked into token_turns."""
+    return db.get_setting("token_count_enabled", "0") == "1"
+
+
+def _today_str() -> str:
+    return datetime.now().strftime("%Y-%m-%d")
+
+
+def _book_session_tokens(slug: str, agent_id: str, csid: Optional[str]) -> Optional[dict]:
+    """Scan a claude session's transcript and book the yet-unbooked remainder into
+    token_turns. Idempotent: the booking is a delta against everything already recorded
+    for this csid, so calling it twice books nothing the second time.
+
+    Called from three places, which together close every leak:
+      1. _run_agent finally — the normal per-turn booking.
+      2. Session ROTATION (/clear, /compact, auto-compact) — the last chance to read the
+         old transcript. After rotation every later scan points at the NEW session's
+         file, so an unbooked remainder on the old one would be lost forever (the case:
+         a turn whose finally-booking failed, or a crash before it ran).
+      3. Startup sweep over sessions left 'running' — a killed server never reached (1).
+    """
+    if not (csid and _token_counting_enabled()):
+        return None
+    try:
+        # force=True: booking is final (especially at rotation — the old csid is never
+        # scanned again), so it must not accept a TTL-stale scan missing the turn's tail.
+        scanned = tokens.scan(csid, force=True)
+        if not scanned:
+            return None
+        booked = db.session_token_booked(csid)
+        d_req = scanned["requests"] - (booked.get("requests") or 0)
+        if d_req <= 0:
+            return None
+        delta = {
+            "requests": d_req,
+            "input_tokens": scanned["input_tokens"] - (booked.get("input_tokens") or 0),
+            "cache_creation": scanned["cache_creation"] - (booked.get("cache_creation") or 0),
+            "cache_read": scanned["cache_read"] - (booked.get("cache_read") or 0),
+            "output_tokens": scanned["output_tokens"] - (booked.get("output_tokens") or 0),
+            "occupancy": scanned["occupancy"],
+        }
+        db.add_token_turn(project_slug=slug, agent_id=agent_id,
+                          claude_session_id=csid, model=scanned.get("model"), **delta)
+        return delta
+    except Exception:
+        return None
+
+
+def _book_current_session_tokens(slug: str, agent_id: str) -> None:
+    """Book the agent's CURRENT session before rotating it away. Call sites: the three
+    new_session() rotation points (/clear, /compact, auto-compact)."""
+    sessions = db.list_sessions(slug, agent_id)
+    if sessions:
+        _book_session_tokens(slug, agent_id, sessions[0].get("claude_session_id"))
+
+
+@app.get("/api/projects/{slug}/agents/{agent_id}/log")
+async def api_agent_log(slug: str, agent_id: str, since: int = 0):
+    """Tool-activity tail for one agent (dashboard "Agent log" tab). Returns tool_use /
+    result / say events appended to the transcript after byte `since`, plus the new
+    offset to pass next poll. The tail parse runs in a thread — multi-MB file over NFS."""
+    found = projects.get_agent(slug, agent_id)
+    if not found:
+        raise HTTPException(404, "agent not found")
+    sessions = db.list_sessions(slug, agent_id)
+    sess = sessions[0] if sessions else None
+    csid = sess.get("claude_session_id") if sess else None
+    if not csid:
+        return {"events": [], "offset": 0, "session": None, "reset": False, "status": "no session"}
+    # The frontend passes back the session id it last polled; if the current session id
+    # differs (a /clear created a new one), its byte offset is meaningless — tail from 0.
+    res = await asyncio.to_thread(agent_log.tail, csid, since)
+    res["status"] = sess.get("last_status") if sess else None
+    res["agent_running"] = any((not r.done) and r.slug == slug and r.agent_id == agent_id
+                               for r in _RUNS.values())
+    return res
+
+
+@app.get("/api/dashboard")
+async def api_dashboard(bucket: str = "hour", hours: int = 48):
+    """Everything the dashboard page renders, in ONE call: per-agent live state across
+    every project, lifetime token totals, and a bucketed time series.
+
+    Deliberately one endpoint, not N: the page polls, and fanning out to /stats per
+    project would re-scan every transcript on every tick. The transcript scan runs in a
+    thread (it parses multi-MB JSONL over NFS — inline it would stall the event loop and
+    with it every live agent's PTY reader).
+    """
+    if bucket not in ("15m", "hour", "day", "week"):
+        bucket = "hour"
+    hours = max(1, min(int(hours or 48), 24 * 365))
+
+    totals = {(t["project_slug"], t["agent_id"]): t for t in db.token_totals_all()}
+    series = await asyncio.to_thread(db.token_series, bucket, hours)
+
+    agents: list[dict] = []
+    for project in projects.list_projects():
+        slug = project["slug"]
+        full = projects.get_project(slug)
+        if not full:
+            continue
+        overrides = db.list_agent_overrides(slug)
+        for a in full["agents"]:
+            aid = a["id"]
+            ov = overrides.get(aid) or {}
+            model_kind = ov.get("model") or a.get("model", "claude")
+            if model_kind == "grok":
+                eff_model = ov.get("grok_model") or a.get("grok_model") or "grok-build"
+            elif model_kind == "deepseek":
+                eff_model = ov.get("deepseek_model") or a.get("deepseek_model") or "deepseek-v4-flash"
+            elif model_kind == "glm":
+                eff_model = ov.get("glm_model") or a.get("glm_model") or "glm-4.6"
+            else:
+                eff_model = ov.get("claude_model") or a.get("claude_model") or "claude-sonnet-4-6"
+
+            sessions = db.list_sessions(slug, aid)
+            sess = sessions[0] if sessions else None
+            window = _context_window_for(model_kind, eff_model)
+            ctx_tokens = None
+            if sess and sess.get("claude_session_id"):
+                scanned = await asyncio.to_thread(tokens.scan, sess["claude_session_id"])
+                if scanned:
+                    ctx_tokens = scanned["occupancy"]
+            t = totals.get((slug, aid)) or {}
+            billed = ((t.get("input_tokens") or 0) + (t.get("cache_creation") or 0)
+                      + (t.get("cache_read") or 0) + (t.get("output_tokens") or 0))
+            # Fixed context cost — the task-independent bytes this agent (re)loads every
+            # session (system prompt + its pre-flight file list). Cheap (reads a few small
+            # files, cached by mtime), so it's fine on the polled dashboard endpoint.
+            adir = _agent_dir(project["root"],
+                              {"id": aid, "system_prompt_file": a.get("system_prompt_file", ""),
+                               "cwd": a.get("cwd", ".")},
+                              projects.resolve_cwd(project["root"], a.get("cwd", ".")))
+            fc = await asyncio.to_thread(fixed_cost.estimate, project["root"], adir,
+                                         a.get("system_prompt_file", ""))
+            agents.append({
+                "project": slug,
+                "project_name": project.get("name") or slug,
+                "agent": aid,
+                "role": a.get("role"),
+                "model_kind": model_kind,
+                "model": eff_model,
+                "status": db.get_last_status(slug, aid) or "idle",
+                "context_tokens": ctx_tokens,
+                "context_window": window,
+                "context_pct": round(min(100.0, (ctx_tokens or 0) / window * 100.0), 1) if window else 0.0,
+                "compact_at_pct": _auto_compact_pct(model_kind),
+                "updated_at": sess.get("updated_at") if sess else None,
+                "turns": t.get("turns") or 0,
+                "requests": t.get("requests") or 0,
+                "output_tokens": t.get("output_tokens") or 0,
+                "cache_read": t.get("cache_read") or 0,
+                "billed_total": billed,
+                "last_at": t.get("last_at"),
+                "fixed_cost": fc["tokens"],
+                "fixed_cost_sys": fc["system_prompt"],
+                "fixed_cost_preflight": fc["preflight"],
+                "fixed_cost_files": fc["files"],
+            })
+            # Daily snapshot (idempotent per day) — the fixed cost drifts as state files
+            # grow/shrink, so one row per agent per day builds the trend.
+            try:
+                db.upsert_fixed_cost(slug, aid, _today_str(), fc["tokens"],
+                                     fc["system_prompt"], fc["preflight"])
+            except Exception:
+                pass
+
+    return {
+        "agents": agents,
+        "series": series,
+        "bucket": bucket,
+        "hours": hours,
+        "counting_enabled": _token_counting_enabled(),
+        "active_runs": [{"project": r.slug, "agent": r.agent_id} for r in _RUNS.values() if not r.done],
+        "server_time": time.time(),
+        "fixed_cost_series": db.fixed_cost_series(30),
+    }
+
+
+@app.post("/api/tokens/backfill")
+async def api_tokens_backfill():
+    """REBUILD the whole token ledger from transcripts, bucketed by the REAL date of
+    each request. The transcript is the source of truth, so this wipes token_turns and
+    re-derives every row with scan_by_day — fixing the earlier backfill that stamped all
+    historical turns with the run date (collapsing the whole time chart onto one day).
+
+    One row per (session, day). Auto-book keeps running for live turns afterwards, on
+    today's date, which is correct. Safe to re-run: it always rebuilds from scratch."""
+    # Refuse while any turn is in flight: the rebuild wipes the ledger, and a turn
+    # finishing mid-rebuild would book its delta against the freshly-wiped table (full
+    # session total) right before the rebuild re-adds the same session — double count.
+    live = [f"{r.slug}/{r.agent_id}" for r in _RUNS.values() if not r.done]
+    if live:
+        raise HTTPException(409, f"backfill refused — runs in flight: {', '.join(live)}")
+    db.delete_all_token_turns()
+    rows_written = 0
+    per_agent = {}
+    for project in projects.list_projects():
+        slug = project["slug"]
+        full = projects.get_project(slug)
+        if not full:
+            continue
+        for a in full["agents"]:
+            aid = a["id"]
+            seen_csid = set()
+            for sess in db.list_sessions(slug, aid):
+                csid = sess.get("claude_session_id")
+                if not csid or csid in seen_csid:
+                    continue
+                seen_csid.add(csid)
+                try:
+                    for day in await asyncio.to_thread(tokens.scan_by_day, csid):
+                        db.add_token_turn(
+                            project_slug=slug, agent_id=aid, claude_session_id=csid,
+                            requests=day["requests"], input_tokens=day["input_tokens"],
+                            cache_creation=day["cache_creation"], cache_read=day["cache_read"],
+                            output_tokens=day["output_tokens"], occupancy=day["occupancy"],
+                            model=day["model"], created_at=day["epoch"])
+                        rows_written += 1
+                        per_agent[f"{slug}/{aid}"] = per_agent.get(f"{slug}/{aid}", 0) + day["output_tokens"]
+                except Exception:
+                    continue
+    return {"rows_written": rows_written, "agents": len(per_agent)}
+
+
+@app.get("/api/tokens/enabled")
+def api_tokens_enabled():
+    return {"enabled": _token_counting_enabled()}
+
+
+@app.post("/api/tokens/enabled")
+def api_set_tokens_enabled(body: dict):
+    db.set_setting("token_count_enabled", "1" if body.get("enabled") else "0")
+    return {"enabled": _token_counting_enabled()}
+
+
 def _skip_overdue_on_resume() -> None:
     """Called on the disabled→enabled transition. Anything that came due while
     the scheduler was off must NOT be replayed: push overdue interval/until
@@ -2796,6 +3205,91 @@ async def _scheduler_loop() -> None:
             print(f"[scheduler] tick error: {e}")
 
 
+# How many recent days the hot progress.json keeps; older days rotate to the archive.
+_PROGRESS_KEEP_DAYS = 2
+
+
+def _progress_rotate_enabled() -> bool:
+    """Global toggle (same pattern as scheduler/token). OFF by default — rotating an
+    agent's own state file is intrusive, so it stays opt-in until trusted."""
+    return db.get_setting("progress_rotate_enabled", "0") == "1"
+
+
+async def _progress_rotate_tick() -> None:
+    """Move stale days out of every agent's progress.json into its archive. Skips agents
+    that are mid-turn (an active run may be about to Edit the file) and torn/never-run
+    sessions — the same safety envelope as auto-compact. File I/O runs in a thread; the
+    rotator must never block the event loop that also drives every PTY reader."""
+    if not _progress_rotate_enabled():
+        return
+    for project in projects.list_projects():
+        slug = project["slug"]
+        full = projects.get_project(slug)
+        if not full:
+            continue
+        for a in full["agents"]:
+            aid = a["id"]
+            # An active run for this agent → leave the file alone this tick.
+            if any((not r.done) and r.slug == slug and r.agent_id == aid for r in _RUNS.values()):
+                continue
+            found = projects.get_agent(slug, aid)
+            if not found:
+                continue
+            _proj, agent = found
+            cwd_abs = projects.resolve_cwd(project["root"], agent.get("cwd", "."))
+            adir = _agent_dir(project["root"], agent, cwd_abs)
+            try:
+                if await asyncio.to_thread(progress_store.needs_rotation, adir, _PROGRESS_KEEP_DAYS):
+                    res = await asyncio.to_thread(progress_store.rotate, adir, aid, _PROGRESS_KEEP_DAYS)
+                    if res:
+                        print(f"[progress-rotate] {slug}/{aid}: archived {res['archived_days']}")
+                # findings.md gets the same treatment (user ruling 2026-07-18: past-error
+                # log, not load-bearing — keep newest days, archive the rest).
+                fres = await asyncio.to_thread(progress_store.rotate_findings, adir, aid, _PROGRESS_KEEP_DAYS)
+                if fres:
+                    print(f"[progress-rotate] {slug}/{aid} findings: archived {fres['archived_days']}")
+            except Exception as e:
+                print(f"[progress-rotate] {slug}/{aid} error: {e}")
+
+
+async def _progress_rotate_loop() -> None:
+    # Hourly is plenty: days cross the boundary once a day, and the rotate is idempotent.
+    while True:
+        await asyncio.sleep(3600)
+        try:
+            await _progress_rotate_tick()
+        except Exception as e:
+            print(f"[progress-rotate] tick error: {e}")
+
+
+@app.get("/api/progress/rotate/enabled")
+def api_progress_rotate_enabled():
+    return {"enabled": _progress_rotate_enabled(), "keep_days": _PROGRESS_KEEP_DAYS}
+
+
+@app.post("/api/progress/rotate/enabled")
+async def api_set_progress_rotate_enabled(body: dict):
+    db.set_setting("progress_rotate_enabled", "1" if body.get("enabled") else "0")
+    # Run one pass immediately so the effect is visible without waiting for the hourly tick.
+    if _progress_rotate_enabled():
+        await _progress_rotate_tick()
+    return {"enabled": _progress_rotate_enabled()}
+
+
+@app.post("/api/projects/{slug}/agents/{agent_id}/progress/migrate")
+def api_progress_migrate(slug: str, agent_id: str):
+    """Build progress.json from the legacy progress.md for one agent (idempotent; the
+    .md stays as a backup). Returns days migrated, or 0 if already migrated / no md."""
+    found = projects.get_agent(slug, agent_id)
+    if not found:
+        raise HTTPException(404, "agent not found")
+    project, agent = found
+    cwd_abs = projects.resolve_cwd(project["root"], agent.get("cwd", "."))
+    adir = _agent_dir(project["root"], agent, cwd_abs)
+    n = progress_store.migrate_md_to_json(adir)
+    return {"migrated_days": n or 0}
+
+
 _COMPACT_PROMPT = (
     "[CONTROL-PLANE COMPACT — not a normal task] Summarise all of this session's work & conversation "
     "into one concise RECAP so that YOU YOURSELF can continue in a new session with less "
@@ -2832,6 +3326,8 @@ async def api_compact(slug: str, agent_id: str):
                 await queue.put({"type": "error", "agent": agent_id,
                                  "message": "compact: recap empty — no new session created"})
             else:
+                # Rotation point — same last-chance booking as the auto-compact path.
+                await asyncio.to_thread(_book_current_session_tokens, slug, agent_id)
                 new_sess = db.new_session(slug, agent_id)
                 db.set_session_seed(new_sess["id"], summary)
                 db.add_message(
@@ -3132,6 +3628,11 @@ async def _start_terminal_reaper():
 
 
 @app.on_event("startup")
+async def _start_progress_rotator():
+    asyncio.create_task(_progress_rotate_loop())
+
+
+@app.on_event("startup")
 async def _start_scheduler():
     asyncio.create_task(_scheduler_loop())
     # Telegram control channel (BOSS by default). No-op when no bot token is
@@ -3160,3 +3661,10 @@ class _NoCacheStaticFiles(StaticFiles):
 
 if FRONTEND_DIR.exists():
     app.mount("/", _NoCacheStaticFiles(directory=str(FRONTEND_DIR), html=True), name="frontend")
+
+
+# Crash leg of the rotation-loss fix: book the transcript tail of every session the
+# previous process left mid-turn (snapshot taken at the top of this module, before the
+# reaper flipped them to 'cancelled'). Runs here — after _book_session_tokens exists.
+for _rs in _orphan_sessions:
+    _book_session_tokens(_rs["project_slug"], _rs["agent_id"], _rs["claude_session_id"])

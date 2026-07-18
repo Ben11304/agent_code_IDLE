@@ -8,6 +8,7 @@ const state = {
   skills: [],             // installed Agent Skills (name + description)
   expandedSkills: new Set(),
   statsCache: {},         // slug -> { agentId -> stats }
+  initInfo: {},           // slug -> { agentId -> {model, cwd, claude_session_id, tools[]} } from system/init meta
   expandedNodes: new Set(), // "slug:agentId" set of expanded graph panels
   activeDispatches: new Set(),
   viewBoxes: {},          // slug -> {x,y,w,h}
@@ -400,11 +401,42 @@ async function loadUsage() {
   try { data = await (await fetch("/api/usage")).json(); }
   catch { data = { available: false }; }
   el.hidden = false;
-  if (!data || !data.available) {
-    el.innerHTML = `<div class="usage-na" title="${escapeHtml((data && data.reason) || "unavailable")}">usage n/a</div>`;
-    return;
-  }
-  el.innerHTML = usageRow("5 hrs", data.five_hour) + usageRow("weekly", data.weekly);
+  const body = (!data || !data.available)
+    ? `<div class="usage-na" title="${escapeHtml((data && data.reason) || "unavailable")}">usage n/a</div>`
+    : usageRow("5 hrs", data.five_hour) + usageRow("weekly", data.weekly);
+  el.innerHTML = body + await tokenToggleHtml();
+  wireTokenToggle(el);
+}
+
+// Global switch for exact token accounting. When on, every turn that completes gets its
+// CLI transcript scanned and the real per-request usage booked into token_turns.
+async function tokenToggleHtml() {
+  let on = false;
+  try { on = !!(await (await fetch("/api/tokens/enabled")).json()).enabled; } catch {}
+  return `<label class="usage-row tok-toggle" title="Count exact input/output tokens from the CLI transcript (free, no API key). Applies from the next turn on.">
+    <span class="u-label">count tokens</span>
+    <span class="tok-switch${on ? " on" : ""}"><span class="tok-knob"></span></span>
+    <input type="checkbox" id="tokToggle" ${on ? "checked" : ""} hidden>
+  </label>`;
+}
+
+function wireTokenToggle(el) {
+  const box = el.querySelector("#tokToggle");
+  const lbl = el.querySelector(".tok-toggle");
+  if (!box || !lbl) return;
+  lbl.onclick = async (e) => {
+    e.preventDefault();
+    const next = !box.checked;
+    try {
+      await fetch("/api/tokens/enabled", {
+        method: "POST", headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ enabled: next }),
+      });
+      showToast(next ? "🧮 token counting ON — applies from the next turn"
+                     : "🧮 token counting OFF", "sched");
+    } catch {}
+    loadUsage();
+  };
 }
 
 function usageRow(label, p) {
@@ -935,7 +967,17 @@ function renderWindowContent(w) {
       </div>`;
     renderChatHeader(w);
     bindChatWindow(w);
+    // Restore messages queued before the last reload BEFORE rendering history, so
+    // refreshChatSession's renderQueue paints them. Then hand them off: if a run is
+    // already in flight, its finally→drainQueue fires them; if the agent is idle,
+    // nothing else ever would, so kick the drain here. The delay lets
+    // reattachActiveRuns claim an in-flight run first — and if it wins the race, the
+    // POST simply 409s and the message goes back on the queue.
+    loadQueue(w);
     refreshChatSession(w);
+    if (w.queue && w.queue.length) {
+      setTimeout(() => { if (!w.streaming) drainQueue(w); }, 2000);
+    }
   }
 }
 
@@ -1105,7 +1147,7 @@ function updateEdgesLive(w) {
 }
 
 // Expanded-panel geometry (viewBox units, matches collapsed node width baseline).
-const PANEL_W = 212, PANEL_H = 284; // headroom for warn rows
+const PANEL_W = 212, PANEL_H = 430; // headroom for warn rows + init (cwd/tools/skills/servers)
 
 function buildAgentNode(proj, a, pos, nodeW, nodeH, gw) {
   const ns = "http://www.w3.org/2000/svg";
@@ -1173,12 +1215,17 @@ function nodeCardHtml(a, status, expanded, stats, slug) {
       <span class="ac-expand" title="${expanded ? "collapse" : "expand"}">${chev}</span>
     </div>
     <div class="ac-model">${escapeHtml(modelLabel(a))}</div>`;
-  if (expanded) html += `<div class="ac-body">${nodeBodyHtml(a, stats)}</div>`;
+  if (expanded) html += `<div class="ac-body">${nodeBodyHtml(a, stats, slug)}</div>`;
   return html;
 }
 
-function nodeBodyHtml(a, stats) {
-  if (!stats) return `<div class="ac-loading">loading stats…</div>`;
+function nodeBodyHtml(a, stats, slug) {
+  // Live stream copy first (fresh within the turn), else the persisted init_meta
+  // that /stats carries — that fallback is what makes the tools list show on an
+  // idle agent and after a browser reload, when state.initInfo is empty.
+  const init = (slug && (state.initInfo[slug] || {})[a.id]) || (stats && stats.init);
+  const initHtml = initSectionHtml(init);
+  if (!stats) return (initHtml || `<div class="ac-loading">loading stats…</div>`);
   const pct = stats.context_pct || 0;
   const barCls = pct > 80 ? "hot" : (pct > 50 ? "warm" : "");
   const mem = stats.memory;
@@ -1191,9 +1238,23 @@ function nodeBodyHtml(a, stats) {
   const sessTxt = stats.has_session
     ? `live${stats.num_sessions > 1 ? " · " + stats.num_sessions : ""}`
     : "fresh";
-  const exact = stats.token_source === "exact";
+  const exact = stats.token_source === "exact" || stats.token_source === "transcript";
   const tokK = exact ? "tokens" : "≈ tokens";
-  const ctxTitle = exact ? "actual token count from CLI (latest turn)" : "chars/4 estimate — no completed turn yet";
+  const ctxTitle = stats.token_source === "transcript"
+    ? "exact occupancy — largest single API request in the CLI transcript"
+    : (exact ? "actual token count from CLI (latest turn)" : "chars/4 estimate — no completed turn yet");
+  // Billing totals (lifetime, from token_turns). Distinct from context occupancy above:
+  // cache_read is re-charged on every request, so this climbs far past the window.
+  const tk = stats.tokens;
+  const billed = tk
+    ? `<div class="ac-row" title="lifetime billing across ${tk.turns} turns / ${tk.requests} API requests — cache_read is re-charged per request, so this is NOT context size">
+         <span class="ac-k">billed</span>
+         <span class="ac-v">${fmtTokens((tk.input_tokens || 0) + (tk.cache_creation || 0) + (tk.cache_read || 0) + (tk.output_tokens || 0))}</span>
+       </div>
+       <div class="ac-row" title="output tokens generated (the part that is not cache)">
+         <span class="ac-k">out</span><span class="ac-v">${fmtTokens(tk.output_tokens)}</span>
+       </div>`
+    : "";
   return `
     <div class="ac-row ac-ctx" title="${ctxTitle}">
       <span class="ac-k">context${exact ? "" : " ≈"}</span>
@@ -1201,6 +1262,7 @@ function nodeBodyHtml(a, stats) {
       <span class="ac-v">${pct}%</span>
     </div>
     <div class="ac-row"><span class="ac-k">${tokK}</span><span class="ac-v">${fmtTokens(stats.context_tokens)} / ${fmtTokens(stats.context_window)}</span></div>
+    ${billed}
     ${pct >= 80 ? `<div class="ac-warn" title="auto-compact threshold: 80%">🔄 auto-compact will run next turn</div>` : ""}
     <div class="ac-row"><span class="ac-k">memory</span><span class="ac-v${memStale ? " ac-stale" : ""}">${memTime}${memStale ? " ⚠" : ""}</span></div>
     ${memStale ? `<div class="ac-warn">⚠ recent activity but memory not written</div>` : ""}
@@ -1208,7 +1270,8 @@ function nodeBodyHtml(a, stats) {
     <div class="ac-row"><span class="ac-k">activity</span><span class="ac-v">${lastAct}</span></div>
     <div class="ac-row"><span class="ac-k">messages</span><span class="ac-v">${stats.message_count}</span></div>
     <div class="ac-row"><span class="ac-k">effort</span><span class="ac-v">${effort}</span></div>
-    <div class="ac-row"><span class="ac-k">session</span><span class="ac-v">${sessTxt}</span></div>
+    <div class="ac-row" title="${init && init.claude_session_id ? "claude session " + escapeHtml(init.claude_session_id) : ""}"><span class="ac-k">session</span><span class="ac-v">${sessTxt}</span></div>
+    ${initHtml}
     <div class="ac-actions"><button class="ac-open">open chat ↗</button></div>`;
 }
 
@@ -1221,6 +1284,77 @@ function toggleNode(slug, id) {
     if (!state.statsCache[slug]) ensureStats(slug);
   }
   rerenderGraphsForSlug(slug);
+}
+
+// ---------- Init payload: default-vs-added split ----------
+// Every stock `claude` CLI session ships the same builtin tools and skills; listing
+// them on every card is noise. Show only what was ADDED for this agent (MCP tools,
+// user/plugin skills, plugins, MCP servers) and collapse the stock set to a count.
+// These lists are a manually maintained baseline of CLI builtins — when a CLI update
+// ships a new builtin it will show up as "added" until appended here (visible and
+// harmless), which beats the reverse failure of hiding a real addition.
+const DEFAULT_TOOLS = new Set([
+  "Agent", "AskUserQuestion", "Bash", "BashOutput", "CronCreate", "CronDelete",
+  "CronList", "DesignSync", "Edit", "EnterPlanMode", "EnterWorktree", "ExitPlanMode",
+  "ExitWorktree", "Glob", "Grep", "KillShell", "ListMcpResourcesTool", "Monitor",
+  "NotebookEdit", "PushNotification", "Read", "ReadMcpResourceDirTool",
+  "ReadMcpResourceTool", "RemoteTrigger", "ReportFindings", "ScheduleWakeup",
+  "SendMessage", "Skill", "SlashCommand", "Task", "TaskCreate", "TaskGet", "TaskList",
+  "TaskOutput", "TaskStop", "TaskUpdate", "TodoWrite", "ToolSearch", "WebFetch",
+  "WebSearch", "Workflow", "Write",
+]);
+const DEFAULT_SKILLS = new Set([
+  "artifact-design", "artifact-capabilities", "batch", "claude-api", "code-review",
+  "dataviz", "debug", "deep-research", "design-sync", "doctor",
+  "fewer-permission-prompts", "init", "keybindings-help", "loop", "review", "run",
+  "run-skill-generator", "schedule", "security-review", "simplify", "update-config",
+  "verify",
+]);
+
+function splitInitLists(init) {
+  const tools = Array.isArray(init.tools) ? init.tools : [];
+  const skills = Array.isArray(init.skills) ? init.skills : [];
+  return {
+    mcpTools: tools.filter((t) => String(t).startsWith("mcp__")),
+    addedTools: tools.filter((t) => !String(t).startsWith("mcp__") && !DEFAULT_TOOLS.has(t)),
+    defaultToolCount: tools.filter((t) => DEFAULT_TOOLS.has(t)).length,
+    addedSkills: skills.filter((s) => !DEFAULT_SKILLS.has(s)),
+    defaultSkillCount: skills.filter((s) => DEFAULT_SKILLS.has(s)).length,
+  };
+}
+
+// Init section for the expanded node panel — shows cwd + what was ADDED for this
+// agent (MCP/extra tools, non-default skills, servers); stock builtins collapse
+// to a count. Captured from the system/init meta of the agent's last turn.
+function initSectionHtml(init) {
+  if (!init) return "";
+  const sp = splitInitLists(init);
+  const CAP = 10;
+  const chipList = (list, cap = CAP) => {
+    const shown = list.slice(0, cap);
+    const extra = list.length - shown.length;
+    const chips = shown
+      .map((t) => `<span class="ac-tool" title="${escapeHtml(t)}">${escapeHtml(t)}</span>`)
+      .join("");
+    return `<div class="ac-tool-list">${chips}${extra > 0 ? `<span class="ac-tool-more" title="${escapeHtml(list.join(", "))}">+${extra}</span>` : ""}</div>`;
+  };
+  const cwd = init.cwd
+    ? `<div class="ac-row"><span class="ac-k">cwd</span><span class="ac-v mono" title="${escapeHtml(init.cwd)}">${escapeHtml(init.cwd)}</span></div>`
+    : "";
+  const servers = (Array.isArray(init.mcp_servers) ? init.mcp_servers : [])
+    .map((s) => s && s.name).filter(Boolean);
+  const row = (label, list) =>
+    list.length
+      ? `<div class="ac-init-tools"><span class="ac-k">${label} · ${list.length}</span>${chipList(list)}</div>`
+      : "";
+  const defaults = (sp.defaultToolCount || sp.defaultSkillCount)
+    ? `<div class="ac-row" title="stock CLI builtins — identical for every agent, hidden from the chip list"><span class="ac-k">defaults</span><span class="ac-v">${sp.defaultToolCount} tools · ${sp.defaultSkillCount} skills</span></div>`
+    : "";
+  const toolsRow =
+    row("+tools", sp.addedTools) + row("mcp", sp.mcpTools) +
+    row("+skills", sp.addedSkills) + row("servers", servers) + defaults;
+  const sep = cwd || toolsRow ? `<div class="ac-sep">init</div>` : "";
+  return sep + cwd + toolsRow;
 }
 
 // ---------- Node drag (rearrange agents on canvas, persisted in db) ----------
@@ -1580,6 +1714,7 @@ const CLAUDE_MODELS = [
   { value: "claude-fable-5",      label: "fable 5"    },
   { value: "claude-opus-4-8",     label: "opus 4.8"   },
   { value: "claude-opus-4-7",     label: "opus 4.7"   },
+  { value: "claude-sonnet-5",     label: "sonnet 5"   },
   { value: "claude-sonnet-4-6",   label: "sonnet 4.6" },
   { value: "claude-haiku-4-5",    label: "haiku 4.5"  },
 ];
@@ -1683,7 +1818,13 @@ async function updateAgentSettings(w, claudeModel, grokModel, deepseekModel, glm
   }
 }
 
-async function refreshChatSession(w) {
+// beforeTs: when re-attaching to a run, render ONLY the history that predates it.
+// A multi-round turn persists each round's assistant message as that round ends, while
+// the _Run stays active until every continuation finishes — so a re-attach that renders
+// all of db AND replays the run from seq 0 draws those rounds twice (once as "assistant"
+// from db, once as "assistant • BOSS" from the replay). The replay owns everything from
+// the run's start onward; db owns what came before.
+async function refreshChatSession(w, beforeTs) {
   // Never wipe the messages area mid-stream: live bubbles hold DOM references
   // that a rebuild would orphan. (attachDetachedRun refreshes BEFORE it sets
   // w.streaming, so its history render still goes through.)
@@ -1694,13 +1835,27 @@ async function refreshChatSession(w) {
     w.session = j.session;
     const msgRoot = w.el.querySelector(".messages");
     msgRoot.innerHTML = "";
+    // Replay the init card at the top of the transcript from the persisted payload,
+    // so it is there on open / reload instead of only during a live turn. The seen-set
+    // is cleared first because the innerHTML wipe just removed every card this window
+    // had drawn; renderInitWidget re-adds this agent's key as it redraws.
+    w.seenInits = new Set();
+    if (j.session && j.session.init_meta) {
+      try { renderInitWidget(w, w.agentId, JSON.parse(j.session.init_meta)); } catch {}
+    }
     (j.messages || []).forEach((m) => {
+      // Everything from the re-attached run's start onward belongs to the replay.
+      if (beforeTs && (m.created_at || 0) >= beforeTs) return;
       if (m.role === "user" && /^\[CONTROL-PLANE /.test(m.content || "")) {
         addCtrlSeparator(w, m.content);
         return;
       }
       addBubble(w, m.role, m.content);
     });
+    // The wipe above also removed any pending-queue bubbles. They are a projection
+    // of w.queue, so repaint them — otherwise queued messages go invisible and then
+    // fire later out of nowhere.
+    renderQueue(w);
   } catch {}
 }
 
@@ -1711,6 +1866,10 @@ function addBubble(w, role, text, container) {
   b.innerHTML = `<div class="role">${role}</div><div class="content"></div>`;
   setContent(b.querySelector(".content"), text);
   root.appendChild(b);
+  // Anything appended to the transcript must not jump ABOVE the pending queue —
+  // a still-running turn kept burying queued questions mid-transcript. Skipped
+  // while rendering the queue itself (its own bubbles are the ones being placed).
+  if (!b.classList.contains("queued") && !w._renderingQueue) parkQueueAtBottom(w);
   const m = w.el.querySelector(".messages");
   if (m) m.scrollTop = m.scrollHeight;
   return b;
@@ -1951,8 +2110,9 @@ async function stopChat(w) {
   // running. (Clearing the queue first means the finally→drainQueue sees an
   // empty queue and does not auto-fire the next message.)
   if (w.queue && w.queue.length) {
-    w.queue.forEach((q) => { if (q.el && q.el.parentNode) q.el.parentNode.removeChild(q.el); });
     w.queue = [];
+    saveQueue(w);     // Stop is an explicit discard — clear the persisted copy too
+    renderQueue(w);   // queue is the source of truth — empty it, then repaint (removes bubbles)
   }
   setChatStatus(w, "stopping…");
   let stopped = false;
@@ -1970,20 +2130,81 @@ async function stopChat(w) {
 
 // ---------- Chat queue (send while streaming) ----------
 
+// ---------- Queue persistence ----------
+// A queued message exists ONLY here until its turn fires — it has never reached the
+// server, so nothing else in the system has a copy. Keeping it in RAM alone meant a
+// reload (or a crash, or closing the tab) destroyed unsent user messages with no trace:
+// the "tin nhắn bị mất" report. localStorage makes the queue survive the page.
+function queueKey(w) { return `queue:${w.projectSlug}:${w.agentId}`; }
+
+function saveQueue(w) {
+  try {
+    const items = (w.queue || []).map((q) => q.text);
+    if (items.length) localStorage.setItem(queueKey(w), JSON.stringify(items));
+    else localStorage.removeItem(queueKey(w));
+  } catch {}   // quota / private mode — never let persistence break sending
+}
+
+function loadQueue(w) {
+  try {
+    const raw = localStorage.getItem(queueKey(w));
+    if (!raw) return;
+    const items = JSON.parse(raw);
+    if (Array.isArray(items) && items.length) {
+      w.queue = items.filter((t) => typeof t === "string" && t).map((text) => ({ text }));
+      renderQueue(w);
+      updateQueueStatus(w);
+    }
+  } catch {}
+}
+
 function enqueueMessage(w, text) {
   if (!w.queue) w.queue = [];
-  const el = addBubble(w, "user", text);
-  el.classList.add("queued");
-  w.queue.push({ text, el });
-  renumberQueue(w);
+  w.queue.push({ text });
+  saveQueue(w);
+  renderQueue(w);
   updateQueueStatus(w);
 }
 
-function renumberQueue(w) {
-  (w.queue || []).forEach((q, i) => {
-    const role = q.el && q.el.querySelector(".role");
-    if (role) role.innerHTML = `user <span class="queue-tag">⏳ queue #${i + 1}</span>`;
-  });
+// The queue is the source of truth; its bubbles are a pure projection of w.queue,
+// rebuilt (never mutated in place) and always parked at the BOTTOM of .messages.
+//
+// Two bugs this fixes, both from treating a DOM node as the queue's storage:
+//  1. Messages VANISHED. Each item used to hold its own .el, but refreshChatSession
+//     wipes .messages wholesale. Its `if (w.streaming) return` guard does not cover
+//     the queue: between drainQueue firing item #1 and sendMessageInWindow setting
+//     streaming=true, any refresh (mirrorDispatchedMessages, openChat) erased the
+//     bubbles of items #2+ while w.queue still held them — so they later fired out
+//     of nowhere, having been invisible in the meantime.
+//  2. Messages DRIFTED UPWARD. enqueueMessage appended at the moment of typing, then
+//     the still-running turn kept appending deltas/worker cards BELOW it, leaving the
+//     pending question stranded mid-transcript looking already answered.
+function renderQueue(w) {
+  const root = w.el && w.el.querySelector(".messages");
+  if (!root) return;
+  root.querySelectorAll(".bubble.queued").forEach((el) => el.remove());
+  // Flag: addBubble parks the queue at the bottom on every append, but these ARE the
+  // queue bubbles being placed — reentering that from here would fight this loop.
+  w._renderingQueue = true;
+  try {
+    (w.queue || []).forEach((q, i) => {
+      const el = addBubble(w, "user", q.text);
+      el.classList.add("queued");
+      const role = el.querySelector(".role");
+      if (role) role.innerHTML = `user <span class="queue-tag">⏳ queue #${i + 1}</span>`;
+    });
+  } finally {
+    w._renderingQueue = false;
+  }
+}
+
+// Keep pending bubbles last after anything else appends to the transcript.
+function parkQueueAtBottom(w) {
+  if (!w.queue || !w.queue.length) return;
+  const root = w.el && w.el.querySelector(".messages");
+  if (!root) return;
+  root.querySelectorAll(".bubble.queued").forEach((el) => root.appendChild(el));
+  root.scrollTop = root.scrollHeight;
 }
 
 function updateQueueStatus(w) {
@@ -1995,14 +2216,45 @@ function updateQueueStatus(w) {
   }
 }
 
+// PEEK, never shift here. The item stays queued (and persisted) until the server has
+// actually accepted it — see dequeueSent(). Shifting first meant a failed POST (network
+// drop, backend error) silently destroyed the message: it was already out of the queue,
+// had never reached the server, and no copy existed anywhere.
+//
+// Keep-until-accepted has a flip side: on a PERSISTENT failure the head item never
+// leaves, and since sendMessageInWindow's finally re-drains unconditionally, a plain
+// retry here would hammer the server in a tight loop (send→fail→finally→send…).
+// _drainBackoff breaks that: a failed attempt (set in the failure paths) delays the
+// next drain and schedules exactly one deferred retry.
+const _QUEUE_RETRY_MS = 15000;
 function drainQueue(w) {
   if (!w.queue || !w.queue.length) return;
-  const item = w.queue.shift();
-  if (item.el && item.el.parentNode) item.el.parentNode.removeChild(item.el);
-  renumberQueue(w);
+  const now = Date.now();
+  if (w._drainBackoff && now < w._drainBackoff) {
+    if (!w._drainTimer) {
+      w._drainTimer = setTimeout(() => {
+        w._drainTimer = null;
+        if (!w.streaming) drainQueue(w);
+      }, w._drainBackoff - now + 200);
+    }
+    return;
+  }
+  const item = w.queue[0];
   // Fire the next turn. Its own finally calls drainQueue again, chaining until
   // the queue is empty. Not awaited — let it run as the next streaming turn.
-  sendMessageInWindow(w, item.text);
+  sendMessageInWindow(w, item.text, { fromQueue: true });
+}
+
+// Called only once the server has taken the message (2xx on POST /chat). Until then a
+// reload replays it from localStorage instead of losing it.
+function dequeueSent(w, text) {
+  if (!w.queue || !w.queue.length) return;
+  const i = w.queue.findIndex((q) => q.text === text);
+  if (i === -1) return;
+  w.queue.splice(i, 1);
+  saveQueue(w);
+  renderQueue(w);
+  updateQueueStatus(w);
 }
 
 // ---------- Slash commands ----------
@@ -2221,7 +2473,8 @@ const _CLAUDE_MODEL_ALIAS = {
   "opus-4-8": "claude-opus-4-8",
   "opus-4-7": "claude-opus-4-7",
   "opus": "claude-opus-4-8",
-  "sonnet": "claude-sonnet-4-6",
+  "sonnet": "claude-sonnet-5",
+  "sonnet-5": "claude-sonnet-5",
   "sonnet-4-6": "claude-sonnet-4-6",
   "haiku": "claude-haiku-4-5",
   "haiku-4-5": "claude-haiku-4-5",
@@ -2265,7 +2518,7 @@ async function cmdAdapter(w, arg) {
     if (t.startsWith("glm-")) return "glm";
     if (t.startsWith("deepseek-")) return "deepseek";
     if (t.startsWith("grok-")) return "grok";
-    if (t.startsWith("claude-") || ["fable-5","opus-4-8","opus-4-7","sonnet","haiku"].includes(t)) return "claude";
+    if (t.startsWith("claude-") || ["fable-5","opus-4-8","opus-4-7","sonnet","sonnet-5","haiku"].includes(t)) return "claude";
     return null;
   };
 
@@ -3277,11 +3530,18 @@ async function reattachAfterDrop(w, slug, rootAgent, bubbleFor) {
   }
 }
 
-async function sendMessageInWindow(w, text) {
+// opts.fromQueue: this text is currently sitting at the head of w.queue. It is removed
+// only after the server accepts it (dequeueSent), so any failure leaves it queued and a
+// reload retries it rather than dropping it.
+async function sendMessageInWindow(w, text, opts = {}) {
   const slug = w.projectSlug;
   const rootAgent = w.agentId;
   const proj = state.projectCache[slug];
-  addBubble(w, "user", text);
+  // Always draw the user bubble — including for a queued send. The queued item's own
+  // "⏳ queue #n" bubble is removed by dequeueSent→renderQueue the moment the server
+  // accepts, so skipping this left the message with NO bubble at all: the agent
+  // answered a question that had visibly vanished ("UI nuốt tin nhắn").
+  const userBubble = addBubble(w, "user", text);
   const bubbleFor = makeBubbleFactory(w, rootAgent);
   w.streaming = true;
   w.sawComplete = false;
@@ -3310,10 +3570,15 @@ async function sendMessageInWindow(w, text) {
       signal: w.abortController.signal,
     });
     if (resp.status === 409) {
-      // A detached run is already in flight for this agent (e.g. started
-      // before a page reload). Queue this message and attach to the live run.
+      // A detached run is already in flight for this agent (e.g. started before a page
+      // reload). The message was NOT accepted — put it back on the queue and attach to
+      // the live run; the finally below drains it once that run ends.
+      // Drop the bubble drawn on entry first: enqueueMessage paints its own "⏳ queue #n"
+      // bubble, so leaving this one would show the same message twice.
+      if (userBubble && userBubble.parentNode) userBubble.parentNode.removeChild(userBubble);
       addSystemBubble(w, "⏳ A turn is already running for this agent — message queued; re-attaching to the live stream…");
-      enqueueMessage(w, text);
+      // Already at the head of the queue when it came from there — re-adding would duplicate.
+      if (!opts.fromQueue) enqueueMessage(w, text);
       await attachRunStream(w, slug, rootAgent, bubbleFor, 0);
       return;
     }
@@ -3323,8 +3588,18 @@ async function sendMessageInWindow(w, text) {
       setContent(b.contentEl, `(backend error ${resp.status}) ${t}`);
       proj.statuses[rootAgent] = "error";
       rerenderGraphsForSlug(slug);
+      // Rejected, not accepted: keep it queued (and persisted) so it is not lost. A
+      // reload retries it; Stop discards it. Back off before the next drain attempt —
+      // without this, finally→drainQueue would retry the same failing POST in a tight
+      // loop for as long as the backend keeps erroring.
+      if (!opts.fromQueue) enqueueMessage(w, text);
+      w._drainBackoff = Date.now() + _QUEUE_RETRY_MS;
+      if (userBubble && userBubble.parentNode) userBubble.parentNode.removeChild(userBubble);
       return;
     }
+    // 2xx: the server owns the message now — safe to drop our copy (and any backoff).
+    w._drainBackoff = 0;
+    if (opts.fromQueue) dequeueSent(w, text);
     await pumpSse(w, slug, rootAgent, resp, bubbleFor);
     if (!w.sawComplete) await reattachAfterDrop(w, slug, rootAgent, bubbleFor);
     setChatStatus(w, w.sawComplete ? "done" : "stream detached — turn continues on the server");
@@ -3333,8 +3608,20 @@ async function sendMessageInWindow(w, text) {
       setChatStatus(w, "stopped");
     } else {
       if (!w.sawComplete) await reattachAfterDrop(w, slug, rootAgent, bubbleFor);
-      if (!w.sawComplete) setChatStatus(w, "network error: " + err.message);
-      else setChatStatus(w, "done");
+      if (!w.sawComplete) {
+        setChatStatus(w, "network error: " + err.message);
+        // The turn never started (no run id ⇒ the POST never reached the server), so
+        // this message is nowhere: not on the server, not in the queue. Persist it or
+        // it dies with the tab. Guarded on runId to avoid re-sending work the server
+        // did accept and is still running.
+        if (!w.runId) {
+          if (!opts.fromQueue) enqueueMessage(w, text);
+          // Either way the text now lives (only) in the queue — drop the plain user
+          // bubble so it doesn't sit next to the queued copy as a duplicate.
+          if (userBubble && userBubble.parentNode) userBubble.parentNode.removeChild(userBubble);
+          w._drainBackoff = Date.now() + _QUEUE_RETRY_MS;
+        }
+      } else setChatStatus(w, "done");
     }
   } finally {
     w.streaming = false;
@@ -3366,14 +3653,15 @@ async function reattachActiveRuns(slug) {
   for (const run of runs) {
     const w = openChat(slug, run.agent_id);
     if (w.streaming) continue; // this tab already follows it
-    attachDetachedRun(w, slug, run.agent_id);
+    attachDetachedRun(w, slug, run.agent_id, run.started_at);
   }
 }
 
-async function attachDetachedRun(w, slug, rootAgent) {
+async function attachDetachedRun(w, slug, rootAgent, startedAt) {
   const proj = state.projectCache[slug];
-  // Render db history first so replayed live bubbles append after it.
-  try { await refreshChatSession(w); } catch {}
+  // Render db history first so replayed live bubbles append after it — but only the
+  // part that predates this run, since the replay below redraws the run itself.
+  try { await refreshChatSession(w, startedAt); } catch {}
   const bubbleFor = makeBubbleFactory(w, rootAgent);
   w.streaming = true;
   w.sawComplete = false;
@@ -3613,7 +3901,88 @@ function handleEventInWindow(w, slug, evt, bubbleFor, rootAgent) {
       refreshSchedulesActiveTab();
       break;
     }
+    case "meta": {
+      // Agent initialization (claude stream-json `system/init`): show a compact
+      // card with session_id, model, cwd, and loaded tools — once per session.
+      const d = evt.data || {};
+      if (d.init) {
+        // Only the window's OWN agent gets an init card. A dispatched worker's init
+        // also arrives here (worker events flow through the parent chat), and drawing
+        // it would wedge RESEARCHER's/CRAFTER's init panel into the middle of BOSS's
+        // answer. The worker's card belongs in the worker's own chat window.
+        if (agent === w.agentId) renderInitWidget(w, agent, d);
+        // Stash for the graph node expand-panel + live-refresh if open.
+        if (!state.initInfo[slug]) state.initInfo[slug] = {};
+        state.initInfo[slug][agent] = d;
+        if (state.expandedNodes.has(`${slug}:${agent}`)) rerenderGraphsForSlug(slug);
+      }
+      break;
+    }
   }
+}
+
+// Render the agent-initialization card (ported from opcode's SystemInitializedWidget,
+// translated to vanilla JS). Shown once per claude session, not on every --resume turn.
+function renderInitWidget(w, agent, data) {
+  const root = w.el.querySelector(".messages");
+  if (!root) return;
+  const sid = data.claude_session_id;
+  // Dedupe key is agent+session, held in a Set. A single `lastInitSid` scalar was the
+  // bug: a parent window sees meta from BOSS *and* every dispatched worker, each with a
+  // different session id, so consecutive agents kept invalidating each other's key and
+  // the card re-drew on every single turn, interleaved with the answer text.
+  if (sid) {
+    if (!w.seenInits) w.seenInits = new Set();
+    const key = `${agent}:${sid}`;
+    if (w.seenInits.has(key)) return;
+    w.seenInits.add(key);
+  }
+
+  const sp = splitInitLists(data);
+
+  const chip = (label, cls) =>
+    `<span class="init-tool ${cls || ""}">${escapeHtml(String(label))}</span>`;
+  const toolRow = (label, list, cls) =>
+    list.length
+      ? `<div class="init-tool-group"><span class="init-tool-label">${label}</span>` +
+        list.map((t) => chip(t, cls)).join("") +
+        `</div>`
+      : "";
+
+  const rows = [];
+  if (data.model) rows.push(`<div class="init-row"><span class="init-k">model</span><span class="init-v">${escapeHtml(data.model)}</span></div>`);
+  if (data.cwd) rows.push(`<div class="init-row"><span class="init-k">cwd</span><span class="init-v mono">${escapeHtml(data.cwd)}</span></div>`);
+  if (sid) rows.push(`<div class="init-row"><span class="init-k">session</span><span class="init-v mono">${escapeHtml(sid)}</span></div>`);
+
+  // Only what was ADDED for this agent (MCP tools, non-default skills, plugins,
+  // servers); the stock builtin tools/skills — identical for every agent — collapse
+  // to one summary line. Hooks (rtk) are absent from the payload and cannot be shown.
+  const plugins = (Array.isArray(data.plugins) ? data.plugins : []).map((p) => p && p.name).filter(Boolean);
+  const servers = (Array.isArray(data.mcp_servers) ? data.mcp_servers : [])
+    .map((s) => s && (s.status && s.status !== "connected" ? `${s.name} (${s.status})` : s.name))
+    .filter(Boolean);
+
+  const hasAdded = sp.addedTools.length || sp.mcpTools.length || sp.addedSkills.length
+    || servers.length || plugins.length;
+  if (hasAdded || sp.defaultToolCount || sp.defaultSkillCount)
+    rows.push(
+      `<div class="init-tools">` +
+        toolRow(`+tools (${sp.addedTools.length})`, sp.addedTools, "builtin") +
+        toolRow(`mcp tools (${sp.mcpTools.length})`, sp.mcpTools, "mcp") +
+        toolRow(`+skills (${sp.addedSkills.length})`, sp.addedSkills, "skill") +
+        toolRow(`plugins (${plugins.length})`, plugins, "plugin") +
+        toolRow(`mcp servers (${servers.length})`, servers, "mcp") +
+        `<div class="init-row" title="stock CLI builtins, identical for every agent — hidden from the chip list"><span class="init-k">defaults</span><span class="init-v">${sp.defaultToolCount} tools · ${sp.defaultSkillCount} skills</span></div>` +
+        `</div>`
+    );
+
+  const card = document.createElement("div");
+  card.className = "init-card";
+  card.innerHTML =
+    `<div class="init-head"><span class="init-dot"></span>agent initialized</div>` +
+    rows.join("");
+  root.appendChild(card);
+  root.scrollTop = root.scrollHeight;
 }
 
 function mirrorDispatchedMessages(slug, agentId) {

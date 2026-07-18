@@ -219,6 +219,7 @@ def _load_template(relpath: str) -> str:
 # "+ agent" template path.
 _AGENT_TEMPLATE_FILES = [
     "AGENT.md",
+    "overview.md",
     "inputs/manifest.md",
     "outputs/manifest.md",
     "state/progress.md",

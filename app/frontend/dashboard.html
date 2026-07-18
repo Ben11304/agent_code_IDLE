@@ -1,0 +1,664 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>AgentUI — Dashboard</title>
+<link rel="stylesheet" href="/styles.css">
+<style>
+/* Dashboard-local tokens. Chart colours come from the validated categorical palette
+   (slots 1-4: blue/green/magenta/yellow). Validator, light surface #fcfcfb:
+     PASS lightness band · PASS chroma floor · PASS CVD ΔE 16.3 · PASS normal ΔE 19.6
+     WARN contrast: magenta 2.62 / yellow 2.11 below 3:1 -> relief rule applies, which
+     is why every series is direct-labelled in the legend AND repeated in the table
+     below; colour never carries meaning alone here. */
+.dash {
+  color-scheme: light;
+  --surface-1: #fcfcfb;
+  --dash-text: #0b0b0b;
+  --dash-dim: #52514e;
+  --dash-line: #e6e5e1;
+  --series-1: #2a78d6;
+  --series-2: #008300;
+  --series-3: #e87ba4;
+  --series-4: #eda100;
+  --st-good: #0ca30c;
+  --st-warn: #fab219;
+  --st-crit: #d03b3b;
+}
+@media (prefers-color-scheme: dark) {
+  :root:where(:not([data-theme="light"])) .dash {
+    color-scheme: dark;
+    --surface-1: #1a1a19;
+    --dash-text: #ffffff;
+    --dash-dim: #c3c2b7;
+    --dash-line: #383835;
+    --series-1: #3987e5;
+    --series-2: #008300;
+    --series-3: #d55181;
+    --series-4: #c98500;
+  }
+}
+:root[data-theme="dark"] .dash {
+  color-scheme: dark;
+  --surface-1: #1a1a19;
+  --dash-text: #ffffff;
+  --dash-dim: #c3c2b7;
+  --dash-line: #383835;
+  --series-1: #3987e5;
+  --series-2: #008300;
+  --series-3: #d55181;
+  --series-4: #c98500;
+}
+
+body { margin: 0; background: var(--surface-1); }
+.dash { min-height: 100vh; background: var(--surface-1); color: var(--dash-text);
+  font: 13px/1.5 -apple-system, BlinkMacSystemFont, "Segoe UI", system-ui, sans-serif;
+  padding: 20px 24px 60px; }
+.dash-head { display: flex; align-items: baseline; gap: 14px; flex-wrap: wrap; margin-bottom: 18px; }
+.dash-title { font-size: 19px; font-weight: 650; letter-spacing: -0.01em; }
+.dash-sub { color: var(--dash-dim); font-size: 12px; }
+.trace { display: inline-flex; align-items: center; gap: 4px; font-size: 11px; font-weight: 600;
+  padding: 2px 8px; border-radius: 999px; margin-right: 6px; }
+.trace.on { color: #fff; background: var(--st-good); }
+.trace.off { color: #fff; background: var(--st-crit); }
+
+.tabs { display: flex; gap: 4px; margin-bottom: 14px; border-bottom: 1px solid var(--dash-line); }
+.tab { border: 0; background: transparent; color: var(--dash-dim); font: inherit; font-size: 13px;
+  padding: 7px 12px; cursor: pointer; border-bottom: 2px solid transparent; margin-bottom: -1px; }
+.tab:hover { color: var(--dash-text); }
+.tab.on { color: var(--dash-text); border-bottom-color: var(--series-1); font-weight: 600; }
+.log-select { background: var(--surface-1); color: var(--dash-text); border: 1px solid var(--dash-line);
+  border-radius: 8px; padding: 5px 10px; font: inherit; font-size: 12px; }
+.log-state { font-size: 11.5px; color: var(--dash-dim); margin-left: 4px; }
+.log-state .run { color: var(--st-warn); font-weight: 600; }
+.logrow-tool { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 11px;
+  padding: 1px 6px; border-radius: 5px; background: var(--dash-line); }
+.logrow-say { color: var(--dash-dim); font-style: italic; }
+.log-tgt { font-family: ui-monospace, Menlo, monospace; font-size: 11.5px; word-break: break-all; }
+.log-st { font-size: 11px; }
+.log-st.ok { color: var(--st-good); } .log-st.err { color: var(--st-crit); } .log-st.pending { color: var(--dash-dim); }
+.dash-head .spacer { margin-left: auto; }
+.dash a.back { color: var(--dash-dim); text-decoration: none; font-size: 12px; }
+.dash a.back:hover { color: var(--dash-text); text-decoration: underline; }
+
+/* filters: one row above the charts */
+.filters { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; margin-bottom: 16px; }
+.seg { display: inline-flex; border: 1px solid var(--dash-line); border-radius: 8px; overflow: hidden; }
+.seg button { border: 0; background: transparent; color: var(--dash-dim); font: inherit;
+  font-size: 12px; padding: 5px 11px; cursor: pointer; }
+.seg button[aria-pressed="true"] { background: var(--series-1); color: #fff; }
+.seg button + button { border-left: 1px solid var(--dash-line); }
+.f-label { color: var(--dash-dim); font-size: 11px; text-transform: uppercase;
+  letter-spacing: 0.07em; margin-right: 2px; }
+
+/* KPI tiles — a bare number needs no plot */
+.kpis { display: grid; grid-template-columns: repeat(auto-fit, minmax(168px, 1fr)); gap: 10px; margin-bottom: 18px; }
+.kpi { border: 1px solid var(--dash-line); border-radius: 10px; padding: 12px 14px; }
+.kpi-k { font-size: 11px; color: var(--dash-dim); text-transform: uppercase; letter-spacing: 0.07em; }
+.kpi-v { font-size: 25px; font-weight: 620; letter-spacing: -0.02em; margin-top: 3px;
+  font-variant-numeric: tabular-nums; }
+.kpi-note { font-size: 11px; color: var(--dash-dim); margin-top: 2px; }
+
+.panel { border: 1px solid var(--dash-line); border-radius: 10px; padding: 14px 16px 10px; margin-bottom: 16px; }
+.panel-h { display: flex; align-items: baseline; gap: 10px; margin-bottom: 2px; }
+.panel-t { font-size: 13px; font-weight: 620; }
+.panel-s { font-size: 11px; color: var(--dash-dim); }
+.panel-h .spacer { margin-left: auto; }
+
+/* legend — always present for >=2 series; identity never colour-alone */
+.legend { display: flex; gap: 12px; flex-wrap: wrap; margin: 8px 0 10px; }
+.lg { display: inline-flex; align-items: center; gap: 5px; font-size: 11.5px; color: var(--dash-dim);
+  cursor: pointer; user-select: none; padding: 1px 5px; border-radius: 6px; }
+.lg:hover { background: var(--dash-line); }
+.lg.off { opacity: 0.4; text-decoration: line-through; }
+.lg i { width: 9px; height: 9px; border-radius: 2px; display: inline-block; }
+.lg b { font-weight: 600; color: var(--dash-text); font-variant-numeric: tabular-nums; }
+
+.chart-wrap { overflow-x: auto; }
+svg { display: block; }
+.grid line { stroke: var(--dash-line); stroke-width: 1; }
+.axis text { fill: var(--dash-dim); font-size: 10px; }
+.bar-seg { stroke: var(--surface-1); stroke-width: 2; }   /* 2px surface gap between fills */
+.hint { color: var(--dash-dim); font-size: 11.5px; padding: 10px 0; }
+
+table.tbl { width: 100%; border-collapse: collapse; font-size: 12.5px; }
+.tbl th { text-align: left; font-weight: 600; color: var(--dash-dim); font-size: 11px;
+  text-transform: uppercase; letter-spacing: 0.06em; padding: 6px 8px; border-bottom: 1px solid var(--dash-line); }
+.tbl td { padding: 7px 8px; border-bottom: 1px solid var(--dash-line); font-variant-numeric: tabular-nums; }
+.tbl tr:last-child td { border-bottom: 0; }
+.tbl .num { text-align: right; }
+.agent-cell { display: inline-flex; align-items: center; gap: 6px; }
+.agent-cell i { width: 9px; height: 9px; border-radius: 2px; }
+.mono { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 11.5px; }
+
+/* status: icon + label, never colour alone */
+.st { display: inline-flex; align-items: center; gap: 4px; font-size: 11.5px; }
+.st b { font-weight: 500; }
+.st.good { color: var(--st-good); }
+.st.warn { color: var(--st-warn); }
+.st.crit { color: var(--st-crit); }
+.st.idle { color: var(--dash-dim); }
+
+/* context meter: value is printed next to it, so the bar is redundant encoding */
+.meter { display: inline-flex; align-items: center; gap: 7px; min-width: 132px; }
+.meter-track { flex: 1; height: 6px; border-radius: 3px; background: var(--dash-line); position: relative; overflow: hidden; }
+.meter-fill { position: absolute; inset: 0 auto 0 0; border-radius: 3px; background: var(--series-1); }
+.meter-fill.hot { background: var(--st-crit); }
+.meter-fill.warm { background: var(--st-warn); }
+.meter-mark { position: absolute; top: -2px; bottom: -2px; width: 2px; background: var(--dash-text); opacity: 0.45; }
+.meter-v { font-variant-numeric: tabular-nums; font-size: 11.5px; min-width: 40px; text-align: right; }
+
+.tip { position: fixed; pointer-events: none; z-index: 50; background: var(--dash-text);
+  color: var(--surface-1); border-radius: 7px; padding: 7px 9px; font-size: 11.5px;
+  line-height: 1.45; opacity: 0; transition: opacity .08s; white-space: nowrap; }
+.tip.on { opacity: 1; }
+.tip .tk { opacity: 0.7; }
+</style>
+</head>
+<body>
+<div class="dash" id="dash">
+  <div class="dash-head">
+    <div class="dash-title">📊 Dashboard</div>
+    <div class="dash-sub" id="sub">loading…</div>
+    <div class="spacer"></div>
+    <a class="back" href="/">← back to workspace</a>
+  </div>
+
+  <div class="tabs" id="tabs">
+    <button data-tab="overview" class="tab on">📈 Overview</button>
+    <button data-tab="log" class="tab">📜 Agent log</button>
+  </div>
+
+  <div id="view-overview">
+    <div class="filters" id="filters"></div>
+    <div class="kpis" id="kpis"></div>
+
+    <div class="panel">
+      <div class="panel-h">
+        <div class="panel-t">Token usage over time</div>
+        <div class="panel-s" id="seriesSub"></div>
+      </div>
+      <div class="legend" id="legend"></div>
+      <div class="chart-wrap"><svg id="chart" role="img" aria-label="Token usage over time by agent"></svg></div>
+    </div>
+
+    <div class="panel">
+      <div class="panel-h">
+        <div class="panel-t">Agents</div>
+        <div class="panel-s">context = largest live request · billed = lifetime, cache re-charged per request</div>
+      </div>
+      <table class="tbl" id="agents"></table>
+    </div>
+  </div>
+
+  <div id="view-log" hidden>
+    <div class="filters">
+      <span class="f-label">agent</span>
+      <select id="logAgent" class="log-select"></select>
+      <span id="logState" class="log-state"></span>
+    </div>
+    <div class="panel">
+      <div class="panel-h">
+        <div class="panel-t">Live tool activity</div>
+        <div class="panel-s">tailed from the CLI transcript · polls every 2s · newest at bottom</div>
+      </div>
+      <table class="tbl" id="logtbl"></table>
+      <div id="logEmpty" class="hint" style="padding:14px 4px">pick an agent to start tailing its activity.</div>
+    </div>
+  </div>
+</div>
+<div class="tip" id="tip"></div>
+
+<script>
+const $ = (id) => document.getElementById(id);
+// Categorical slots in FIXED order — never cycled. A 9th agent folds into "Other"
+// rather than inventing a hue.
+const SLOTS = ["var(--series-1)", "var(--series-2)", "var(--series-3)", "var(--series-4)"];
+const OTHER = "var(--dash-dim)";
+let state = { bucket: "hour", hours: 48, project: "all", data: null,
+  groupBy: "agent",     // "agent" | "model" — how the chart stacks
+  hidden: {} };         // seriesKey -> true : hidden via legend click
+
+const fmt = (n) => {
+  n = n || 0;
+  if (n >= 1e9) return (n / 1e9).toFixed(2) + "B";
+  if (n >= 1e6) return (n / 1e6).toFixed(1) + "M";
+  if (n >= 1e3) return (n / 1e3).toFixed(1) + "k";
+  return String(n);
+};
+const esc = (s) => String(s == null ? "" : s).replace(/[&<>"']/g, (c) =>
+  ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
+
+async function load() {
+  const r = await fetch(`/api/dashboard?bucket=${state.bucket}&hours=${state.hours}`);
+  state.data = await r.json();
+  render();
+}
+
+// Assign a fixed categorical slot per key, ranked by weight. Colour follows the ENTITY,
+// never its position, so hiding/filtering never repaints the survivors. Generic over the
+// key set: the table calls it with agent keys, the chart with agent- OR model-keys.
+function assignColors(billed) {
+  const ranked = Object.keys(billed).filter((k) => billed[k] > 0)
+    .sort((a, b) => billed[b] - billed[a]);
+  const m = {};
+  ranked.forEach((k, i) => { m[k] = i < SLOTS.length ? SLOTS[i] : OTHER; });
+  return m;
+}
+
+// Agent colour map — used by the table and the by-agent chart.
+function colorMap(d) {
+  const billed = {};
+  d.agents.forEach((a) => {
+    const k = a.project + "/" + a.agent;
+    billed[k] = a.billed_total || 0;
+  });
+  const ranked = Object.keys(billed).filter((k) => billed[k] > 0)
+    .sort((a, b) => billed[b] - billed[a]);
+  const m = {};
+  ranked.forEach((k, i) => { m[k] = i < SLOTS.length ? SLOTS[i] : OTHER; });
+  return m;
+}
+
+function render() {
+  const d = state.data;
+  if (!d) return;
+  const cmap = colorMap(d);
+  // agent → current model, the fallback for series rows booked before the model column.
+  state.modelOf = {};
+  d.agents.forEach((a) => { state.modelOf[a.project + "/" + a.agent] = a.model; });
+  const inScope = (p) => state.project === "all" || p === state.project;
+  const agents = d.agents.filter((a) => inScope(a.project));
+  const series = d.series.filter((s) => inScope(s.project_slug));
+
+  // Live trace indicator: green pill when token counting is ON (new turns are being
+  // recorded), amber warning when OFF (the numbers freeze until it's switched back on
+  // via the "count tokens" switch in the main UI's usage widget).
+  const clock = new Date(d.server_time * 1000).toLocaleTimeString();
+  $("sub").innerHTML = d.counting_enabled
+    ? `<span class="trace on">● tracing</span> ${d.agents.length} agents · ${esc(clock)}`
+    : `<span class="trace off">⚠ tracing OFF</span> numbers frozen — enable “count tokens” in the usage widget`;
+
+  // Per-agent windowed totals from the series (bounded to the selected range) —
+  // keyed "project/agent" so the table can show last-Nh billed/output/turns instead
+  // of lifetime. Point-in-time fields (context, status, last-seen) stay on the agent.
+  const win = {};
+  series.forEach((r) => {
+    const k = r.project_slug + "/" + r.agent_id;
+    const w = win[k] || (win[k] = { billed: 0, out: 0, turns: 0 });
+    w.out += r.output_tokens || 0;
+    w.turns += r.turns || 0;
+    w.billed += (r.input_tokens || 0) + (r.cache_creation || 0) + (r.cache_read || 0) + (r.output_tokens || 0);
+  });
+
+  renderFilters(d);
+  renderKpis(agents, series);
+  renderChart(series, cmap);
+  renderAgents(agents, cmap, win);
+}
+
+function renderFilters(d) {
+  const projects = ["all", ...Array.from(new Set(d.agents.map((a) => a.project)))];
+  const seg = (label, key, opts, cur) =>
+    `<span class="f-label">${label}</span><span class="seg">` +
+    opts.map((o) => `<button data-k="${key}" data-v="${o.v}" aria-pressed="${String(o.v) === String(cur)}">${esc(o.t)}</button>`).join("") +
+    `</span>`;
+  $("filters").innerHTML =
+    seg("project", "project", projects.map((p) => ({ v: p, t: p })), state.project) +
+    seg("bucket", "bucket", [
+      { v: "15m", t: "15 min" }, { v: "hour", t: "hourly" },
+      { v: "day", t: "daily" }, { v: "week", t: "weekly" },
+    ], state.bucket) +
+    seg("range", "hours", [
+      { v: 1, t: "1h" }, { v: 6, t: "6h" }, { v: 24, t: "24h" }, { v: 48, t: "48h" },
+      { v: 168, t: "7d" }, { v: 720, t: "30d" }, { v: 2160, t: "90d" },
+    ], state.hours) +
+    seg("stack by", "groupBy", [{ v: "agent", t: "agent" }, { v: "model", t: "model" }], state.groupBy);
+  $("filters").querySelectorAll("button").forEach((b) => {
+    b.onclick = () => {
+      const k = b.dataset.k;
+      state[k] = k === "hours" ? Number(b.dataset.v) : b.dataset.v;
+      // Picking a RANGE auto-pairs a sensible bucket (short → fine, long → coarse) so
+      // "1h at daily buckets" or "90d at 15-min bars" can't happen by default. Picking
+      // a BUCKET explicitly is respected as-is — the user is overriding the pairing.
+      if (k === "hours") state.bucket = autoBucket(state.hours);
+      // Switching agent↔model changes what the hidden-set keys mean, so clear it.
+      if (k === "groupBy") state.hidden = {};
+      if (k === "bucket" || k === "hours") load(); else render();
+    };
+  });
+}
+
+function autoBucket(hours) {
+  if (hours <= 6) return "15m";
+  if (hours <= 72) return "hour";
+  if (hours <= 720) return "day";
+  return "week";
+}
+
+function rangeLabel() {
+  const h = state.hours;
+  return h < 24 ? `${h}h` : h % 24 === 0 ? `${h / 24}d` : `${h}h`;
+}
+
+function renderKpis(agents, series) {
+  // billed / output / turns are WINDOWED — summed over the series (which the backend
+  // already bounded to the selected range), so they move with the 1h/6h/…/90d filter.
+  // running / hottest are point-in-time state, so they stay lifetime-agnostic.
+  const s0 = { billed: 0, out: 0, cache: 0, turns: 0 };
+  const agg = series.reduce((s, r) => {
+    s.out += r.output_tokens || 0;
+    s.cache += r.cache_read || 0;
+    s.billed += (r.input_tokens || 0) + (r.cache_creation || 0) + (r.cache_read || 0) + (r.output_tokens || 0);
+    s.turns += r.turns || 0;
+    return s;
+  }, s0);
+  const running = agents.filter((a) => a.status === "running").length;
+  const hottest = agents.slice().sort((a, b) => (b.context_pct || 0) - (a.context_pct || 0))[0];
+  const rl = rangeLabel();
+  const tile = (k, v, note) =>
+    `<div class="kpi"><div class="kpi-k">${esc(k)}</div><div class="kpi-v">${esc(v)}</div>` +
+    (note ? `<div class="kpi-note">${esc(note)}</div>` : "") + `</div>`;
+  $("kpis").innerHTML =
+    tile(`billed · last ${rl}`, fmt(agg.billed), `${(agg.cache / (agg.billed || 1) * 100).toFixed(0)}% is cache re-read`) +
+    tile(`output · last ${rl}`, fmt(agg.out), "the part that is not cache") +
+    tile(`turns · last ${rl}`, String(agg.turns), `across ${agents.length} agents`) +
+    tile("running now", String(running), running ? "live" : "idle") +
+    tile("hottest context", hottest ? hottest.context_pct + "%" : "—",
+         hottest ? `${hottest.agent} · compact at ${hottest.compact_at_pct}%` : "");
+}
+
+// FORM: magnitude over time, one bar per bucket, stacked by series (agent OR model).
+// Not a line: the buckets are discrete and often sparse.
+function renderChart(series, cmap) {
+  const svg = $("chart");
+  const buckets = Array.from(new Set(series.map((s) => s.bucket))).sort();
+  if (!buckets.length) {
+    svg.innerHTML = "";
+    svg.setAttribute("height", "0");
+    $("legend").innerHTML = "";
+    $("seriesSub").innerHTML = `<span class="hint">no token data in this range — turns are recorded only while token counting is ON</span>`;
+    return;
+  }
+  // Group key depends on the toggle. In model mode, rows booked before the model column
+  // existed have model=null; fall back to the agent's CURRENT model so old data still
+  // groups instead of piling into one "unknown" bar.
+  const byModel = state.groupBy === "model";
+  const keyOf = (s) => byModel
+    ? (s.model || state.modelOf[s.project_slug + "/" + s.agent_id] || "unknown")
+    : (s.project_slug + "/" + s.agent_id);
+
+  // Colours per series key, ranked by total in this window (assigned once here so
+  // hiding a series never repaints the rest).
+  const keyBilled = {};
+  series.forEach((s) => {
+    const k = keyOf(s);
+    keyBilled[k] = (keyBilled[k] || 0) + s.input_tokens + s.cache_creation + s.cache_read + s.output_tokens;
+  });
+  cmap = byModel ? assignColors(keyBilled) : cmap;
+
+  const allKeys = Object.keys(keyBilled).sort((a, b) => keyBilled[b] - keyBilled[a]);
+  const keys = allKeys.filter((k) => !state.hidden[k]);   // legend-hidden series drop out
+  const val = {};
+  series.forEach((s) => {
+    const k = keyOf(s);
+    if (state.hidden[k]) return;
+    (val[s.bucket] = val[s.bucket] || {})[k] =
+      (val[s.bucket][k] || 0) + s.input_tokens + s.cache_creation + s.cache_read + s.output_tokens;
+  });
+  const totals = buckets.map((b) => keys.reduce((sum, k) => sum + ((val[b] || {})[k] || 0), 0));
+  const max = Math.max(...totals, 1);
+
+  const barW = Math.max(14, Math.min(46, Math.floor(760 / buckets.length) - 6));
+  const gap = 6, padL = 52, padR = 8, padT = 8, padB = 34;
+  const plotH = 190;
+  const W = padL + buckets.length * (barW + gap) + padR;
+  const H = plotH + padT + padB;
+  svg.setAttribute("width", W); svg.setAttribute("height", H);
+  svg.setAttribute("viewBox", `0 0 ${W} ${H}`);
+
+  const y = (v) => padT + plotH - (v / max) * plotH;
+  let g = `<g class="grid">`;
+  const ticks = [0, 0.25, 0.5, 0.75, 1].map((f) => f * max);
+  ticks.forEach((t) => { g += `<line x1="${padL}" x2="${W - padR}" y1="${y(t)}" y2="${y(t)}"/>`; });
+  g += `</g><g class="axis">`;
+  ticks.forEach((t) => { g += `<text x="${padL - 7}" y="${y(t) + 3}" text-anchor="end">${fmt(Math.round(t))}</text>`; });
+
+  const everyN = Math.ceil(buckets.length / 12);
+  buckets.forEach((b, i) => {
+    if (i % everyN) return;
+    const x = padL + i * (barW + gap) + barW / 2;
+    // Bucket string shapes: 15m/hour "YYYY-MM-DD HH:MM" · day "YYYY-MM-DD" · week "YYYY-Wnn"
+    const timey = state.bucket === "hour" || state.bucket === "15m";
+    const label = timey ? b.slice(11, 16)
+      : state.bucket === "week" ? b.slice(5)   // "W28"
+      : b.slice(5);                            // "MM-DD"
+    g += `<text x="${x}" y="${H - padB + 14}" text-anchor="middle">${esc(label)}</text>`;
+    // Second line: the date, on day boundaries, for the intra-day buckets.
+    if (timey && (i === 0 || b.slice(0, 10) !== buckets[i - 1].slice(0, 10)))
+      g += `<text x="${x}" y="${H - padB + 26}" text-anchor="middle" opacity="0.75">${esc(b.slice(5, 10))}</text>`;
+  });
+  g += `</g>`;
+
+  buckets.forEach((b, i) => {
+    let acc = 0;
+    const x = padL + i * (barW + gap);
+    keys.forEach((k) => {
+      const v = (val[b] || {})[k] || 0;
+      if (!v) return;
+      const h = (v / max) * plotH;
+      const yTop = y(acc + v);
+      acc += v;
+      // 4px rounded data-end only on the top segment; the rest square, anchored down.
+      g += `<rect class="bar-seg" x="${x}" y="${yTop}" width="${barW}" height="${Math.max(h, 1)}"` +
+           ` fill="${cmap[k] || OTHER}" rx="2"` +
+           ` data-b="${esc(b)}" data-k="${esc(k)}" data-v="${v}" data-t="${totals[i]}"></rect>`;
+    });
+  });
+  svg.innerHTML = g;
+  bindTips(svg);
+
+  const unit = { "15m": "15-min buckets", hour: "hours", day: "days", week: "weeks" }[state.bucket] || "buckets";
+  $("seriesSub").textContent =
+    `${buckets.length} ${unit} · by ${byModel ? "model" : "agent"} · billed tokens (input + cache + output)`;
+
+  // Legend is CLICKABLE: click a series to hide/show it. Shows every series (even
+  // hidden ones, dimmed) with its windowed total, so the legend doubles as a ranking.
+  $("legend").innerHTML = allKeys.map((k) => {
+    const off = state.hidden[k];
+    return `<span class="lg${off ? " off" : ""}" data-key="${esc(k)}" title="click to ${off ? "show" : "hide"}">` +
+      `<i style="background:${cmap[k] || OTHER}"></i>${esc(k)} <b>${fmt(keyBilled[k])}</b></span>`;
+  }).join("");
+  $("legend").querySelectorAll(".lg").forEach((el) => {
+    el.onclick = () => {
+      const k = el.dataset.key;
+      if (state.hidden[k]) delete state.hidden[k]; else state.hidden[k] = true;
+      render();   // client-side only — no refetch
+    };
+  });
+}
+
+function bindTips(svg) {
+  const tip = $("tip");
+  svg.querySelectorAll("rect").forEach((r) => {
+    r.addEventListener("mousemove", (e) => {
+      tip.innerHTML = `<b>${esc(r.dataset.k)}</b><br><span class="tk">${esc(r.dataset.b)}</span><br>` +
+        `${fmt(+r.dataset.v)} billed <span class="tk">of ${fmt(+r.dataset.t)} this bucket</span>`;
+      tip.classList.add("on");
+      tip.style.left = Math.min(e.clientX + 12, innerWidth - tip.offsetWidth - 8) + "px";
+      tip.style.top = (e.clientY + 14) + "px";
+    });
+    r.addEventListener("mouseleave", () => tip.classList.remove("on"));
+  });
+}
+
+function renderAgents(agents, cmap, win) {
+  const wof = (a) => win[a.project + "/" + a.agent] || { billed: 0, out: 0, turns: 0 };
+  // Sort by windowed billed so the range's biggest spenders float up; lifetime billed
+  // breaks ties so idle-in-window agents keep a stable order instead of jumping.
+  const rows = agents.slice().sort((a, b) =>
+    (wof(b).billed - wof(a).billed) || ((b.billed_total || 0) - (a.billed_total || 0)));
+  const st = (s) => s === "running" ? `<span class="st warn">⏳ <b>running</b></span>`
+    : s === "ok" ? `<span class="st good">✓ <b>ok</b></span>`
+    : s === "error" ? `<span class="st crit">✕ <b>error</b></span>`
+    : s === "cancelled" ? `<span class="st crit">⊘ <b>cancelled</b></span>`
+    : `<span class="st idle">○ <b>${esc(s || "idle")}</b></span>`;
+  const meter = (a) => {
+    const pct = a.context_pct || 0;
+    const cls = pct >= a.compact_at_pct ? "hot" : pct >= a.compact_at_pct * 0.7 ? "warm" : "";
+    return `<span class="meter" title="compacts at ${a.compact_at_pct}% of ${fmt(a.context_window)}">` +
+      `<span class="meter-track"><span class="meter-fill ${cls}" style="width:${Math.min(100, pct)}%"></span>` +
+      `<span class="meter-mark" style="left:${a.compact_at_pct}%"></span></span>` +
+      `<span class="meter-v">${pct}%</span></span>`;
+  };
+  const ago = (t) => {
+    if (!t) return "—";
+    const s = Math.max(0, Date.now() / 1000 - t);
+    if (s < 90) return Math.round(s) + "s";
+    if (s < 5400) return Math.round(s / 60) + "m";
+    if (s < 172800) return Math.round(s / 3600) + "h";
+    return Math.round(s / 86400) + "d";
+  };
+  const rl = rangeLabel();
+  $("agents").innerHTML =
+    `<thead><tr><th>agent</th><th>project</th><th>model</th><th>status</th>
+      <th class="num" title="fixed context cost: system prompt + the files the pre-flight block reads every session, whatever the task. chars/4 estimate. Hover a cell for the breakdown.">fixed ctx</th>
+      <th>context</th><th class="num">billed · ${rl}</th><th class="num">output · ${rl}</th>
+      <th class="num">turns · ${rl}</th><th class="num">last</th></tr></thead><tbody>` +
+    rows.map((a) => {
+      const k = a.project + "/" + a.agent;
+      const w = wof(a);
+      const dim = w.billed ? "" : ' style="opacity:.4"';   // no activity in the window
+      const fcTip = (a.fixed_cost_files || []).map((f) => `${f.name}: ${fmt(f.tokens)}`).join("\n")
+        || "system prompt only";
+      const fc = a.fixed_cost != null
+        ? `<td class="num" title="sys ${fmt(a.fixed_cost_sys)} + pre-flight ${fmt(a.fixed_cost_preflight)}\n${fcTip}">${fmt(a.fixed_cost)}</td>`
+        : `<td class="num"></td>`;
+      return `<tr>
+        <td><span class="agent-cell"><i style="background:${cmap[k] || OTHER}"></i><b>${esc(a.agent)}</b></span></td>
+        <td class="mono">${esc(a.project)}</td>
+        <td class="mono">${esc(a.model)}</td>
+        <td>${st(a.status)}</td>
+        ${fc}
+        <td>${a.context_tokens == null ? '<span class="st idle">— no session</span>' : meter(a)}</td>
+        <td class="num"${dim}>${fmt(w.billed)}</td>
+        <td class="num"${dim}>${fmt(w.out)}</td>
+        <td class="num"${dim}>${w.turns}</td>
+        <td class="num">${ago(a.updated_at)}</td>
+      </tr>`;
+    }).join("") + `</tbody>`;
+}
+
+// ---------- Agent log tab ----------
+const logState = { tab: "overview", agent: null, offset: 0, session: null, timer: null, seenIds: {} };
+
+function switchTab(tab) {
+  logState.tab = tab;
+  document.querySelectorAll(".tab").forEach((b) => b.classList.toggle("on", b.dataset.tab === tab));
+  $("view-overview").hidden = tab !== "overview";
+  $("view-log").hidden = tab !== "log";
+  if (tab === "log") { fillLogAgents(); startLogPoll(); } else { stopLogPoll(); }
+}
+
+function fillLogAgents() {
+  const d = state.data;
+  if (!d) return;
+  const sel = $("logAgent");
+  const cur = logState.agent;
+  // Sort agents that have a session first, then by recent activity.
+  const opts = d.agents.slice().sort((a, b) => (b.updated_at || 0) - (a.updated_at || 0));
+  sel.innerHTML = `<option value="">— select agent —</option>` +
+    opts.map((a) => `<option value="${esc(a.project + "/" + a.agent)}">${esc(a.agent)} · ${esc(a.project)}</option>`).join("");
+  if (cur) sel.value = cur;
+  sel.onchange = () => selectLogAgent(sel.value);
+}
+
+function selectLogAgent(key) {
+  logState.agent = key || null;
+  logState.offset = 0; logState.session = null; logState.seenIds = {};
+  $("logtbl").innerHTML = "";
+  $("logEmpty").hidden = !!key;
+  $("logEmpty").textContent = key ? "waiting for activity…" : "pick an agent to start tailing its activity.";
+  if (key) pollLog(true);
+}
+
+function startLogPoll() {
+  stopLogPoll();
+  if (logState.agent) pollLog(true);
+  logState.timer = setInterval(() => { if (logState.tab === "log") pollLog(false); }, 2000);
+}
+function stopLogPoll() { if (logState.timer) { clearInterval(logState.timer); logState.timer = null; } }
+
+async function pollLog() {
+  if (!logState.agent) return;
+  const [project, agent] = logState.agent.split("/");
+  let r;
+  try {
+    r = await (await fetch(`/api/projects/${project}/agents/${agent}/log?since=${logState.offset}`)).json();
+  } catch { return; }
+
+  // New claude session (e.g. after /clear) or the file shrank → wipe and reseed.
+  if ((logState.session && r.session && r.session !== logState.session) || r.reset) {
+    $("logtbl").innerHTML = ""; logState.seenIds = {}; logState.offset = 0;
+  }
+  logState.session = r.session;
+  logState.offset = r.offset || 0;
+
+  $("logState").innerHTML = r.session
+    ? (r.agent_running ? `<span class="run">⏳ running</span>` : `<span>idle · ${esc(r.status || "")}</span>`)
+    : `<span>no session yet</span>`;
+
+  const body = $("logtbl").querySelector("tbody") || (() => {
+    $("logtbl").innerHTML =
+      `<thead><tr><th>time</th><th>tool</th><th>target</th>` +
+      `<th class="num" title="tokens the model GENERATED this request — the real per-round work">output</th>` +
+      `<th class="num" title="total sent to the server this request (input + cache + output). Mostly cached context re-read, so it's large but ~10× cheaper per token than fresh input.">billed</th>` +
+      `<th>ok</th></tr></thead><tbody></tbody>`;
+    return $("logtbl").querySelector("tbody");
+  })();
+
+  let appended = 0;
+  (r.events || []).forEach((e) => {
+    if (e.kind === "result") {   // late status update for a row from an earlier poll
+      const row = logState.seenIds[e.id];
+      if (row) { const c = row.querySelector(".log-st"); if (c) { c.className = "log-st " + e.status; c.textContent = e.status === "err" ? "✕" : "✓"; } }
+      return;
+    }
+    const tr = document.createElement("tr");
+    // Parse the full ISO (UTC) and render in the viewer's own timezone.
+    const time = e.ts ? new Date(e.ts).toLocaleTimeString() : "";
+    if (e.kind === "say") {
+      tr.innerHTML = `<td class="mono">${esc(time)}</td><td></td>` +
+        `<td colspan="4" class="logrow-say">${esc(e.target)}</td>`;
+    } else {
+      const stCls = e.status === "ok" ? "ok" : e.status === "err" ? "err" : "pending";
+      const stTxt = e.status === "ok" ? "✓" : e.status === "err" ? "✕" : "…";
+      // output = real per-round work · billed = full request (mostly cached re-read).
+      tr.innerHTML =
+        `<td class="mono">${esc(time)}</td>` +
+        `<td><span class="logrow-tool">${esc(e.tool)}</span></td>` +
+        `<td class="log-tgt">${esc(e.target)}</td>` +
+        `<td class="num">${e.out_tokens != null ? fmt(e.out_tokens) : ""}</td>` +
+        `<td class="num" style="color:var(--dash-dim)">${e.round_tokens != null ? fmt(e.round_tokens) : ""}</td>` +
+        `<td><span class="log-st ${stCls}">${stTxt}</span></td>`;
+      if (e.id) logState.seenIds[e.id] = tr;
+    }
+    body.appendChild(tr);
+    appended++;
+  });
+  if (appended) {
+    $("logEmpty").hidden = true;
+    const wrap = $("view-log"); wrap.scrollTop = wrap.scrollHeight;
+    // keep the DOM bounded — drop oldest rows past 400
+    while (body.children.length > 400) body.removeChild(body.firstChild);
+  }
+}
+
+document.querySelectorAll(".tab").forEach((b) => { b.onclick = () => switchTab(b.dataset.tab); });
+
+load();
+setInterval(load, 30000);
+</script>
+</body>
+</html>

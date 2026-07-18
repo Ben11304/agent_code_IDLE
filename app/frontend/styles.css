@@ -146,6 +146,9 @@ html, body { margin: 0; height: 100%; background: var(--bg); color: var(--text);
   cursor: pointer; display: flex; align-items: center; gap: 6px; font-family: inherit;
   white-space: nowrap; transition: background 0.12s, color 0.12s, border-color 0.12s; }
 .topbar-btn:hover { background: var(--hover); color: var(--text); border-color: var(--accent-border); }
+/* #dashBtn is an <a> (opens the dashboard page in a new tab) wearing the button
+   style — strip the link defaults so it sits flush with the real buttons. */
+a.topbar-btn { text-decoration: none; }
 .topbar-btn.active { background: var(--bg-card); color: var(--text); border-color: var(--accent); }
 .topbar-btn .proc-count { background: var(--accent-soft); color: var(--text);
   border-radius: 8px; padding: 0 6px; font-size: 10.5px; font-family: var(--mono); }
@@ -369,6 +372,20 @@ html, body { margin: 0; height: 100%; background: var(--bg); color: var(--text);
   border: 1px solid var(--accent-border); border-radius: 6px; padding: 5px; font-size: 11px;
   cursor: pointer; font-family: var(--mono); }
 .ac-open:hover { background: var(--accent); color: #fff; }
+.ac-v.mono { font-family: var(--mono); font-weight: 500;
+  max-width: 130px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.ac-sep { font-size: 9px; text-transform: uppercase; letter-spacing: 0.08em;
+  color: var(--text-dim); margin: 4px 0 2px 0; padding-top: 4px;
+  border-top: 1px dashed var(--border); }
+.ac-init-tools { display: flex; align-items: flex-start; gap: 6px; font-size: 10.5px; }
+.ac-init-tools .ac-k { flex: 0 0 auto; min-width: 56px; padding-top: 1px; }
+.ac-tool-list { display: flex; flex-wrap: wrap; gap: 3px; margin-left: auto;
+  justify-content: flex-end; max-width: 130px; }
+.ac-tool { font-size: 9px; padding: 0 4px; border-radius: 4px; line-height: 14px;
+  background: var(--hover); border: 1px solid var(--border); color: var(--text);
+  white-space: nowrap; max-width: 120px; overflow: hidden; text-overflow: ellipsis; }
+.ac-tool-more { font-size: 9px; line-height: 14px; color: var(--text-dim);
+  align-self: center; cursor: help; }
 
 .graph-toolbar { position: absolute; top: 8px; left: 8px; display: flex;
   gap: 4px; background: var(--glass); border: 1px solid var(--border);
@@ -614,6 +631,44 @@ html, body { margin: 0; height: 100%; background: var(--bg); color: var(--text);
   border: 1px dashed var(--accent-border); color: var(--text-dim); font-size: 12px;
   max-width: 100%; }
 .bubble.system .content { color: var(--text); }
+
+/* Agent initialization card (system/init meta) — ported from opcode */
+.init-card { align-self: stretch; max-width: 100%; background: var(--bg-soft);
+  border: 1px solid var(--border); border-radius: 10px; padding: 8px 10px;
+  font-size: 12px; color: var(--text-dim); margin: 2px 0; }
+.init-head { display: flex; align-items: center; gap: 6px; text-transform: lowercase;
+  letter-spacing: 0.02em; color: var(--text); font-size: 11px; margin-bottom: 6px; }
+.init-dot { width: 7px; height: 7px; border-radius: 50%; background: var(--accent, #6b7a90);
+  box-shadow: 0 0 0 3px var(--accent-soft, rgba(107,122,144,0.15)); }
+.init-row { display: flex; gap: 8px; align-items: baseline; margin: 2px 0; }
+.init-k { font-family: var(--mono); font-size: 10px; text-transform: uppercase;
+  letter-spacing: 0.06em; color: var(--text-dim); min-width: 48px; }
+.init-v { color: var(--text); word-break: break-all; }
+.init-v.mono { font-family: var(--mono); font-size: 11px; }
+.init-tools { margin-top: 6px; display: flex; flex-direction: column; gap: 4px; }
+.init-tool-group { display: flex; flex-wrap: wrap; gap: 4px; align-items: center; }
+.init-tool-label { font-family: var(--mono); font-size: 10px; text-transform: uppercase;
+  letter-spacing: 0.06em; color: var(--text-dim); margin-right: 2px; }
+.init-tool { font-family: var(--mono); font-size: 10px; padding: 1px 6px; border-radius: 6px;
+  background: var(--hover); border: 1px solid var(--border); color: var(--text); }
+.init-tool.mcp { background: var(--accent-soft, rgba(107,122,144,0.12));
+  border-color: var(--accent-border); }
+/* Skills / plugins / subagents come from the same system/init payload as tools;
+   tinted apart so the loaded surface is scannable at a glance. */
+/* Token-counting switch in the usage widget */
+.tok-toggle { cursor: pointer; user-select: none; margin-top: 4px;
+  padding-top: 4px; border-top: 1px dashed var(--border); }
+.tok-switch { margin-left: auto; width: 26px; height: 15px; border-radius: 999px;
+  background: var(--bar-bg); border: 1px solid var(--border); position: relative;
+  transition: background 0.15s ease; flex-shrink: 0; }
+.tok-switch .tok-knob { position: absolute; top: 1px; left: 1px; width: 11px; height: 11px;
+  border-radius: 50%; background: var(--text-dim); transition: transform 0.15s ease, background 0.15s ease; }
+.tok-switch.on { background: var(--ok); border-color: var(--ok); }
+.tok-switch.on .tok-knob { transform: translateX(11px); background: #fff; }
+
+.init-tool.skill { background: var(--orch-bg, var(--hover)); border-style: dashed; }
+.init-tool.plugin { border-color: var(--accent-border); font-weight: 600; }
+.init-tool.subagent { opacity: 0.85; font-style: italic; }
 .chatbox-label { font-size: 11px; color: var(--text-dim); text-transform: uppercase;
   letter-spacing: 0.08em; margin-bottom: 6px; font-family: var(--mono); }
 .chat-form { display: flex; gap: 6px; align-items: flex-end; }

@@ -110,11 +110,14 @@ Writing is atomic: backend creates `<project_root>/<ID>/`, writes every file, th
 
 Required files generated per agent:
 
-- `<ID>/AGENT.md` — system prompt (Role, Required reads, Scope, Pre-flight, Output contract, Escalation triggers). Under ~80 lines. **No routing tables, no worker lists** — that information is injected at runtime by `_dispatch_instructions` from the live graph.
-- `<ID>/inputs/manifest.md` — YAML frontmatter + table of upstream artifacts (one row per parent).
-- `<ID>/outputs/manifest.md` — YAML frontmatter + table of produced artifacts.
-- `<ID>/state/progress.md` — initial bootstrap entry.
+- `<ID>/AGENT.md` — system prompt. Under ~80 lines. Sections: NOTICE, **Boot (ONE slim read-list — no second "Required reads" section; never reads the full `state/progress.md`, opens producer-manifest blobs on-demand only)**, Role, Boundaries (Always/Ask-first/Never), Deliverables, Handoff, Hard rules. **No routing tables, no worker lists** — injected at runtime by `_dispatch_instructions` from the live graph. Canonical reference: `TEMPLATE_AGENT/` at the repo root.
+- `<ID>/overview.md` — slim state pane (3 comment-delimited sections HEADER/BODY/FOOTER). BODY overwritten by the agent each turn; HEADER machine fields (`manifest_version` etc.) stamped by `_stamp_overview`. The parent routes off it (and off `children_status.json`) instead of loading full manifests.
+- `<ID>/inputs/manifest.md` — YAML frontmatter + pinned producer versions (tiny roll-up; the full `inputs/<PRODUCER>.md` blob is on-demand).
+- `<ID>/outputs/manifest.md` — YAML frontmatter + table of produced artifacts (points to PATHS, never data).
+- `<ID>/state/progress.md` — append-only log (control-plane rotates → `progress.json`, auto-injects recent slice; agent never reads the full file at boot).
 - `<ID>/context/code_map.md` — owned files + read-only references.
+
+> **Boot-cost refactor (2026-07):** the AGENT.md template (and the parent-bootstrap prompt in `_bootstrap_prompt`) encode the slim boot pattern — one read-list, slim reads only, blobs + full progress off the boot path. The old dual-list / blob-slurp / read-progress-at-boot template inflated per-boot context 6–14×. `TEMPLATE_AGENT/` at the repo root is the standalone canonical reference.
 
 The parent-generated bootstrap is what makes the agent contextually correct: BOSS that knows `paper/` exists will reference it directly in `inputs/manifest.md`, instead of leaving `(TBD)` placeholders.
 
@@ -362,13 +365,29 @@ endpoint instead of Anthropic's.
   **retire 2026-07-24** — do not default to them.
 - **Genuine asymmetries vs Claude (cannot be erased):** DeepSeek is **billed
   per-token** (API), unlike the Claude subscription. Context is 1M (at parity).
-- **Cumulative-usage gotcha (fixed in `_usage_ctx_tokens`):** DeepSeek's endpoint
-  reports `usage` SUMMED across every internal tool-use round (cumulative
-  `cache_read_input_tokens` reached ~1.8M in one turn) with an empty `iterations`
-  list. The naive sum pinned the context gauge at 100% and made auto-compact fire
-  every turn (thrashing `--resume`). `_usage_ctx_tokens(usage, window)` now detects
-  this (single-request total > window ⇒ cumulative) and falls back to
-  `input+output`. Claude's per-request totals stay < window, so it's unaffected.
+- **Cumulative-usage gotcha (`_usage_ctx_tokens`) — NOT DeepSeek-only:** an endpoint may
+  report `usage` SUMMED across every internal tool-use round (cumulative
+  `cache_read_input_tokens` reached ~1.8M in one turn) with an empty `iterations` list.
+  The naive sum pinned the context gauge at 100% and made auto-compact fire every turn
+  (thrashing `--resume`).
+  **The `iterations` list is the fix when present**: `_usage_ctx_tokens` returns
+  `max(per-request total)` over it, which IS true occupancy (e.g. aecbench/CRAFTER: 17.2M
+  top-level sum, but `max(iter)` = 374k — correct). The bug only bites when `iterations`
+  comes back **empty**, and that happens to **Claude too** — the old comment claiming
+  "Claude's per-request totals stay < window, so this branch never triggers for Claude"
+  was false: `cveval/VLM` (2.5M summed) and `dfu-pipeline/INTEGRITY` (1.3M summed) are both
+  `claude-sonnet-4-6` and both hit it.
+  The old fallback (`input + output`) was **measuring the wrong thing** — that is the size of
+  the NEW turn, while the bulk of a `--resume` context is `cache_read`, which it drops. It read
+  INTEGRITY as 6,278 tokens = **0.6%**, so auto-compact could never fire on precisely the
+  heaviest, most tool-happy agents — the feature silently disabled itself where it was needed
+  most. Fixed 2026-07-11: `_usage_ctx_tokens` now returns **`None`** ("occupancy unrecoverable")
+  and callers fall back to `_ctx_estimate_tokens` (chars/4 over persisted messages + system
+  prompt). Coarse, but it grows monotonically so the threshold actually trips.
+  ⚠️ **Known under-count**: the estimate only sees the `messages` table, so tool output the CLI
+  read internally (file reads, bash stdout) is invisible to it. On tool-heavy agents the estimate
+  is a FLOOR, not the truth. If a better signal appears (the CLI populating `iterations`
+  reliably), prefer it.
 - **Reload caveat:** WatchFiles `--reload` uses inotify, which does NOT fire for
   edits made on a DIFFERENT host over NFS. If you edit `backend/*.py` from
   login01 but uvicorn runs on login02, the reload won't trigger — restart the
@@ -389,7 +408,7 @@ endpoint instead of Anthropic's.
 
 The bootstrap-from-parent prompt (in `main.py:_bootstrap_prompt`) is a strict envelope: the parent must emit exactly the listed file blocks, each wrapped in `<file path="...">...</file>`, with no prose. The control plane parses with `_FILE_BLOCK_RE`. If the parent violates the format (no blocks, wrong paths), the modal surfaces it and the user is sent back to the form.
 
-Template generation lives in `projects.py:_AGENT_FILE_TEMPLATES` (5 templates) + `render_agent_files()`. Keep the AGENT.md template under ~80 lines and free of routing tables — the same rule we apply when prompting the parent.
+Template generation lives in `projects.py:_AGENT_TEMPLATE_FILES` (6 templates, incl. `overview.md`) + `render_agent_files()`, rendered from `app/backend/templates/agent/**`. Keep the AGENT.md template under ~80 lines, free of routing tables, and on the slim boot pattern (ONE read-list, no full-progress read, blobs on-demand) — the same rule applied when prompting the parent in `_bootstrap_prompt`.
 
 ## Adding a new project
 
@@ -404,7 +423,9 @@ Template generation lives in `projects.py:_AGENT_FILE_TEMPLATES` (5 templates) +
 - **No project-wide event bus**. Worker SSE events flow only through the parent chat that triggered them. If you open a separate worker chat window during a BOSS-triggered dispatch, it refreshes from db on `dispatch_started` / `agent_done` / `dispatch_complete` (mirror). Live token-by-token mirroring would need a pub/sub channel.
 - **Worker result feedback to orchestrator is solved by the dispatch ledger** (see the dedicated section above). Future work: an optional MCP tool surface so claude-native tool_result UX is available for Claude orchestrators without changing the persistence model.
 - **No idle reaper**. Sessions live forever. Plan: idle timeout + startup reaping with pid groups.
-- **Compaction: solved.** `/compact` (manual) and auto-compact (fires before a user turn when the session's last-turn context ≥ `_AUTO_COMPACT_PCT` = 80%): the agent summarises its own context, a fresh session is created seeded with that recap (`sessions.seed`, prepended once then cleared). Empty recap → rotate anyway, cold-start preamble covers recovery.
+- **Compaction: solved.** `/compact` (manual) and auto-compact: the agent summarises its own context, a fresh session is created seeded with that recap (`sessions.seed`, prepended once then cleared). Empty recap → rotate anyway, cold-start preamble covers recovery. Auto-compact fires BEFORE the turn runs, from **two** call-sites that together cover every way an agent can run: `_start_run.driver()` (user turns, scheduler fires, Telegram) and `_dispatched_run()` (a worker reached only via `<dispatch>` never touches `_start_run`, so without this its context grows unbounded). Torn sessions (`last_status != "ok"`) are skipped — they start fresh anyway.
+  - **Threshold is per-adapter** (`_auto_compact_pct`): **40%** for the reasoning adapters (glm/deepseek/grok — they over-think on large cached context; measured 2026-07-01) and **70%** for Claude, which does not. A single 40% tuned for the worst adapter doubled Claude's compaction rate for no benefit, and each compact costs a full extra turn on the largest session plus a lossy recap.
+  - **The numerator is the hard part** — see the `_usage_ctx_tokens` gotcha below. It is NOT DeepSeek-only.
 - **Cold-start preamble.** Any turn that cannot `--resume` (fresh/torn session) gets a deterministic recap prepended: latest `state/progress.md` sections + `state/children_status.json` (parents) + `inputs/manifest.md` head. Built in `_session_preamble`; a /compact seed takes precedence.
 - **Children rollup.** Every parent gets `state/children_status.json` auto-derived on each `/stats` call (and via `POST /api/projects/{slug}/rollup`): per-child status, context %, memory freshness + `stale_memory` flag, sha256 of progress.md. Read-only projection — never hand-edited, never a second source of truth.
 

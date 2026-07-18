@@ -5,6 +5,7 @@ import sqlite3
 import time
 import uuid
 from pathlib import Path
+from typing import Optional
 
 DB_PATH = Path(__file__).resolve().parent.parent / "agentui.db"
 
@@ -157,6 +158,40 @@ def init_db() -> None:
                 verified_at REAL NOT NULL,
                 PRIMARY KEY (project_slug, auditor, producer)
             );
+            -- Exact per-turn token accounting, harvested from the CLI transcript
+            -- (see tokens.py). One row per completed turn; the columns are a DELTA
+            -- against everything already recorded for that claude_session_id, so
+            -- SUM(rows) = the session's lifetime billing and never double-counts the
+            -- requests an earlier turn already booked.
+            CREATE TABLE IF NOT EXISTS token_turns (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                project_slug TEXT NOT NULL,
+                agent_id TEXT NOT NULL,
+                claude_session_id TEXT NOT NULL,
+                created_at REAL NOT NULL,
+                requests INTEGER NOT NULL DEFAULT 0,
+                input_tokens INTEGER NOT NULL DEFAULT 0,
+                cache_creation INTEGER NOT NULL DEFAULT 0,
+                cache_read INTEGER NOT NULL DEFAULT 0,
+                output_tokens INTEGER NOT NULL DEFAULT 0,
+                occupancy INTEGER NOT NULL DEFAULT 0
+            );
+            CREATE INDEX IF NOT EXISTS idx_token_turns_agent
+                ON token_turns(project_slug, agent_id);
+            -- Daily snapshot of each agent's FIXED context cost (system prompt + the
+            -- files its pre-flight block reads every session — see fixed_cost.py). One
+            -- row per agent per day; it drifts as progress/state files grow and shrink,
+            -- so the daily series shows that trend. PK makes the daily write idempotent.
+            CREATE TABLE IF NOT EXISTS fixed_cost_daily (
+                project_slug TEXT NOT NULL,
+                agent_id TEXT NOT NULL,
+                day TEXT NOT NULL,
+                tokens INTEGER NOT NULL,
+                system_prompt INTEGER NOT NULL DEFAULT 0,
+                preflight INTEGER NOT NULL DEFAULT 0,
+                updated_at REAL NOT NULL,
+                PRIMARY KEY (project_slug, agent_id, day)
+            );
             """
         )
         # backward-compat: add grok_model column if older db
@@ -168,6 +203,16 @@ def init_db() -> None:
         _ensure_column(c, "sessions", "usage", "TEXT")
         # one-time context seed (compact recap) prepended to this session's next turn
         _ensure_column(c, "sessions", "seed", "TEXT")
+        # CLI `system/init` payload (model, cwd, tools) of this session's last turn.
+        # Persisted because the init card + the node panel's tools list must survive a
+        # browser reload and be visible while the agent is idle — an in-memory-only copy
+        # exists solely for the duration of a live stream.
+        _ensure_column(c, "sessions", "init_meta", "TEXT")
+        # Model that actually served each booked turn (from the transcript, not the
+        # current override) — lets the dashboard split token usage by model over time,
+        # accurate even after the agent's /adapter changes. NULL on rows booked before
+        # this column existed; the frontend falls back to the agent's current model.
+        _ensure_column(c, "token_turns", "model", "TEXT")
 
 
 def get_or_create_active_session(project_slug: str, agent_id: str) -> dict:
@@ -279,6 +324,151 @@ def set_session_usage(session_id: str, usage: dict) -> None:
         c.execute(
             "UPDATE sessions SET usage=? WHERE id=?",
             (json.dumps(usage), session_id),
+        )
+
+
+def session_token_booked(claude_session_id: str) -> dict:
+    """What has already been recorded for this claude session, so a new scan of the
+    transcript can be booked as a delta instead of re-counting old requests."""
+    with _conn() as c:
+        row = c.execute(
+            "SELECT COALESCE(SUM(requests),0) AS requests, "
+            "COALESCE(SUM(input_tokens),0) AS input_tokens, "
+            "COALESCE(SUM(cache_creation),0) AS cache_creation, "
+            "COALESCE(SUM(cache_read),0) AS cache_read, "
+            "COALESCE(SUM(output_tokens),0) AS output_tokens "
+            "FROM token_turns WHERE claude_session_id=?",
+            (claude_session_id,),
+        ).fetchone()
+    return dict(row) if row else {}
+
+
+def add_token_turn(project_slug: str, agent_id: str, claude_session_id: str,
+                   requests: int, input_tokens: int, cache_creation: int,
+                   cache_read: int, output_tokens: int, occupancy: int,
+                   model: Optional[str] = None, created_at: Optional[float] = None) -> None:
+    with _conn() as c:
+        c.execute(
+            "INSERT INTO token_turns (project_slug, agent_id, claude_session_id, created_at,"
+            " requests, input_tokens, cache_creation, cache_read, output_tokens, occupancy, model)"
+            " VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+            (project_slug, agent_id, claude_session_id, created_at or time.time(), requests,
+             input_tokens, cache_creation, cache_read, output_tokens, occupancy, model),
+        )
+
+
+def upsert_fixed_cost(project_slug: str, agent_id: str, day: str,
+                      tokens: int, system_prompt: int, preflight: int) -> None:
+    """Record (or overwrite) today's fixed-cost snapshot for one agent. Idempotent per
+    day via the PK — the hourly rotator can call it repeatedly; it just refreshes today."""
+    with _conn() as c:
+        c.execute(
+            "INSERT INTO fixed_cost_daily (project_slug, agent_id, day, tokens,"
+            " system_prompt, preflight, updated_at) VALUES (?,?,?,?,?,?,?)"
+            " ON CONFLICT(project_slug, agent_id, day) DO UPDATE SET"
+            " tokens=excluded.tokens, system_prompt=excluded.system_prompt,"
+            " preflight=excluded.preflight, updated_at=excluded.updated_at",
+            (project_slug, agent_id, day, tokens, system_prompt, preflight, time.time()),
+        )
+
+
+def fixed_cost_series(days: int = 30) -> list[dict]:
+    """Daily fixed-cost snapshots across all agents, for the trend view."""
+    with _conn() as c:
+        rows = c.execute(
+            "SELECT project_slug, agent_id, day, tokens, system_prompt, preflight"
+            " FROM fixed_cost_daily WHERE day >= date('now', ?) ORDER BY day ASC",
+            (f"-{int(days)} days",),
+        ).fetchall()
+    return [dict(r) for r in rows]
+
+
+def delete_all_token_turns() -> int:
+    """Wipe the token ledger — used by the transcript-truth rebuild. The transcript is
+    the source of truth, so a full rebuild reconstructs every row (with correct dates),
+    losing nothing that isn't re-derivable from the JSONL files."""
+    with _conn() as c:
+        return c.execute("DELETE FROM token_turns").rowcount
+
+
+def token_series(bucket: str = "hour", hours: int = 48) -> list[dict]:
+    """Token usage bucketed over time, split per project+agent — the dashboard's
+    time series. `bucket` ∈ {'15m','hour','day','week'}; `hours` bounds the lookback.
+
+    Grouped in SQL rather than in Python because token_turns grows unbounded and the
+    dashboard polls: let SQLite do the reduction and ship only the buckets.
+
+    '15m' floors the epoch to 900s then formats it — strftime alone has no sub-hour
+    granularity. 'week' uses ISO-ish %Y-W%W so long ranges stay a handful of bars.
+    """
+    if bucket == "15m":
+        # floor to 15-minute grid, then render as local HH:MM
+        expr = ("strftime('%Y-%m-%d %H:%M', CAST(created_at/900 AS INT)*900,"
+                " 'unixepoch', 'localtime')")
+    elif bucket == "week":
+        expr = "strftime('%Y-W%W', created_at, 'unixepoch', 'localtime')"
+    elif bucket == "day":
+        expr = "strftime('%Y-%m-%d', created_at, 'unixepoch', 'localtime')"
+    else:
+        expr = "strftime('%Y-%m-%d %H:00', created_at, 'unixepoch', 'localtime')"
+    since = time.time() - hours * 3600
+    with _conn() as c:
+        rows = c.execute(
+            f"SELECT {expr} AS bucket,"
+            "  project_slug, agent_id, model,"
+            "  COALESCE(SUM(output_tokens),0) AS output_tokens,"
+            "  COALESCE(SUM(input_tokens),0) AS input_tokens,"
+            "  COALESCE(SUM(cache_creation),0) AS cache_creation,"
+            "  COALESCE(SUM(cache_read),0) AS cache_read,"
+            "  COALESCE(SUM(requests),0) AS requests,"
+            "  COUNT(*) AS turns"
+            " FROM token_turns WHERE created_at >= ?"
+            # model in the GROUP BY so a mid-window /adapter switch shows as two
+            # slices for the same agent rather than being silently merged.
+            " GROUP BY bucket, project_slug, agent_id, model ORDER BY bucket ASC",
+            (since,),
+        ).fetchall()
+    return [dict(r) for r in rows]
+
+
+def token_totals_all() -> list[dict]:
+    """Lifetime totals per project+agent across every project (dashboard tables)."""
+    with _conn() as c:
+        rows = c.execute(
+            "SELECT project_slug, agent_id,"
+            "  COALESCE(SUM(requests),0) AS requests,"
+            "  COALESCE(SUM(input_tokens),0) AS input_tokens,"
+            "  COALESCE(SUM(cache_creation),0) AS cache_creation,"
+            "  COALESCE(SUM(cache_read),0) AS cache_read,"
+            "  COALESCE(SUM(output_tokens),0) AS output_tokens,"
+            "  COUNT(*) AS turns, MAX(created_at) AS last_at"
+            " FROM token_turns GROUP BY project_slug, agent_id"
+        ).fetchall()
+    return [dict(r) for r in rows]
+
+
+def agent_token_totals(project_slug: str) -> dict:
+    """Lifetime token totals per agent (across all its sessions)."""
+    with _conn() as c:
+        rows = c.execute(
+            "SELECT agent_id, COALESCE(SUM(requests),0) AS requests, "
+            "COALESCE(SUM(input_tokens),0) AS input_tokens, "
+            "COALESCE(SUM(cache_creation),0) AS cache_creation, "
+            "COALESCE(SUM(cache_read),0) AS cache_read, "
+            "COALESCE(SUM(output_tokens),0) AS output_tokens, "
+            "COUNT(*) AS turns, MAX(created_at) AS last_at "
+            "FROM token_turns WHERE project_slug=? GROUP BY agent_id",
+            (project_slug,),
+        ).fetchall()
+    return {r["agent_id"]: dict(r) for r in rows}
+
+
+def set_session_init(session_id: str, init: dict) -> None:
+    """Persist the CLI's `system/init` payload (model, cwd, tools) for this session."""
+    with _conn() as c:
+        c.execute(
+            "UPDATE sessions SET init_meta=? WHERE id=?",
+            (json.dumps(init), session_id),
         )
 
 
@@ -466,6 +656,17 @@ def consume_results(result_ids: list[int], session_id: str) -> None:
             f"WHERE id IN ({placeholders})",
             (time.time(), session_id, *result_ids),
         )
+
+
+def list_running_sessions() -> list[dict]:
+    """Sessions the previous process left mid-turn — used by the startup token sweep
+    (their finally-booking never ran) before cleanup_stale_running flips them."""
+    with _conn() as c:
+        rows = c.execute(
+            "SELECT project_slug, agent_id, claude_session_id FROM sessions "
+            "WHERE last_status='running' AND claude_session_id IS NOT NULL"
+        ).fetchall()
+    return [dict(r) for r in rows]
 
 
 def cleanup_stale_running() -> int:

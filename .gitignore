@@ -36,3 +36,12 @@ Thumbs.db
 
 # Node
 node_modules/
+
+# Caveman plugin clone (external repo, not part of AgentUI)
+caveman/
+
+# pdf_extractor corpus + outputs (bulk data, ~211MB — not source)
+pdf_extractor/input_test/
+pdf_extractor/output/
+pdf_extractor/jobs/logs/
+*.pdf

@@ -10,5 +10,6 @@
 {{date}} (bootstrap — never synced yet)
 
 ## Notes
-- Consumer MUST read `inputs/<PRODUCER>.md` for the detailed contract.
+- Read THIS file (pinned versions) at boot for the drift-check. Open the full
+  `inputs/<PRODUCER>.md` blob **on-demand only** — when actually consuming an artifact.
 - Version here ≠ producer's current version → re-run `sync.sh {{id}}`.
