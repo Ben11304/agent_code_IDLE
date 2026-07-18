@@ -15,7 +15,7 @@ import argparse
 import json
 import os
 from pathlib import Path
-from typing import List, Dict, Optional
+from typing import List, Dict, Optional, Tuple
 
 import fitz  # PyMuPDF
 import pdfplumber
@@ -53,6 +53,31 @@ def get_device(force: Optional[str] = None) -> str:
     return "cpu"
 
 
+def merge_fig_rects(
+    candidates: List[Tuple["fitz.Rect", List["fitz.Rect"]]]
+) -> List[Tuple["fitz.Rect", List["fitz.Rect"]]]:
+    """Union candidate figure regions that overlap, until no pair overlaps.
+
+    Each candidate is (expanded_region, [source placement bboxes]). Two regions
+    that intersect describe the same visual, so they collapse into one render.
+    """
+    items = [(fitz.Rect(r), list(src)) for r, src in candidates]
+    changed = True
+    while changed:
+        changed = False
+        out: List[Tuple[fitz.Rect, List[fitz.Rect]]] = []
+        for rect, src in items:
+            for i, (orect, osrc) in enumerate(out):
+                if orect.intersects(rect):
+                    out[i] = (orect | rect, osrc + src)
+                    changed = True
+                    break
+            else:
+                out.append((rect, src))
+        items = out
+    return items
+
+
 def extract_with_pymupdf(pdf_path: Path, out_dir: Path, dpi: int = 150) -> Dict:
     """Robust extraction using PyMuPDF only - always works."""
     print("[INFO] Using PyMuPDF for robust extraction...")
@@ -85,6 +110,10 @@ def extract_with_pymupdf(pdf_path: Path, out_dir: Path, dpi: int = 150) -> Dict:
         image_list = page.get_images(full=True)
         drawings = page.get_drawings()
         tdict = page.get_text("dict")
+
+        # (fig_rect, [source placement bboxes]) — merged before rendering so a
+        # figure tiled out of many small placements is not rendered once per tile.
+        candidates: List[Tuple[fitz.Rect, List[fitz.Rect]]] = []
 
         for img_index, img in enumerate(image_list):
             xref = img[0]
@@ -120,23 +149,34 @@ def extract_with_pymupdf(pdf_path: Path, out_dir: Path, dpi: int = 150) -> Dict:
 
                 # Safety clip + final small render padding
                 fig_rect = (fig_rect + (-4, -4, 4, 4)) & page.rect
+                candidates.append((fig_rect, [fitz.Rect(rect)]))
 
-                # Render
-                mat = fitz.Matrix(dpi / 72.0, dpi / 72.0)
-                pix = page.get_pixmap(matrix=mat, clip=fig_rect)
+        # Merge overlapping candidate regions. A figure built from many tiled
+        # placements (icon grids, sliced raster plots) yields hundreds of nearly
+        # identical expanded rects; without this each one renders its own PNG.
+        merged = merge_fig_rects(candidates)
 
-                fname = f"fig_p{page_num+1}_{img_index}_{rect_idx}.png"
-                fpath = figures_dir / fname
-                pix.save(str(fpath))
+        mat = fitz.Matrix(dpi / 72.0, dpi / 72.0)
+        for fig_idx, (fig_rect, src_rects) in enumerate(merged):
+            pix = page.get_pixmap(matrix=mat, clip=fig_rect)
 
-                # Keep original image placement bbox in metadata (the "location" you liked)
-                figure_list.append({
-                    "page": page_num + 1,
-                    "filename": fname,
-                    "bbox": [rect.x0, rect.y0, rect.x1, rect.y1],
-                    "label": f"Figure on page {page_num+1}",
-                    "path": f"figures/{fname}"
-                })
+            fname = f"fig_p{page_num+1}_{fig_idx}.png"
+            fpath = figures_dir / fname
+            pix.save(str(fpath))
+
+            # Keep original image placement bbox in metadata (the "location" you liked).
+            # bbox = union of the placements this figure was built from.
+            bbox = fitz.Rect(src_rects[0])
+            for r in src_rects[1:]:
+                bbox |= r
+            figure_list.append({
+                "page": page_num + 1,
+                "filename": fname,
+                "bbox": [bbox.x0, bbox.y0, bbox.x1, bbox.y1],
+                "n_placements": len(src_rects),
+                "label": f"Figure on page {page_num+1}",
+                "path": f"figures/{fname}"
+            })
 
         # Extract tables using pdfplumber (much better for structured tables in papers)
         try:
