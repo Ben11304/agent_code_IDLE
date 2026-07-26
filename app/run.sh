@@ -31,6 +31,15 @@ fi
 # with "CLI not found on PATH". Always assert the full set here.
 export PATH="/users/PGS0407/binben14/VietHuy/AI_AGENT_SYSTEM/bin:$HOME/.local/bin:$HOME/.grok/bin:$PATH"
 
+# RTK is shared by every AgentUI subprocess. Claude-family adapters use RTK's
+# global PreToolUse hook; Codex uses ~/.codex/AGENTS.md + RTK.md instructions.
+# Keeping ~/.local/bin explicit here also covers cron/keepalive's minimal PATH.
+if command -v rtk >/dev/null 2>&1; then
+  echo ">> $(rtk --version) available — Claude hook + Codex instructions enabled"
+else
+  echo ">> WARNING: rtk not found — agents will receive uncompressed shell output"
+fi
+
 # Ensure the aas CLI is executable — a git/rsync of AI_AGENT_SYSTEM can drop the
 # +x bit (mode 644), which silently breaks every agent's `aas ...` call with
 # "Permission denied" (exit 126). Re-assert it on each launch.

@@ -31,6 +31,7 @@ def init_db() -> None:
                 project_slug TEXT NOT NULL,
                 agent_id TEXT NOT NULL,
                 claude_session_id TEXT,
+                cli_adapter TEXT,
                 created_at REAL NOT NULL,
                 updated_at REAL NOT NULL,
                 last_status TEXT
@@ -51,6 +52,7 @@ def init_db() -> None:
                 grok_model TEXT,
                 deepseek_model TEXT,
                 glm_model TEXT,
+                codex_model TEXT,
                 model TEXT,  -- adapter override (claude|grok|deepseek|glm); wins over project.yaml
                 effort TEXT,
                 updated_at REAL NOT NULL,
@@ -103,6 +105,19 @@ def init_db() -> None:
                 ON sessions(project_slug, agent_id, updated_at DESC);
             CREATE INDEX IF NOT EXISTS idx_messages_session
                 ON messages(session_id, id);
+            CREATE TABLE IF NOT EXISTS cli_events (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                session_id TEXT NOT NULL,
+                kind TEXT NOT NULL,
+                tool TEXT,
+                target TEXT,
+                status TEXT,
+                event_key TEXT,
+                created_at REAL NOT NULL,
+                FOREIGN KEY(session_id) REFERENCES sessions(id)
+            );
+            CREATE INDEX IF NOT EXISTS idx_cli_events_session
+                ON cli_events(session_id, id);
             CREATE TABLE IF NOT EXISTS settings (
                 key TEXT PRIMARY KEY,
                 value TEXT NOT NULL
@@ -198,9 +213,11 @@ def init_db() -> None:
         _ensure_column(c, "agent_overrides", "grok_model", "TEXT")
         _ensure_column(c, "agent_overrides", "deepseek_model", "TEXT")
         _ensure_column(c, "agent_overrides", "glm_model", "TEXT")
+        _ensure_column(c, "agent_overrides", "codex_model", "TEXT")
         _ensure_column(c, "agent_overrides", "model", "TEXT")  # adapter override
         # latest real token usage from the CLI (JSON: input/output/cache buckets)
         _ensure_column(c, "sessions", "usage", "TEXT")
+        _ensure_column(c, "sessions", "cli_adapter", "TEXT")
         # one-time context seed (compact recap) prepended to this session's next turn
         _ensure_column(c, "sessions", "seed", "TEXT")
         # CLI `system/init` payload (model, cwd, tools) of this session's last turn.
@@ -302,6 +319,28 @@ def add_message(session_id: str, role: str, content: str, meta: dict | None = No
         return cur.lastrowid
 
 
+def add_cli_event(session_id: str, kind: str, tool: str = "", target: str = "",
+                  status: str = "", event_key: str | None = None) -> int:
+    """Persist adapter-neutral activity for CLIs without a Claude transcript."""
+    with _conn() as c:
+        cur = c.execute(
+            "INSERT INTO cli_events(session_id,kind,tool,target,status,event_key,created_at) "
+            "VALUES (?,?,?,?,?,?,?)",
+            (session_id, kind, tool, target, status, event_key, time.time()),
+        )
+        return cur.lastrowid
+
+
+def list_cli_events(session_id: str, since: int = 0, limit: int = 400) -> list[dict]:
+    with _conn() as c:
+        rows = c.execute(
+            "SELECT id,kind,tool,target,status,event_key,created_at FROM cli_events "
+            "WHERE session_id=? AND id>? ORDER BY id ASC LIMIT ?",
+            (session_id, max(0, since), limit),
+        ).fetchall()
+    return [dict(r) for r in rows]
+
+
 def update_session_status(session_id: str, status: str) -> None:
     with _conn() as c:
         c.execute(
@@ -310,12 +349,17 @@ def update_session_status(session_id: str, status: str) -> None:
         )
 
 
-def set_claude_session_id(session_id: str, claude_session_id: str) -> None:
+def set_cli_session_id(session_id: str, cli_session_id: str, adapter: str) -> None:
     with _conn() as c:
         c.execute(
-            "UPDATE sessions SET claude_session_id=? WHERE id=?",
-            (claude_session_id, session_id),
+            "UPDATE sessions SET claude_session_id=?, cli_adapter=? WHERE id=?",
+            (cli_session_id, adapter, session_id),
         )
+
+
+def set_claude_session_id(session_id: str, claude_session_id: str) -> None:
+    """Legacy compatibility helper; new call sites should identify the adapter."""
+    set_cli_session_id(session_id, claude_session_id, "claude")
 
 
 def set_session_usage(session_id: str, usage: dict) -> None:
@@ -487,7 +531,7 @@ def clear_session_seed(session_id: str) -> None:
 def get_agent_override(project_slug: str, agent_id: str) -> dict | None:
     with _conn() as c:
         row = c.execute(
-            "SELECT claude_model, grok_model, deepseek_model, glm_model, model, effort FROM agent_overrides "
+            "SELECT claude_model, grok_model, deepseek_model, glm_model, codex_model, model, effort FROM agent_overrides "
             "WHERE project_slug=? AND agent_id=?",
             (project_slug, agent_id),
         ).fetchone()
@@ -498,6 +542,7 @@ def get_agent_override(project_slug: str, agent_id: str) -> dict | None:
         "grok_model": row["grok_model"],
         "deepseek_model": row["deepseek_model"],
         "glm_model": row["glm_model"],
+        "codex_model": row["codex_model"],
         "model": row["model"],
         "effort": row["effort"],
     }
@@ -508,16 +553,17 @@ def set_agent_override(project_slug: str, agent_id: str,
                        grok_model: str | None,
                        deepseek_model: str | None,
                        glm_model: str | None,
-                       effort: str | None) -> None:
+                       codex_model: str | None = None,
+                       effort: str | None = None) -> None:
     with _conn() as c:
         c.execute(
-            "INSERT INTO agent_overrides(project_slug, agent_id, claude_model, grok_model, deepseek_model, glm_model, effort, updated_at) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?) "
+            "INSERT INTO agent_overrides(project_slug, agent_id, claude_model, grok_model, deepseek_model, glm_model, codex_model, effort, updated_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?) "
             "ON CONFLICT(project_slug, agent_id) DO UPDATE SET "
             "claude_model=excluded.claude_model, grok_model=excluded.grok_model, "
-            "deepseek_model=excluded.deepseek_model, glm_model=excluded.glm_model, "
+            "deepseek_model=excluded.deepseek_model, glm_model=excluded.glm_model, codex_model=excluded.codex_model, "
             "effort=excluded.effort, updated_at=excluded.updated_at",
-            (project_slug, agent_id, claude_model, grok_model, deepseek_model, glm_model, effort, time.time()),
+            (project_slug, agent_id, claude_model, grok_model, deepseek_model, glm_model, codex_model, effort, time.time()),
         )
 
 
@@ -531,6 +577,7 @@ def set_agent_adapter(project_slug: str, agent_id: str, adapter: str, model_id: 
         "grok": "grok_model",
         "deepseek": "deepseek_model",
         "glm": "glm_model",
+        "codex": "codex_model",
     }.get(adapter)
     if col is None:
         raise ValueError(f"unknown adapter: {adapter}")
@@ -552,7 +599,7 @@ def set_agent_adapter(project_slug: str, agent_id: str, adapter: str, model_id: 
 def list_agent_overrides(project_slug: str) -> dict[str, dict]:
     with _conn() as c:
         rows = c.execute(
-            "SELECT agent_id, claude_model, grok_model, deepseek_model, glm_model, model, effort FROM agent_overrides WHERE project_slug=?",
+            "SELECT agent_id, claude_model, grok_model, deepseek_model, glm_model, codex_model, model, effort FROM agent_overrides WHERE project_slug=?",
             (project_slug,),
         ).fetchall()
     return {r["agent_id"]: {
@@ -560,6 +607,7 @@ def list_agent_overrides(project_slug: str) -> dict[str, dict]:
         "grok_model": r["grok_model"],
         "deepseek_model": r["deepseek_model"],
         "glm_model": r["glm_model"],
+        "codex_model": r["codex_model"],
         "model": r["model"],
         "effort": r["effort"],
     } for r in rows}

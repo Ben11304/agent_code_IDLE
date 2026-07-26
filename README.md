@@ -1,6 +1,6 @@
 # agent_code_IDLE
 
-Localhost UI control plane for multi-agent workflows. Wraps subscription-backed CLIs (`claude`, `aas`) — no API key needed.
+Localhost UI control plane for multi-agent workflows. Wraps authenticated CLIs (`claude`, `aas`, `codex`) — no API key needed.
 
 Each project declares a graph of agents in `.agentui/project.yaml`. Orchestrator agents can auto-dispatch tasks to workers via XML tags parsed live from the stream; the user verifies dispatch happens by watching the graph light up. Floating windows let you chat with multiple agents simultaneously, VSCode-style.
 
@@ -12,7 +12,7 @@ cd app
 # → http://127.0.0.1:5174
 ```
 
-Requires `claude` CLI authenticated (subscription) and optionally `aas` for Grok nodes.
+Requires `claude` CLI authenticated (subscription), optionally `aas` for Grok nodes, or `codex login` for Codex nodes. Verify Codex automation with `codex exec --json "reply with ok"`.
 
 ## Deploy on a remote server
 
@@ -24,7 +24,7 @@ See [DEPLOY.md](DEPLOY.md) — SSH tunnel + systemd service.
 - **Floating windows**, draggable, resizable, hidable. Open multiple agents at once.
 - **Auto-dispatch + result feedback**: orchestrator emits `<dispatch agent="X">task</dispatch>`, backend parses live, fires worker, animates edge + worker node. After workers finish, a **dispatch ledger** + bounded auto-continuation feeds the worker outputs back into the orchestrator's next prompt as `<dispatch_result>` blocks, so the orchestrator can synthesise / chain / report inside the same SSE response (no more "still waiting" hallucinations). Design rationale in [docs/agentui-dispatch-spec.md](docs/agentui-dispatch-spec.md).
 - **Add agent through UI**: `+ agent` button opens a form. Default flow asks the first parent (e.g. BOSS) to **write the bootstrap files** based on its project context (streamed live, then previewed). Fallback to generic template if no parent or for speed. Backend atomically creates `<ID>/AGENT.md`, `inputs/manifest.md`, `outputs/manifest.md`, `state/progress.md`, `context/code_map.md` and appends to `project.yaml` (ruamel.yaml preserves comments).
-- **Mix Claude and Grok agents** in the same project graph. Each agent picks its adapter; the wrapper handles streaming, sessions, dispatch tags uniformly.
+- **Mix Claude, Grok, DeepSeek, GLM, and Codex agents** in one graph. Codex final messages arrive atomically while status and tool activity still stream.
 - **Slash commands** in chat input (`/help`, `/clear`, `/model`, `/effort`, `/focus`, `/dispatch`, `/stop`, `/status`)
 - **Workspace-wide folder tree** in the sidebar (project roots get a diamond marker); ⌥⌘C copy-path shortcut; click any file to open in a floating viewer (markdown render, code mono, PDF + images via browser, binary fallback with download)
 - **Markdown rendering** of agent output (marked + DOMPurify); dispatch tags become collapsed cards
@@ -51,7 +51,7 @@ See [CLAUDE.md](CLAUDE.md) for the full architecture, dispatch protocol, SSE eve
 
 ## Stack
 
-- Backend: FastAPI + SQLite, PTY-wrapped `claude -p` subprocess for true streaming
+- Backend: FastAPI + SQLite, PTY-wrapped `claude -p` plus pipe-based `codex exec --json`
 - Frontend: vanilla JS + SVG graph, marked.js for markdown, DOMPurify for sanitization
 - Dispatch: `<dispatch agent="WORKER_ID">task</dispatch>` parsed live in the SSE stream
 - Models: Claude opus 4.8 / 4.7, sonnet 4.6, haiku 4.5; Grok via `aas`

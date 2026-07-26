@@ -234,6 +234,17 @@ async def claude_stream(
                 usage = evt.get("usage") or {}
                 if usage:
                     yield {"type": "meta", "data": {"usage": usage}}
+                # claude -p exits 0 even when the RESULT is an error (is_error:
+                # true), e.g. a GLM/Z.ai 529 "overloaded" after the CLI's own
+                # internal retries are exhausted. Surface that as an `error`
+                # event (not `done`) so _claude_stream_with_overload_retry can
+                # detect the overload signature in the text and retry the whole
+                # turn — otherwise the wrapper sees a clean `done` and yields it
+                # immediately, giving the user a dead 529 with zero retries.
+                if evt.get("is_error"):
+                    yield {"type": "error",
+                           "message": final or "claude -p result flagged is_error (no text)"}
+                    return
                 yield {"type": "done", "text": final, "meta": {
                     "duration_ms": evt.get("duration_ms"),
                     "total_cost_usd": evt.get("total_cost_usd"),
@@ -263,6 +274,130 @@ async def claude_stream(
 
     # If we reached EOF without a "result" event, emit assembled as done.
     yield {"type": "done", "text": "".join(assembled), "meta": {"claude_session_id": claude_session_id}}
+
+
+# ---------------------------------------------------------------------------
+# Codex adapter — `codex exec --json` is already line-buffered JSONL, so unlike
+# the Node-based Claude CLI it intentionally uses ordinary stdout pipes.
+# ---------------------------------------------------------------------------
+
+def _codex_usage(raw: dict | None) -> dict:
+    """Normalize Codex counters into the existing, non-overlapping buckets."""
+    raw = raw or {}
+    total_input = int(raw.get("input_tokens") or raw.get("input") or 0)
+    cached = int(raw.get("cached_input_tokens") or raw.get("cached_input") or 0)
+    fresh = int(raw.get("fresh_input_tokens") or max(0, total_input - cached))
+    return {
+        "input_tokens": fresh,
+        "cache_read_input_tokens": cached,
+        "cache_creation_input_tokens": int(raw.get("cache_creation_input_tokens") or raw.get("cache_write_tokens") or 0),
+        "output_tokens": int(raw.get("output_tokens") or raw.get("output") or 0),
+    }
+
+
+async def codex_stream(
+    message: str,
+    system_prompt: str,
+    cwd: str,
+    model: str = "gpt-5.6-terra",
+    effort: str | None = None,
+    resume_session_id: str | None = None,
+) -> AsyncIterator[dict]:
+    if shutil.which("codex") is None:
+        yield {"type": "error", "message": "codex CLI not found on PATH"}
+        return
+
+    # JSON encoding is also valid for a TOML basic string and safely preserves
+    # quotes, newlines, backslashes, and long AGENT.md prompts.
+    config = [
+        "-c", f"developer_instructions={json.dumps(system_prompt or '')}",
+        "-c", 'approval_policy="never"',
+        "-c", 'sandbox_mode="danger-full-access"',
+        "--disable", "multi_agent",
+        "--model", model,
+        "--json",
+    ]
+    if effort and effort != "default":
+        config[0:0] = ["-c", f'model_reasoning_effort="{effort}"']
+    if resume_session_id:
+        cmd = ["codex", "exec", "resume", *config, resume_session_id, "-"]
+    else:
+        cmd = ["codex", "exec", "--cd", cwd, *config, "-"]
+
+    proc = await asyncio.create_subprocess_exec(
+        *cmd, stdin=asyncio.subprocess.PIPE, stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE, cwd=cwd,
+        env={**os.environ, "NO_COLOR": "1", "TERM": "dumb"},
+        limit=_READER_LIMIT,
+    )
+    assert proc.stdin and proc.stdout
+    proc.stdin.write(message.encode("utf-8"))
+    await proc.stdin.drain()
+    proc.stdin.close()
+
+    assembled: list[str] = []
+    thread_id: str | None = resume_session_id
+    usage: dict = {}
+    failed: str | None = None
+    while True:
+        try:
+            raw_line = await proc.stdout.readline()
+        except (ValueError, asyncio.LimitOverrunError):
+            continue
+        if not raw_line:
+            break
+        try:
+            evt = json.loads(raw_line.decode("utf-8", errors="replace"))
+        except json.JSONDecodeError:
+            continue
+        etype = evt.get("type")
+        if etype == "thread.started":
+            thread_id = evt.get("thread_id") or evt.get("thread", {}).get("id")
+            yield {"type": "meta", "data": {
+                "claude_session_id": thread_id, "cli_adapter": "codex",
+                "model": model, "cwd": cwd, "permission_mode": "danger-full-access",
+                "init": True,
+            }}
+        elif etype in ("turn.started", "item.started"):
+            yield {"type": "status", "status": "thinking"}
+        elif etype in ("item.completed", "item.updated"):
+            item = evt.get("item") or {}
+            kind = item.get("type")
+            if kind in ("agent_message", "message") and etype == "item.completed":
+                text = item.get("text") or item.get("content") or ""
+                if isinstance(text, list):
+                    text = "".join(p.get("text", "") for p in text if isinstance(p, dict))
+                if text:
+                    assembled.append(text)
+            elif kind in ("command_execution", "mcp_tool_call", "file_change", "tool_call"):
+                tool = item.get("name") or kind
+                inp = item.get("input") or {}
+                if kind == "command_execution":
+                    inp = {"command": item.get("command"), "status": item.get("status")}
+                elif kind == "file_change":
+                    inp = {"changes": item.get("changes") or []}
+                yield {"type": "tool_use", "tool": tool, "input": inp}
+        elif etype == "turn.completed":
+            usage = _codex_usage(evt.get("usage"))
+        elif etype in ("turn.failed", "error"):
+            err = evt.get("error") or evt.get("message") or "Codex turn failed"
+            failed = err.get("message", str(err)) if isinstance(err, dict) else str(err)
+
+    rc = await proc.wait()
+    stderr = (await proc.stderr.read()).decode("utf-8", errors="replace") if proc.stderr else ""
+    if failed or rc:
+        yield {"type": "error", "message": failed or f"codex exited {rc}: {stderr[:500]}"}
+        return
+    text = "".join(assembled)
+    if usage:
+        yield {"type": "meta", "data": {"usage": usage}}
+    # Codex agent messages arrive atomically in JSONL; emitting here preserves the
+    # existing dispatch/schedule parser without pretending token-level streaming.
+    if text:
+        yield {"type": "delta", "text": text}
+    yield {"type": "done", "text": text, "meta": {
+        "claude_session_id": thread_id, "cli_adapter": "codex", "usage": usage,
+    }}
 
 
 # ---------------------------------------------------------------------------
@@ -453,8 +588,10 @@ _OVERLOAD_PATTERNS = (
     "429", "rate limit", "rate_limit", "too many requests",
     "service may be temporarily",
 )
-# backoff seconds before each retry (index 0 → before retry #1)
-_OVERLOAD_BACKOFF = (5.0, 12.0, 25.0)
+# backoff seconds before each retry (index 0 → before retry #1). Long tail for
+# sustained evening overload on Z.ai — a short 3-step schedule gave up while the
+# gateway was still saturated; this keeps retrying long enough for a slot to free.
+_OVERLOAD_BACKOFF = (5.0, 12.0, 25.0, 45.0, 90.0)
 
 
 def _event_is_overload(ev: dict) -> bool:
@@ -501,6 +638,12 @@ async def _claude_stream_with_overload_retry(
                 agent_id = ev.get("agent")
             if isinstance(ev, dict) and ev.get("type") in ("agent_done", "error"):
                 terminal = ev  # hold back until we know it's not overload
+                continue
+            # Belt-and-suspenders: a `done` whose text carries an overload
+            # signature (claude -p can surface 529 as an exit-0 result without
+            # is_error in some CLI builds) is also held back for retry.
+            if isinstance(ev, dict) and ev.get("type") == "done" and _event_is_overload(ev):
+                terminal = ev
                 continue
             yield ev
         if terminal is None:
@@ -638,4 +781,6 @@ def get_stream(model: str):
         return deepseek_stream
     if model == "glm":
         return glm_stream
+    if model == "codex":
+        return codex_stream
     raise AdapterError(f"unknown model adapter: {model}")

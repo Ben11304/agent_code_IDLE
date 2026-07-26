@@ -8,6 +8,7 @@ Hướng dẫn copy thư mục này lên server cá nhân và chạy. Chỉ dùn
 - Python 3.9 trở lên
 - Node 18 trở lên (để cài claude CLI)
 - Tài khoản Anthropic Pro hoặc Max
+- (Tuỳ chọn) Codex CLI và tài khoản đã đăng nhập nếu dùng adapter Codex
 - Có thể SSH vào server
 
 ## Bước 1. Cài runtime trên server
@@ -19,6 +20,11 @@ SSH vào server, cài đặt một lần.
 curl -fsSL https://claude.ai/install.sh | bash
 # kiểm tra
 claude --version
+
+# Codex CLI (nếu dùng Codex adapter)
+codex --version
+codex login
+codex exec --json "reply with ok"
 
 # python venv module (Debian/Ubuntu thường thiếu)
 sudo apt-get install -y python3-venv python3-pip   # nếu Ubuntu
@@ -38,6 +44,10 @@ claude auth
 Lệnh sẽ in một URL và device code. Mở URL trên máy local trong browser, dán code, đăng nhập Anthropic, xác nhận device. Sau khi `claude --version` chạy được và `claude -p hello` trả lời được là OK.
 
 Login lưu trong `~/.config/anthropic/` hoặc `~/.claude/`, persist giữa các phiên SSH. Không cần lặp lại.
+
+Codex dùng authentication đã lưu của CLI, không dùng OpenAI API key. Adapter chạy với
+`danger-full-access` và approval `never`; đây là quyền rất rộng, chỉ bật trên máy/project
+bạn tin cậy và đã cô lập phù hợp.
 
 ## Bước 3. Copy thư mục lên server
 

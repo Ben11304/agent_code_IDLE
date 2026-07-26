@@ -274,6 +274,7 @@ def api_project(slug: str):
         a["default_grok_model"] = a.get("grok_model") or "grok-build"
         a["default_deepseek_model"] = a.get("deepseek_model") or "deepseek-v4-flash"
         a["default_glm_model"] = a.get("glm_model") or "glm-4.6"  # glm-4.6 | glm-5.2
+        a["default_codex_model"] = a.get("codex_model") or "gpt-5.6-terra"
         a["default_effort"] = a.get("effort")
         if ov.get("claude_model"):
             a["claude_model"] = ov["claude_model"]
@@ -283,6 +284,8 @@ def api_project(slug: str):
             a["deepseek_model"] = ov["deepseek_model"]
         if ov.get("glm_model"):
             a["glm_model"] = ov["glm_model"]
+        if ov.get("codex_model"):
+            a["codex_model"] = ov["codex_model"]
         if ov.get("model"):
             a["model"] = ov["model"]  # adapter override wins over project.yaml
         if "effort" in ov:
@@ -362,8 +365,10 @@ _MODEL_CONTEXT_WINDOWS = {
     "glm-4.6": 200_000,
     "glm-5.2": 1_000_000,
     "glm-4.5-air": 128_000,
+    "gpt-5.6-terra": 400_000,
+    "gpt-5.6-sol": 400_000,
 }
-_CONTEXT_WINDOWS = {"claude": 200_000, "grok": 256_000, "deepseek": 1_000_000, "glm": 200_000}  # adapter fallback
+_CONTEXT_WINDOWS = {"claude": 200_000, "grok": 256_000, "deepseek": 1_000_000, "glm": 200_000, "codex": 400_000}  # adapter fallback
 
 
 def _context_window_for(model_kind: str, model_id: Optional[str]) -> int:
@@ -540,6 +545,13 @@ def _file_hash(project_root: str, rel_path: Optional[str]) -> Optional[str]:
 # has been working without persisting — the exact "active 6h ago, memory 9 days
 # stale" failure the rollup is meant to surface. Threshold: 6 hours.
 _STALE_MEMORY_GAP_S = 6 * 3600
+# Overview BODY staleness — the agent owns its overview BODY (control-plane only
+# stamps HEADER/FOOTER machine fields), so a full-but-wrong body passes
+# body_incomplete:false and rots silently. This is the floor: a body older than
+# this is flagged regardless of activity (catches the BOSS-2026-06-27 case where
+# the agent read the live rollup every turn but never mirrored it back).
+_STALE_BODY_ABS_S = 14 * 24 * 3600
+_STALE_BODY_GRACE_S = 60  # ignore sub-minute mtime skew between sibling files
 
 # status (raw session state) → coarse job status for the parent rollup. We only
 # emit what we can actually observe; we do NOT fabricate "done"/"blocked".
@@ -671,6 +683,8 @@ def api_project_stats(slug: str):
             eff_model = ov.get("deepseek_model") or a.get("deepseek_model") or "deepseek-v4-flash"
         elif model_kind == "glm":
             eff_model = ov.get("glm_model") or a.get("glm_model") or "glm-4.6"
+        elif model_kind == "codex":
+            eff_model = ov.get("codex_model") or a.get("codex_model") or "gpt-5.6-terra"
         else:
             eff_model = ov.get("claude_model") or a.get("claude_model") or "claude-sonnet-4-6"
         effort = ov.get("effort") if (ov and "effort" in ov) else a.get("effort")
@@ -684,10 +698,14 @@ def api_project_stats(slug: str):
         # Preferred source: the CLI transcript. It reports the usage the SERVER returned
         # per request, so max(input+cache_creation+cache_read) IS the context occupancy —
         # no cumulative-vs-occupancy ambiguity and nothing the CLI injected is missed.
+        codex_ctx = agent_log.codex_context(sess["claude_session_id"]) \
+            if sess and sess.get("claude_session_id") and model_kind == "codex" else None
+        if codex_ctx and codex_ctx.get("window"):
+            window = codex_ctx["window"]
         scanned = tokens.scan(sess["claude_session_id"]) \
-            if sess and sess.get("claude_session_id") else None
-        ctx_tokens = scanned["occupancy"] if scanned else None
-        token_source = "transcript"
+            if sess and sess.get("claude_session_id") and model_kind != "codex" else None
+        ctx_tokens = codex_ctx["occupancy"] if codex_ctx else (scanned["occupancy"] if scanned else None)
+        token_source = "codex" if codex_ctx else "transcript"
         if ctx_tokens is None:
             ctx_tokens = _usage_ctx_tokens(usage, window) if usage else None
             token_source = "exact"
@@ -744,6 +762,7 @@ class AgentSettings(BaseModel):
     grok_model: Optional[str] = None
     deepseek_model: Optional[str] = None
     glm_model: Optional[str] = None
+    codex_model: Optional[str] = None
     effort: Optional[str] = None
 
 
@@ -758,6 +777,7 @@ class NewAgent(BaseModel):
     grok_model: Optional[str] = None
     deepseek_model: Optional[str] = None
     glm_model: Optional[str] = None
+    codex_model: Optional[str] = None
     effort: Optional[str] = None
     system_prompt_file: Optional[str] = ""
     cwd: Optional[str] = "."
@@ -771,8 +791,8 @@ def _validate_new_agent(slug: str, body: "NewAgent") -> dict:
         raise HTTPException(404, "project not found")
     if not _AGENT_ID_RE.match(body.id):
         raise HTTPException(400, "id must be uppercase letters/digits/underscore starting with a letter")
-    if body.model not in ("claude", "grok", "deepseek", "glm"):
-        raise HTTPException(400, "model must be 'claude', 'grok', 'deepseek', or 'glm'")
+    if body.model not in ("claude", "grok", "deepseek", "glm", "codex"):
+        raise HTTPException(400, "model must be claude, grok, deepseek, glm, or codex")
     existing = {a["id"] for a in project["agents"]}
     if body.id in existing:
         raise HTTPException(409, f"agent id already exists: {body.id}")
@@ -1034,8 +1054,8 @@ def _validate_project_agents(agents: list) -> None:
     for a in agents:
         if not _AGENT_ID_RE.match(a.get("id") or ""):
             raise HTTPException(400, f"invalid agent id (must be UPPERCASE): {a.get('id')}")
-        if a.get("model", "claude") not in ("claude", "grok", "deepseek", "glm"):
-            raise HTTPException(400, f"model must be claude|grok|deepseek|glm: {a.get('id')}")
+        if a.get("model", "claude") not in ("claude", "grok", "deepseek", "glm", "codex"):
+            raise HTTPException(400, f"model must be claude|grok|deepseek|glm|codex: {a.get('id')}")
         for p in a.get("parents") or []:
             if p not in ids:
                 raise HTTPException(400, f"parent '{p}' is not in the project (agent {a.get('id')})")
@@ -1082,6 +1102,7 @@ def api_set_agent_settings(slug: str, agent_id: str, body: AgentSettings):
                           grok_model=body.grok_model,
                           deepseek_model=body.deepseek_model,
                           glm_model=body.glm_model,
+                          codex_model=body.codex_model,
                           effort=body.effort)
     return {"ok": True}
 
@@ -1097,6 +1118,7 @@ _ADAPTER_DEFAULT_MODEL = {
     "grok": "grok-build",
     "deepseek": "deepseek-v4-flash",
     "glm": "glm-4.6",
+    "codex": "gpt-5.6-terra",
 }
 
 
@@ -1108,10 +1130,20 @@ def api_set_agent_adapter(slug: str, agent_id: str, body: AdapterSwitch):
     found = projects.get_agent(slug, agent_id)
     if not found:
         raise HTTPException(404, "agent not found")
-    if body.adapter not in ("claude", "grok", "deepseek", "glm"):
-        raise HTTPException(400, "adapter must be 'claude', 'grok', 'deepseek', or 'glm'")
+    if body.adapter not in ("claude", "grok", "deepseek", "glm", "codex"):
+        raise HTTPException(400, "adapter must be claude, grok, deepseek, glm, or codex")
+    current = (db.get_agent_override(slug, agent_id) or {}).get("model") or found[1].get("model", "claude")
+    rotated = current != body.adapter
+    if rotated:
+        _book_current_session_tokens(slug, agent_id)
+        db.new_session(slug, agent_id)
     db.set_agent_adapter(slug, agent_id, body.adapter, body.model or _ADAPTER_DEFAULT_MODEL[body.adapter])
-    return {"ok": True}
+    # Return the canonical, override-enriched project in the same response. This
+    # removes the frontend's second-fetch race and guarantees every node/header
+    # repaints from exactly the state that was committed above.
+    return {"ok": True, "adapter": body.adapter,
+            "model": body.model or _ADAPTER_DEFAULT_MODEL[body.adapter],
+            "session_rotated": rotated, "project": api_project(slug)}
 
 
 @app.get("/api/skills")
@@ -1594,6 +1626,17 @@ async def _run_agent(
         )
     # ----- END VERSION-PIN DRIFT -----
 
+    # ----- OVERVIEW BODY STALENESS (spec §6.5 sibling) -----
+    # The agent owns its overview BODY; control-plane stamps only HEADER/FOOTER.
+    # A full-but-stale body is invisible to body_incomplete, so surface it here.
+    body_stale = _check_overview_staleness(project["root"], project, agent_id)
+    if body_stale:
+        message = (
+            "[CONTROL-PLANE STALE-BODY] Your overview.md BODY is stale: "
+            + body_stale + ".\n\n" + message
+        )
+    # ----- END OVERVIEW BODY STALENESS -----
+
     # ----- OPEN-DISSENT GATE (spec §15.2 forcing function) -----
     # An orchestrator (agent with children) cannot silently proceed while a worker's
     # dissent is open — prepend it so the model MUST ratify/overrule. The flag stays
@@ -1638,7 +1681,9 @@ async def _run_agent(
     # browser disconnected mid-stream — claude server state may be torn), or
     # "error" cannot be safely resumed: claude --resume into a half-finished
     # state often returns empty or hangs silently. Better to start fresh.
-    resume_sid = sess.get("claude_session_id") if sess.get("last_status") == "ok" else None
+    resume_sid = (sess.get("claude_session_id")
+                  if sess.get("last_status") == "ok" and sess.get("cli_adapter") in (None, model)
+                  else None)
 
     # ----- COLD-START PREAMBLE -----
     # No resumable CLI session → the model wakes up with amnesia (only AGENT.md).
@@ -1693,6 +1738,16 @@ async def _run_agent(
             cwd=cwd,
             model=override.get("glm_model") or agent.get("glm_model") or "glm-4.6",
             effort=effort,
+            resume_session_id=resume_sid,
+        )
+    elif model == "codex":
+        codex_effort = effort if effort in (None, "default", "low", "medium", "high", "xhigh") else None
+        agen = stream_fn(
+            message=message,
+            system_prompt=system_prompt,
+            cwd=cwd,
+            model=override.get("codex_model") or agent.get("codex_model") or "gpt-5.6-terra",
+            effort=codex_effort,
             resume_session_id=resume_sid,
         )
     else:
@@ -1776,7 +1831,7 @@ async def _run_agent(
                 data = evt.get("data") or {}
                 if data.get("claude_session_id"):
                     claude_sid = data["claude_session_id"]
-                    db.set_claude_session_id(sess["id"], claude_sid)
+                    db.set_cli_session_id(sess["id"], claude_sid, data.get("cli_adapter") or model)
                 if data.get("init"):
                     # The init card and the node panel's tools list must be visible on
                     # an idle agent and survive a browser reload, so the payload is
@@ -1788,12 +1843,26 @@ async def _run_agent(
                 await emit({"type": "meta", "agent": agent_id, "data": data})
             elif etype == "thinking":
                 await emit({"type": "thinking", "agent": agent_id, "text": evt.get("text", "")})
+            elif etype == "status":
+                await emit({"type": "status", "agent": agent_id,
+                            "status": evt.get("status", "responding")})
             elif etype == "tool_use":
                 # Adapter surfaced a tool call (Read/Grep/Glob/Edit/Write/Bash/
                 # MCP...) with its parsed input. Forward as-is so the UI can
                 # render a "files / commands accessed" bubble per agent.
+                tool_name = evt.get("tool") or "?"
+                tool_input = evt.get("input") or {}
+                if model == "codex":
+                    try:
+                        target = agent_log._target(tool_name, tool_input)
+                        raw_status = str(tool_input.get("status") or "").lower()
+                        log_status = ("err" if raw_status in ("failed", "error") else
+                                      "ok" if raw_status in ("completed", "success", "ok") else "…")
+                        db.add_cli_event(sess["id"], "tool", tool_name, target, log_status)
+                    except Exception:
+                        pass
                 await emit({"type": "tool_use", "agent": agent_id,
-                            "tool": evt.get("tool"), "input": evt.get("input") or {}})
+                            "tool": tool_name, "input": tool_input})
             elif etype == "done":
                 pass  # finalize below
             elif etype == "error":
@@ -1845,7 +1914,19 @@ async def _run_agent(
         # against what earlier turns of this claude session already recorded.
         try:
             # to_thread — same event-loop-starvation reason as the compact-path scan.
-            delta = await asyncio.to_thread(_book_session_tokens, slug, agent_id, claude_sid)
+            if model == "codex" and claude_sid and last_usage and final_status == "ok":
+                fresh = int(last_usage.get("input_tokens") or 0)
+                cached = int(last_usage.get("cache_read_input_tokens") or 0)
+                cache_write = int(last_usage.get("cache_creation_input_tokens") or 0)
+                output = int(last_usage.get("output_tokens") or 0)
+                occupancy = fresh + cached + cache_write + output
+                eff_codex_model = override.get("codex_model") or agent.get("codex_model") or "gpt-5.6-terra"
+                db.add_token_turn(slug, agent_id, claude_sid, 1, fresh, cache_write,
+                                  cached, output, occupancy, model=eff_codex_model)
+                delta = {"requests": 1, "input_tokens": fresh, "cache_creation": cache_write,
+                         "cache_read": cached, "output_tokens": output, "occupancy": occupancy}
+            else:
+                delta = await asyncio.to_thread(_book_session_tokens, slug, agent_id, claude_sid)
             if delta:
                 await emit({"type": "token_turn", "agent": agent_id, "usage": {
                     "requests": delta["requests"],
@@ -2127,6 +2208,59 @@ def _check_version_pins(project_root: str, project: dict, agent_id: str) -> list
     return drift
 
 
+def _check_overview_staleness(project_root: str, project: dict, agent_id: str) -> Optional[str]:
+    """Overview BODY staleness — the agent owns its overview BODY (control-plane
+    only stamps HEADER/FOOTER), so a full-but-wrong body passes body_incomplete:
+    false and rots silently. Mirror the stale_memory idea onto the BODY.
+
+    Two signals, either fires:
+      (1) RELATIVE — for an orchestrator, BODY mtime older than its
+          state/children_status.json (the live rollup it is supposed to summarize);
+          for a leaf, BODY mtime older than its own outputs/manifest.md (producer
+          bumped but body not refreshed). Catches "read live data, route off it,
+          never wrote it back".
+      (2) ABSOLUTE — BODY older than _STALE_BODY_ABS_S regardless of activity.
+    Returns a human warning string, or None when fresh / no overview / body incomplete.
+    """
+    agents = {a["id"]: a for a in project["agents"]}
+    agent = agents.get(agent_id)
+    if not agent:
+        return None
+    adir = _agent_dir(project_root, agent, projects.resolve_cwd(project_root, agent.get("cwd", ".")))
+    ov = adir / "overview.md"
+    if not ov.is_file():
+        return None
+    # Skip if BODY is already flagged incomplete — that is surfaced separately.
+    if _read_overview_flag(adir) is True:
+        return None
+    try:
+        ov_mtime = ov.stat().st_mtime
+    except OSError:
+        return None
+    now = time.time()
+
+    has_children = any(agent_id in (a.get("parents") or []) for a in project["agents"])
+    ref_path = adir / "state" / "children_status.json" if has_children \
+        else adir / "outputs" / "manifest.md"
+    ref_label = "state/children_status.json (live rollup you must summarize)" if has_children \
+        else "outputs/manifest.md (your own producer bump)"
+    try:
+        ref_mtime = ref_path.stat().st_mtime
+    except OSError:
+        ref_mtime = None
+
+    reasons: list[str] = []
+    if ref_mtime and ov_mtime + _STALE_BODY_GRACE_S < ref_mtime:
+        age = int(ref_mtime - ov_mtime)
+        reasons.append(f"BODY is {age//3600}h older than {ref_label}")
+    if now - ov_mtime > _STALE_BODY_ABS_S:
+        reasons.append(f"BODY untouched for {(now-ov_mtime)//86400}d (floor {_STALE_BODY_ABS_S//86400}d)")
+    if not reasons:
+        return None
+    return ("; ".join(reasons)) + " — rewrite the OVERVIEW:BODY block from the live "
+    "rollup this turn (control-plane only stamps HEADER/FOOTER; the BODY is yours)"
+
+
 def _handle_escalate(esc: dict, slug: str, project: dict, agent_id: str) -> Optional[str]:
     """Route a worker's [ESCALATE] to its parent's dispatch ledger so the
     orchestrator picks it up next turn (reuses the ledger — no separate table).
@@ -2405,7 +2539,7 @@ async def _dispatched_run(slug, source_id, target_id, task, emit, tracker, chain
 # costs a full extra turn on the largest session plus a lossy recap. Claude keeps the
 # original 70%; the reasoning adapters keep the 40% that was measured for them.
 _AUTO_COMPACT_PCT = 40.0                        # default: glm / deepseek / grok
-_AUTO_COMPACT_PCT_BY_KIND = {"claude": 70.0}
+_AUTO_COMPACT_PCT_BY_KIND = {"claude": 70.0, "codex": 70.0}
 
 
 def _auto_compact_pct(model_kind: str) -> float:
@@ -2450,6 +2584,8 @@ async def _auto_compact_if_needed(slug: str, agent_id: str, emit) -> bool:
         eff_model = ov.get("deepseek_model") or agent.get("deepseek_model") or "deepseek-v4-flash"
     elif model_kind == "glm":
         eff_model = ov.get("glm_model") or agent.get("glm_model") or "glm-4.6"
+    elif model_kind == "codex":
+        eff_model = ov.get("codex_model") or agent.get("codex_model") or "gpt-5.6-terra"
     else:
         eff_model = ov.get("claude_model") or agent.get("claude_model") or "claude-sonnet-4-6"
     # Numerator, best source first: the CLI transcript gives real per-request occupancy,
@@ -2460,9 +2596,15 @@ async def _auto_compact_if_needed(slug: str, agent_id: str, emit) -> bool:
     # to_thread: the scan parses a transcript that can reach tens of MB over NFS.
     # Inline it would block the event loop — which also runs every PTY reader, so a
     # slow scan here froze a LIVE claude child mid-turn (observed 2026-07-16).
-    scanned = await asyncio.to_thread(tokens.scan, sess["claude_session_id"])
-    if scanned and window:
-        pct = round(min(100.0, scanned["occupancy"] / window * 100.0), 1)
+    codex_ctx = (await asyncio.to_thread(agent_log.codex_context, sess["claude_session_id"])) \
+        if model_kind == "codex" else None
+    if codex_ctx and codex_ctx.get("window"):
+        window = codex_ctx["window"]
+    scanned = (await asyncio.to_thread(tokens.scan, sess["claude_session_id"])) \
+        if model_kind != "codex" else None
+    if (codex_ctx or scanned) and window:
+        occupancy = codex_ctx["occupancy"] if codex_ctx else scanned["occupancy"]
+        pct = round(min(100.0, occupancy / window * 100.0), 1)
     else:
         est_chars = sum(len(m.get("content") or "") for m in db.get_messages(sess["id"]))
         est_tokens = _ctx_estimate_tokens(root, agent, est_chars)
@@ -2981,6 +3123,26 @@ async def api_agent_log(slug: str, agent_id: str, since: int = 0):
     csid = sess.get("claude_session_id") if sess else None
     if not csid:
         return {"events": [], "offset": 0, "session": None, "reset": False, "status": "no session"}
+    if sess.get("cli_adapter") == "codex":
+        persisted = await asyncio.to_thread(agent_log.codex_tail, csid, since)
+        if persisted.get("events") or persisted.get("offset", since) != since:
+            persisted["status"] = sess.get("last_status")
+            persisted["agent_running"] = any(
+                (not run.done) and run.slug == slug and run.agent_id == agent_id
+                for run in _RUNS.values())
+            return persisted
+        rows = db.list_cli_events(sess["id"], since)
+        events = [{
+            "ts": datetime.fromtimestamp(r["created_at"], timezone.utc).isoformat(),
+            "kind": r["kind"], "tool": r.get("tool") or "",
+            "target": r.get("target") or "", "status": r.get("status") or "",
+            "id": r.get("event_key"), "out_tokens": None, "round_tokens": None,
+        } for r in rows]
+        return {"events": events, "offset": rows[-1]["id"] if rows else since,
+                "session": csid, "reset": False, "seeded": False,
+                "status": sess.get("last_status"),
+                "agent_running": any((not run.done) and run.slug == slug and run.agent_id == agent_id
+                                     for run in _RUNS.values())}
     # The frontend passes back the session id it last polled; if the current session id
     # differs (a /clear created a new one), its byte offset is meaningless — tail from 0.
     res = await asyncio.to_thread(agent_log.tail, csid, since)
@@ -3024,6 +3186,8 @@ async def api_dashboard(bucket: str = "hour", hours: int = 48):
                 eff_model = ov.get("deepseek_model") or a.get("deepseek_model") or "deepseek-v4-flash"
             elif model_kind == "glm":
                 eff_model = ov.get("glm_model") or a.get("glm_model") or "glm-4.6"
+            elif model_kind == "codex":
+                eff_model = ov.get("codex_model") or a.get("codex_model") or "gpt-5.6-terra"
             else:
                 eff_model = ov.get("claude_model") or a.get("claude_model") or "claude-sonnet-4-6"
 
@@ -3031,7 +3195,12 @@ async def api_dashboard(bucket: str = "hour", hours: int = 48):
             sess = sessions[0] if sessions else None
             window = _context_window_for(model_kind, eff_model)
             ctx_tokens = None
-            if sess and sess.get("claude_session_id"):
+            if sess and sess.get("claude_session_id") and model_kind == "codex":
+                codex_ctx = await asyncio.to_thread(agent_log.codex_context, sess["claude_session_id"])
+                if codex_ctx:
+                    ctx_tokens = codex_ctx["occupancy"]
+                    window = codex_ctx.get("window") or window
+            if sess and sess.get("claude_session_id") and model_kind != "codex":
                 scanned = await asyncio.to_thread(tokens.scan, sess["claude_session_id"])
                 if scanned:
                     ctx_tokens = scanned["occupancy"]

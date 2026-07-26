@@ -1,11 +1,10 @@
 #!/usr/bin/env bash
 # Watchdog: restart AgentUI if 127.0.0.1:5174 stops answering.
-# Installed in crontab on ascend-login01 (server is node-local).
-#
-# OSC crontab is NFS-shared across login nodes: without this guard every login
-# node starts its own server and they all write the same SQLite file over NFS
-# (corruption risk). login01 is the canonical node — tunnels target it.
-[ "$(hostname -s)" = "ascend-login01" ] || exit 0
+# Installed in crontab (NFS-shared across login nodes) — the hostname gate below
+# makes ONLY the canonical node act, so every other login node exits 0 and never
+# starts a second server writing the same SQLite file over NFS (corruption risk).
+# Canonical node switched ascend-login01 → ascend-login02 on 2026-07-21.
+[ "$(hostname -s)" = "ascend-login02" ] || exit 0
 
 APP_DIR="/users/PGS0407/binben14/VietHuy/agent_code_IDLE/app"
 LOG="/tmp/agentui.log"

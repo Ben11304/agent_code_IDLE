@@ -16,6 +16,8 @@ from typing import Optional
 
 from . import tokens
 
+_CODEX_SESSIONS = Path.home() / ".codex" / "sessions"
+
 # Per tool, the one input field worth showing in a one-line log row.
 _TARGET_FIELDS = ("file_path", "command", "pattern", "path", "url", "query",
                   "notebook_path", "prompt")
@@ -134,3 +136,101 @@ def tail(claude_session_id: str, since: int = 0) -> dict:
 
     return {"events": events, "offset": offset, "session": claude_session_id,
             "reset": reset, "seeded": seeded}
+
+
+def codex_tail(session_id: str, since: int = 0) -> dict:
+    """Tail Codex's persisted rollout JSONL using the dashboard log contract."""
+    matches = list(_CODEX_SESSIONS.glob(f"**/*-{session_id}.jsonl"))
+    if not matches:
+        return {"events": [], "offset": since, "session": session_id, "reset": False}
+    path = max(matches, key=lambda p: p.stat().st_mtime)
+    try:
+        size = path.stat().st_size
+        reset = since > size
+        seeded = False
+        if since <= 0 and size > _SEED_BYTES:
+            start, seeded = size - _SEED_BYTES, True
+        else:
+            start = 0 if reset else since
+        with path.open("rb") as f:
+            f.seek(start)
+            raw = f.read()
+        offset = start + len(raw)
+    except OSError:
+        return {"events": [], "offset": since, "session": session_id, "reset": False}
+    lines = raw.split(b"\n")
+    if seeded and lines:
+        lines = lines[1:]
+    events: list[dict] = []
+    last_tool: dict | None = None
+    for line in lines:
+        try:
+            d = json.loads(line.decode("utf-8", errors="replace"))
+        except ValueError:
+            continue
+        if d.get("type") == "event_msg":
+            ep = d.get("payload") or {}
+            if ep.get("type") == "token_count" and last_tool is not None:
+                usage = ((ep.get("info") or {}).get("last_token_usage") or {})
+                last_tool["out_tokens"] = usage.get("output_tokens")
+                # Codex input_tokens already includes cached_input_tokens (confirmed
+                # by total_tokens=input_tokens+output_tokens), so use total_tokens
+                # directly; adding cached again would inflate dashboard billing.
+                last_tool["round_tokens"] = usage.get("total_tokens")
+                last_tool = None
+            continue
+        if d.get("type") != "response_item":
+            continue
+        p = d.get("payload") or {}
+        typ = p.get("type")
+        ts = d.get("timestamp") or ""
+        if typ in ("function_call", "custom_tool_call"):
+            try:
+                inp = (json.loads(p.get("arguments") or "{}") if typ == "function_call"
+                       else {"command": p.get("input") or ""})
+            except ValueError:
+                inp = {}
+            last_tool = {"ts": ts, "kind": "tool", "tool": p.get("name") or "?",
+                         "target": _target(p.get("name") or "", inp), "status": "…",
+                         "id": p.get("call_id"), "out_tokens": None, "round_tokens": None}
+            events.append(last_tool)
+        elif typ in ("function_call_output", "custom_tool_call_output") and p.get("call_id"):
+            output = str(p.get("output") or "")
+            status = "err" if ("Script failed" in output or
+                                 ("Process exited with code " in output and
+                                  "Process exited with code 0" not in output)) else "ok"
+            events.append({"ts": ts, "kind": "result", "id": p["call_id"], "status": status})
+    return {"events": events, "offset": offset, "session": session_id,
+            "reset": reset, "seeded": seeded}
+
+
+def codex_context(session_id: str) -> Optional[dict]:
+    """Latest real Codex request occupancy and runtime-advertised window."""
+    matches = list(_CODEX_SESSIONS.glob(f"**/*-{session_id}.jsonl"))
+    if not matches:
+        return None
+    path = max(matches, key=lambda p: p.stat().st_mtime)
+    try:
+        # token_count is near the tail; bound I/O for long-lived sessions.
+        size = path.stat().st_size
+        with path.open("rb") as f:
+            f.seek(max(0, size - 2 * 1024 * 1024))
+            raw = f.read()
+    except OSError:
+        return None
+    for line in reversed(raw.split(b"\n")):
+        try:
+            d = json.loads(line.decode("utf-8", errors="replace"))
+        except ValueError:
+            continue
+        p = d.get("payload") or {}
+        if d.get("type") != "event_msg" or p.get("type") != "token_count":
+            continue
+        info = p.get("info") or {}
+        usage = info.get("last_token_usage") or {}
+        occupancy = usage.get("total_tokens")
+        window = info.get("model_context_window")
+        if occupancy is not None:
+            return {"occupancy": int(occupancy), "window": int(window) if window else None,
+                    "usage": usage}
+    return None

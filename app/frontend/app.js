@@ -1238,10 +1238,12 @@ function nodeBodyHtml(a, stats, slug) {
   const sessTxt = stats.has_session
     ? `live${stats.num_sessions > 1 ? " · " + stats.num_sessions : ""}`
     : "fresh";
-  const exact = stats.token_source === "exact" || stats.token_source === "transcript";
+  const exact = stats.token_source === "exact" || stats.token_source === "transcript" || stats.token_source === "codex";
   const tokK = exact ? "tokens" : "≈ tokens";
   const ctxTitle = stats.token_source === "transcript"
     ? "exact occupancy — largest single API request in the CLI transcript"
+    : stats.token_source === "codex"
+    ? "exact occupancy — Codex CLI last_token_usage.total_tokens and runtime context window"
     : (exact ? "actual token count from CLI (latest turn)" : "chars/4 estimate — no completed turn yet");
   // Billing totals (lifetime, from token_turns). Distinct from context occupancy above:
   // cache_read is re-charged on every request, so this climbs far past the window.
@@ -1470,6 +1472,9 @@ function modelLabel(a) {
   }
   if (a.model === "glm") {
     return (a.glm_model || "glm-4.6");
+  }
+  if (a.model === "codex") {
+    return (a.codex_model || "gpt-5.6-terra");
   }
   return (a.claude_model || "claude-sonnet-4-6").replace(/^claude-/, "");
 }
@@ -1718,6 +1723,10 @@ const CLAUDE_MODELS = [
   { value: "claude-sonnet-4-6",   label: "sonnet 4.6" },
   { value: "claude-haiku-4-5",    label: "haiku 4.5"  },
 ];
+const CODEX_MODELS = [
+  { value: "gpt-5.6-terra", label: "gpt-5.6-terra" },
+  { value: "gpt-5.6-sol",   label: "gpt-5.6-sol"   },
+];
 const EFFORT_LEVELS = [
   { value: "",       label: "default" },
   { value: "low",    label: "low"     },
@@ -1739,10 +1748,12 @@ function renderChatHeader(w) {
     ? (agent.deepseek_model || agent.default_deepseek_model || "deepseek-v4-flash")
     : agent.model === "glm"
     ? (agent.glm_model || agent.default_glm_model || "glm-4.6")
+    : agent.model === "codex"
+    ? (agent.codex_model || agent.default_codex_model || "gpt-5.6-terra")
     : (agent.claude_model || agent.default_claude_model || "claude-sonnet-4-6").replace(/^claude-/, "");
   const curEffort = agent.effort || "";
 
-  const effortOpts = EFFORT_LEVELS.map((e) =>
+  const effortOpts = EFFORT_LEVELS.filter((e) => agent.model !== "codex" || e.value !== "max").map((e) =>
     `<option value="${e.value}"${e.value === curEffort ? " selected" : ""}>${e.label}</option>`
   ).join("");
 
@@ -1773,6 +1784,8 @@ function renderChatHeader(w) {
         await updateAgentSettings(w, null, null, a.deepseek_model || "deepseek-v4-flash", null, eff);
       } else if (a.model === "glm") {
         await updateAgentSettings(w, null, null, null, a.glm_model || "glm-4.6", eff);
+      } else if (a.model === "codex") {
+        await updateAgentSettings(w, null, null, null, null, eff, a.codex_model || "gpt-5.6-terra");
       } else {
         await updateAgentSettings(w, a.claude_model || "claude-sonnet-4-6", null, null, null, eff);
       }
@@ -1782,7 +1795,7 @@ function renderChatHeader(w) {
   }
 }
 
-async function updateAgentSettings(w, claudeModel, grokModel, deepseekModel, glmModel, effort) {
+async function updateAgentSettings(w, claudeModel, grokModel, deepseekModel, glmModel, effort, codexModel = null) {
   const slug = w.projectSlug;
   const agentId = w.agentId;
   const hint = w.el.querySelector(".save-hint");
@@ -1796,6 +1809,7 @@ async function updateAgentSettings(w, claudeModel, grokModel, deepseekModel, glm
         grok_model: grokModel,
         deepseek_model: deepseekModel,
         glm_model: glmModel,
+        codex_model: codexModel,
         effort: effort || null,
       }),
     });
@@ -2265,7 +2279,7 @@ const CHAT_COMMANDS = [
   { cmd: "/clear",    adapter: "*",     hint: "",                                    desc: "new session (old history kept in db)",     exec: cmdClear },
   { cmd: "/compact",  adapter: "*",     hint: "",                                    desc: "agent summarizes context → new session seeded with recap (reduces context %)", exec: cmdCompact },
   { cmd: "/model",    adapter: "*",     hint: "<...>",                               desc: "change this agent's model",                              exec: cmdModel },
-  { cmd: "/adapter",  adapter: "*",     hint: "<claude|grok|deepseek|glm> [model]", desc: "switch adapter (e.g. claude→glm-5.2); no restart",          exec: cmdAdapter },
+  { cmd: "/adapter",  adapter: "*",     hint: "<claude|grok|deepseek|glm|codex> [model]", desc: "switch adapter/model; starts a clean provider session", exec: cmdAdapter },
   { cmd: "/effort",   adapter: "*",     hint: "<default|low|medium|high|max>",       desc: "change this agent's effort",                             exec: cmdEffort },
   { cmd: "/focus",    adapter: "*",     hint: "<AGENT_ID>",                          desc: "open another agent's chat in this project",                 exec: cmdFocus },
   { cmd: "/dispatch", adapter: "*",     hint: "<AGENT_ID> <task>",                   desc: "open target agent's chat and send the task now",              exec: cmdDispatch },
@@ -2504,13 +2518,19 @@ const _GLM_MODEL_ALIAS = {
   "5.2": "glm-5.2",
   "glm-5.2": "glm-5.2",
 };
+const _CODEX_MODEL_ALIAS = {
+  "terra": "gpt-5.6-terra",
+  "sol": "gpt-5.6-sol",
+  "gpt-5.6-terra": "gpt-5.6-terra",
+  "gpt-5.6-sol": "gpt-5.6-sol",
+};
 
 async function cmdAdapter(w, arg) {
   const slug = w.projectSlug;
   const proj = state.projectCache[slug];
   const agent = proj?.agents.find((a) => a.id === w.agentId);
   const parts = (arg || "").trim().split(/\s+/).filter(Boolean);
-  const VALID = { claude: "claude-sonnet-4-6", grok: "grok-build", deepseek: "deepseek-v4-flash", glm: "glm-4.6" };
+  const VALID = { claude: "claude-sonnet-4-6", grok: "grok-build", deepseek: "deepseek-v4-flash", glm: "glm-4.6", codex: "gpt-5.6-terra" };
 
   // Infer adapter from a model id (so `/adapter glm-5.2` works, not just `/adapter glm`).
   const inferAdapter = (tok) => {
@@ -2518,12 +2538,13 @@ async function cmdAdapter(w, arg) {
     if (t.startsWith("glm-")) return "glm";
     if (t.startsWith("deepseek-")) return "deepseek";
     if (t.startsWith("grok-")) return "grok";
+    if (t.startsWith("gpt-5.6-")) return "codex";
     if (t.startsWith("claude-") || ["fable-5","opus-4-8","opus-4-7","sonnet","sonnet-5","haiku"].includes(t)) return "claude";
     return null;
   };
 
   if (!parts.length) {
-    addSystemBubble(w, "Syntax: `/adapter <claude|grok|deepseek|glm> [model]` OR `/adapter <model-id>` — e.g. `/adapter glm glm-5.2` or `/adapter glm-5.2`. Switches the endpoint/adapter of this agent (no restart).");
+    addSystemBubble(w, "Syntax: `/adapter <claude|grok|deepseek|glm|codex> [model]` OR `/adapter <model-id>`.");
     return;
   }
   let effAdapter, model;
@@ -2536,7 +2557,7 @@ async function cmdAdapter(w, arg) {
     // `/adapter <model-id>` — infer adapter from the model id itself
     const inferred = inferAdapter(first);
     if (!inferred) {
-      addSystemBubble(w, `invalid adapter/model: \`${parts[0]}\`. Use an adapter (claude|grok|deepseek|glm) or a model id (e.g. glm-5.2, opus-4-8).`);
+      addSystemBubble(w, `invalid adapter/model: \`${parts[0]}\`. Use claude|grok|deepseek|glm|codex or a known model id.`);
       return;
     }
     effAdapter = inferred;
@@ -2550,14 +2571,29 @@ async function cmdAdapter(w, arg) {
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ adapter: effAdapter, model }),
     });
-    if (!r.ok) throw new Error("adapter switch failed");
-    const pr = await fetch(`/api/projects/${slug}`);
-    state.projectCache[slug] = await pr.json();
+    let result = null;
+    try { result = await r.json(); } catch (_) { /* non-JSON proxy error */ }
+    if (!r.ok) {
+      const detail = result?.detail || result?.message || `${r.status} ${r.statusText}`;
+      throw new Error(`adapter switch failed: ${detail}`);
+    }
+    if (result?.project) {
+      state.projectCache[slug] = result.project;
+    } else {
+      const pr = await fetch(`/api/projects/${slug}`, { cache: "no-store" });
+      if (!pr.ok) throw new Error(`adapter saved, but refresh failed: HTTP ${pr.status}`);
+      state.projectCache[slug] = await pr.json();
+    }
+    // Provider sessions have different init/tool surfaces. Drop the old card and
+    // reload the newly rotated AgentUI session before repainting all views.
+    if (state.initInfo[slug]) delete state.initInfo[slug][w.agentId];
+    await refreshChatSession(w);
+    ensureStats(slug, true);
     rerenderGraphsForSlug(slug);
     state.windows
       .filter((x) => x.type === "chat" && x.projectSlug === slug && x.agentId === w.agentId)
       .forEach((x) => renderChatHeader(x));
-    const cur = (effAdapter === "glm" ? (model || "glm-4.6") : (model || VALID[effAdapter]));
+    const cur = result?.model || model || VALID[effAdapter];
     addSystemBubble(w, `✓ adapter → \`${effAdapter}\` (model \`${cur}\`) — applies from the next chat turn`);
     if (hint) { hint.textContent = "✓ applies next turn"; hint.style.color = "var(--ok)"; }
   } catch (e) {
@@ -2572,6 +2608,7 @@ async function cmdModel(w, arg) {
   const isGrok = agent.model === "grok";
   const isDeepseek = agent.model === "deepseek";
   const isGlm = agent.model === "glm";
+  const isCodex = agent.model === "codex";
 
   if (!arg) {
     addSystemBubble(w, isGrok
@@ -2580,6 +2617,8 @@ async function cmdModel(w, arg) {
       ? "Syntax: `/model <deepseek-v4-flash|deepseek-v4-pro>`"
       : isGlm
       ? "Syntax: `/model <glm-4.6|glm-5.2>`"
+      : isCodex
+      ? "Syntax: `/model <gpt-5.6-terra|gpt-5.6-sol>`"
       : "Syntax: `/model <fable-5|opus-4-8|opus-4-7|sonnet|haiku>`");
     return;
   }
@@ -2606,6 +2645,13 @@ async function cmdModel(w, arg) {
     addSystemBubble(w, `✓ glm_model → \`${target}\` (applies from the next chat turn)`);
     return;
   }
+  if (isCodex) {
+    const target = _CODEX_MODEL_ALIAS[arg.toLowerCase()];
+    if (!target) { addSystemBubble(w, `invalid codex model: \`${arg}\``); return; }
+    await updateAgentSettings(w, null, null, null, null, eff, target);
+    addSystemBubble(w, `✓ codex_model → \`${target}\` (applies from the next chat turn)`);
+    return;
+  }
 
   const target = _CLAUDE_MODEL_ALIAS[arg.toLowerCase()] || (arg.startsWith("claude-") ? arg : null);
   if (!target) { addSystemBubble(w, `invalid claude model: \`${arg}\``); return; }
@@ -2622,12 +2668,18 @@ async function cmdEffort(w, arg) {
   const eff = arg.toLowerCase() === "default" ? "" : arg.toLowerCase();
   const proj = state.projectCache[w.projectSlug];
   const agent = proj.agents.find((a) => a.id === w.agentId);
+  if (agent.model === "codex" && arg.toLowerCase() === "max") {
+    addSystemBubble(w, "Codex effort supports default|low|medium|high|xhigh (not max).");
+    return;
+  }
   if (agent.model === "grok") {
     await updateAgentSettings(w, null, agent.grok_model || "grok-build", null, null, eff);
   } else if (agent.model === "deepseek") {
     await updateAgentSettings(w, null, null, agent.deepseek_model || "deepseek-v4-flash", null, eff);
   } else if (agent.model === "glm") {
     await updateAgentSettings(w, null, null, null, agent.glm_model || "glm-4.6", eff);
+  } else if (agent.model === "codex") {
+    await updateAgentSettings(w, null, null, null, null, eff, agent.codex_model || "gpt-5.6-terra");
   } else {
     await updateAgentSettings(w, agent.claude_model || "claude-sonnet-4-6", null, null, null, eff);
   }
@@ -2902,6 +2954,7 @@ function openAddAgentDialog(slug) {
     <option value="deepseek-v4-pro">deepseek-v4-pro (top)</option>`;
   const glmOpts = `<option value="glm-4.6">glm-4.6 (200K)</option>
     <option value="glm-5.2">glm-5.2 (top, 1M)</option>`;
+  const codexOpts = CODEX_MODELS.map((o) => `<option value="${o.value}">${o.label}</option>`).join("");
   const parentOpts = existing.map((id) =>
     `<option value="${escapeHtml(id)}">${escapeHtml(id)}</option>`).join("");
 
@@ -2930,6 +2983,7 @@ function openAddAgentDialog(slug) {
               <option value="grok">grok</option>
               <option value="deepseek">deepseek</option>
               <option value="glm">glm</option>
+              <option value="codex">codex</option>
             </select>
           </label>
           <label data-for="claude">Claude model
@@ -2954,6 +3008,12 @@ function openAddAgentDialog(slug) {
             <select name="glm_model">
               <option value="">(default glm-4.6)</option>
               ${glmOpts}
+            </select>
+          </label>
+          <label data-for="codex" style="display:none">Codex model
+            <select name="codex_model">
+              <option value="">(default gpt-5.6-terra)</option>
+              ${codexOpts}
             </select>
           </label>
           <label>Effort
@@ -3016,6 +3076,7 @@ function openAddAgentDialog(slug) {
   const grokWrap = form.querySelector('[data-for="grok"]');
   const deepseekWrap = form.querySelector('[data-for="deepseek"]');
   const glmWrap = form.querySelector('[data-for="glm"]');
+  const codexWrap = form.querySelector('[data-for="codex"]');
 
   function syncAdapter() {
     const v = modelSelect.value;
@@ -3023,6 +3084,7 @@ function openAddAgentDialog(slug) {
     grokWrap.style.display = v === "grok" ? "" : "none";
     deepseekWrap.style.display = v === "deepseek" ? "" : "none";
     glmWrap.style.display = v === "glm" ? "" : "none";
+    codexWrap.style.display = v === "codex" ? "" : "none";
   }
   modelSelect.onchange = syncAdapter;
   syncAdapter();
@@ -3047,14 +3109,16 @@ function openAddAgentDialog(slug) {
     const isGrok = adapter === "grok";
     const isDeepseek = adapter === "deepseek";
     const isGlm = adapter === "glm";
+    const isCodex = adapter === "codex";
     return {
       id: (fd.get("id") || "").trim().toUpperCase(),
       role: (fd.get("role") || "").trim(),
       model: adapter,
-      claude_model: (isGrok || isDeepseek || isGlm) ? null : ((fd.get("claude_model") || "").trim() || null),
+      claude_model: (isGrok || isDeepseek || isGlm || isCodex) ? null : ((fd.get("claude_model") || "").trim() || null),
       grok_model: isGrok ? ((fd.get("grok_model") || "").trim() || null) : null,
       deepseek_model: isDeepseek ? ((fd.get("deepseek_model") || "").trim() || null) : null,
       glm_model: isGlm ? ((fd.get("glm_model") || "").trim() || null) : null,
+      codex_model: isCodex ? ((fd.get("codex_model") || "").trim() || null) : null,
       effort: (fd.get("effort") || "").trim() || null,
       system_prompt_file: (fd.get("system_prompt_file") || "").trim() || null,
       cwd: (fd.get("cwd") || ".").trim() || ".",
@@ -3301,13 +3365,16 @@ async function cmdStatus(w) {
   const isGrok = agent.model === "grok";
   const isDeepseek = agent.model === "deepseek";
   const isGlm = agent.model === "glm";
+  const isCodex = agent.model === "codex";
   const cur = isGrok ? (agent.grok_model || "grok-build")
     : isDeepseek ? (agent.deepseek_model || "deepseek-v4-flash")
     : isGlm ? (agent.glm_model || "glm-4.6")
+    : isCodex ? (agent.codex_model || "gpt-5.6-terra")
     : (agent.claude_model || "claude-sonnet-4-6");
   const def = isGrok ? (agent.default_grok_model || "grok-build")
     : isDeepseek ? (agent.default_deepseek_model || "deepseek-v4-flash")
     : isGlm ? (agent.default_glm_model || "glm-4.6")
+    : isCodex ? (agent.default_codex_model || "gpt-5.6-terra")
     : (agent.default_claude_model || "claude-sonnet-4-6");
   const lines = [
     `**Agent**: \`${agent.id}\``,
