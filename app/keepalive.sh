@@ -3,8 +3,8 @@
 # Installed in crontab (NFS-shared across login nodes) — the hostname gate below
 # makes ONLY the canonical node act, so every other login node exits 0 and never
 # starts a second server writing the same SQLite file over NFS (corruption risk).
-# Canonical node switched ascend-login01 → ascend-login02 on 2026-07-21.
-[ "$(hostname -s)" = "ascend-login02" ] || exit 0
+# login01 is the persistent canonical node; user SSH tunnels target it directly.
+[ "$(hostname -s)" = "ascend-login01" ] || exit 0
 
 APP_DIR="/users/PGS0407/binben14/VietHuy/agent_code_IDLE/app"
 LOG="/tmp/agentui.log"
