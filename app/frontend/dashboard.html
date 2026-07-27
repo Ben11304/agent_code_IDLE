@@ -148,6 +148,14 @@ table.tbl { width: 100%; border-collapse: collapse; font-size: 12.5px; }
 .meter-fill.warm { background: var(--st-warn); }
 .meter-mark { position: absolute; top: -2px; bottom: -2px; width: 2px; background: var(--dash-text); opacity: 0.45; }
 .meter-v { font-variant-numeric: tabular-nums; font-size: 11.5px; min-width: 40px; text-align: right; }
+.ctx-policy { display: grid; grid-template-columns: 105px 88px 42px; gap: 5px; align-items: center; min-width: 245px; }
+.ctx-policy select, .ctx-policy input { min-width: 0; border: 1px solid var(--dash-line); border-radius: 6px;
+  background: var(--surface-1); color: var(--dash-text); padding: 4px 5px; font: inherit; font-size: 11px; }
+.ctx-policy button { border: 1px solid var(--dash-line); border-radius: 6px; background: transparent;
+  color: var(--dash-text); padding: 4px 6px; font: inherit; font-size: 11px; cursor: pointer; }
+.ctx-policy button:hover { border-color: var(--series-1); }
+.ctx-policy input:disabled { opacity: .45; }
+.ctx-policy .saved { color: var(--st-good); }
 
 /* High-contrast tooltip bubble — deliberately a fixed dark card with light text in
    BOTH themes (not theme-flipped), so it reads at full strength over any bar colour.
@@ -233,6 +241,22 @@ const fmt = (n) => {
   if (n >= 1e3) return (n / 1e3).toFixed(1) + "k";
   return String(n);
 };
+// Official Codex rate-card units (credits per 1M tokens). Keep this metric
+// separate from raw processed tokens: cache and output have different weights.
+const openAiUsage = (r) => {
+  const model = r.model || "";
+  const rates = model === "gpt-5.6-sol" ? [125, 12.5, 750]
+    : model === "gpt-5.6-terra" ? [62.5, 6.25, 375] : null;
+  if (!rates) return {credits: 0, equivalent: 0};
+  const fresh = (r.input_tokens || 0) + (r.cache_creation || 0);
+  const cached = r.cache_read || 0;
+  const output = r.output_tokens || 0;
+  const credits = (fresh * rates[0] + cached * rates[1] + output * rates[2]) / 1e6;
+  // Normalize credits back to this model's fresh-input rate. Sol and Terra have
+  // the same 1 : .1 : 6 relative weights, so mixed-model rows remain additive.
+  return {credits, equivalent: fresh + cached * .1 + output * 6};
+};
+const fmtCredits = (n) => n >= 1000 ? (n / 1000).toFixed(2) + "k" : n.toFixed(1);
 const esc = (s) => String(s == null ? "" : s).replace(/[&<>"']/g, (c) =>
   ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
 
@@ -292,10 +316,13 @@ function render() {
   const win = {};
   series.forEach((r) => {
     const k = r.project_slug + "/" + r.agent_id;
-    const w = win[k] || (win[k] = { billed: 0, out: 0, turns: 0 });
+    const w = win[k] || (win[k] = { billed: 0, out: 0, turns: 0, oaCredits: 0, oaEquivalent: 0 });
+    const oa = openAiUsage(r);
     w.out += r.output_tokens || 0;
     w.turns += r.turns || 0;
     w.billed += (r.input_tokens || 0) + (r.cache_creation || 0) + (r.cache_read || 0) + (r.output_tokens || 0);
+    w.oaCredits += oa.credits;
+    w.oaEquivalent += oa.equivalent;
   });
 
   renderFilters(d);
@@ -352,27 +379,38 @@ function renderKpis(agents, series) {
   // billed / output / turns are WINDOWED — summed over the series (which the backend
   // already bounded to the selected range), so they move with the 1h/6h/…/90d filter.
   // running / hottest are point-in-time state, so they stay lifetime-agnostic.
-  const s0 = { billed: 0, out: 0, cache: 0, turns: 0 };
+  const s0 = { billed: 0, out: 0, cache: 0, turns: 0, oaCredits: 0, oaEquivalent: 0 };
   const agg = series.reduce((s, r) => {
+    const oa = openAiUsage(r);
     s.out += r.output_tokens || 0;
     s.cache += r.cache_read || 0;
     s.billed += (r.input_tokens || 0) + (r.cache_creation || 0) + (r.cache_read || 0) + (r.output_tokens || 0);
     s.turns += r.turns || 0;
+    s.oaCredits += oa.credits;
+    s.oaEquivalent += oa.equivalent;
     return s;
   }, s0);
   const running = agents.filter((a) => a.status === "running").length;
   const hottest = agents.slice().sort((a, b) => (b.context_pct || 0) - (a.context_pct || 0))[0];
+  const hotNote = hottest ? (() => {
+    const p = hottest.context_policy || {mode: "default"};
+    if (p.mode === "off") return `${hottest.agent} · auto context off`;
+    const action = p.mode === "clear" ? "clear" : "compact";
+    return `${hottest.agent} · ${action} at ${fmt(hottest.compact_at_tokens)}`;
+  })() : "";
   const rl = rangeLabel();
   const tile = (k, v, note) =>
     `<div class="kpi"><div class="kpi-k">${esc(k)}</div><div class="kpi-v">${esc(v)}</div>` +
     (note ? `<div class="kpi-note">${esc(note)}</div>` : "") + `</div>`;
   $("kpis").innerHTML =
     tile(`billed · last ${rl}`, fmt(agg.billed), `${(agg.cache / (agg.billed || 1) * 100).toFixed(0)}% is cache re-read`) +
+    tile(`OpenAI credits · last ${rl}`, fmtCredits(agg.oaCredits),
+         `${fmt(agg.oaEquivalent)} input-equivalent · Codex only`) +
     tile(`output · last ${rl}`, fmt(agg.out), "the part that is not cache") +
     tile(`turns · last ${rl}`, String(agg.turns), `across ${agents.length} agents`) +
     tile("running now", String(running), running ? "live" : "idle") +
     tile("hottest context", hottest ? hottest.context_pct + "%" : "—",
-         hottest ? `${hottest.agent} · compact at ${hottest.compact_at_pct}%` : "");
+         hotNote);
 }
 
 // FORM: magnitude over time, one bar per bucket, stacked by series (agent OR model).
@@ -500,7 +538,8 @@ function bindTips(svg) {
 }
 
 function renderAgents(agents, cmap, win) {
-  const wof = (a) => win[a.project + "/" + a.agent] || { billed: 0, out: 0, turns: 0 };
+  const wof = (a) => win[a.project + "/" + a.agent] ||
+    { billed: 0, out: 0, turns: 0, oaCredits: 0, oaEquivalent: 0 };
   // Sort by windowed billed so the range's biggest spenders float up; lifetime billed
   // breaks ties so idle-in-window agents keep a stable order instead of jumping.
   const rows = agents.slice().sort((a, b) =>
@@ -512,11 +551,31 @@ function renderAgents(agents, cmap, win) {
     : `<span class="st idle">○ <b>${esc(s || "idle")}</b></span>`;
   const meter = (a) => {
     const pct = a.context_pct || 0;
-    const cls = pct >= a.compact_at_pct ? "hot" : pct >= a.compact_at_pct * 0.7 ? "warm" : "";
-    return `<span class="meter" title="compacts at ${a.compact_at_pct}% of ${fmt(a.context_window)}">` +
+    const p = a.context_policy || {mode: "default"};
+    const enabled = p.mode !== "off";
+    const threshold = a.compact_at_tokens || Math.round(a.context_window * a.compact_at_pct / 100);
+    const mark = Math.min(100, threshold / a.context_window * 100);
+    const hot = enabled && a.context_tokens >= threshold;
+    const cls = hot ? "hot" : enabled && a.context_tokens >= threshold * 0.7 ? "warm" : "";
+    const action = p.mode === "clear" ? "clears" : "compacts";
+    const title = p.mode === "off" ? "automatic context handling is off"
+      : `${action} at ${fmt(threshold)} tokens (${mark.toFixed(1)}% of ${fmt(a.context_window)})`;
+    return `<span class="meter" title="${esc(title)}">` +
       `<span class="meter-track"><span class="meter-fill ${cls}" style="width:${Math.min(100, pct)}%"></span>` +
-      `<span class="meter-mark" style="left:${a.compact_at_pct}%"></span></span>` +
+      (enabled ? `<span class="meter-mark" style="left:${mark}%"></span>` : "") + `</span>` +
       `<span class="meter-v">${pct}%</span></span>`;
+  };
+  const policy = (a) => {
+    const p = a.context_policy || {mode: "default", threshold_tokens: null};
+    const threshold = p.threshold_tokens || 100000;
+    const disabled = p.mode === "default" || p.mode === "off";
+    return `<div class="ctx-policy" data-project="${esc(a.project)}" data-agent="${esc(a.agent)}">` +
+      `<select class="ctx-mode" aria-label="automatic context action">` +
+      [["default","default"],["off","off"],["compact","compact"],["clear","clear"]]
+        .map(([v,l]) => `<option value="${v}"${p.mode === v ? " selected" : ""}>${l}</option>`).join("") +
+      `</select><input class="ctx-threshold" type="number" min="1000" max="10000000" step="1000" ` +
+      `value="${threshold}"${disabled ? " disabled" : ""} title="context token threshold">` +
+      `<button class="ctx-save" type="button">save</button></div>`;
   };
   const ago = (t) => {
     if (!t) return "—";
@@ -530,7 +589,9 @@ function renderAgents(agents, cmap, win) {
   $("agents").innerHTML =
     `<thead><tr><th>agent</th><th>project</th><th>model</th><th>status</th>
       <th class="num" title="fixed context cost: system prompt + the files the pre-flight block reads every session, whatever the task. chars/4 estimate. Hover a cell for the breakdown.">fixed ctx</th>
-      <th>context</th><th class="num">billed · ${rl}</th><th class="num">output · ${rl}</th>
+      <th>context</th><th>auto context</th><th class="num">raw · ${rl}</th>
+      <th class="num" title="Official Codex rate card: Sol 125/12.5/750 and Terra 62.5/6.25/375 credits per 1M fresh/cached/output tokens.">OpenAI credits · ${rl}</th>
+      <th class="num">output · ${rl}</th>
       <th class="num">turns · ${rl}</th><th class="num">last</th></tr></thead><tbody>` +
     rows.map((a) => {
       const k = a.project + "/" + a.agent;
@@ -548,12 +609,44 @@ function renderAgents(agents, cmap, win) {
         <td>${st(a.status)}</td>
         ${fc}
         <td>${a.context_tokens == null ? '<span class="st idle">— no session</span>' : meter(a)}</td>
+        <td>${policy(a)}</td>
         <td class="num"${dim}>${fmt(w.billed)}</td>
+        <td class="num"${dim} title="${fmt(w.oaEquivalent)} input-equivalent">${w.oaCredits ? fmtCredits(w.oaCredits) : "—"}</td>
         <td class="num"${dim}>${fmt(w.out)}</td>
         <td class="num"${dim}>${w.turns}</td>
         <td class="num">${ago(a.updated_at)}</td>
       </tr>`;
     }).join("") + `</tbody>`;
+
+  document.querySelectorAll(".ctx-policy").forEach((el) => {
+    const mode = el.querySelector(".ctx-mode");
+    const threshold = el.querySelector(".ctx-threshold");
+    const save = el.querySelector(".ctx-save");
+    mode.onchange = () => { threshold.disabled = mode.value === "default" || mode.value === "off"; };
+    save.onclick = async () => {
+      save.disabled = true;
+      save.textContent = "…";
+      try {
+        const url = `/api/projects/${encodeURIComponent(el.dataset.project)}/agents/${encodeURIComponent(el.dataset.agent)}/context-policy`;
+        const r = await fetch(url, {method: "POST", headers: {"Content-Type": "application/json"},
+          body: JSON.stringify({mode: mode.value, threshold_tokens: Number(threshold.value)})});
+        const result = await r.json();
+        if (!r.ok) throw new Error(result.detail || "save failed");
+        const a = state.data.agents.find((x) => x.project === el.dataset.project && x.agent === el.dataset.agent);
+        if (a) {
+          a.context_policy = result;
+          a.compact_at_tokens = result.threshold_tokens || Math.round(a.context_window * a.compact_at_pct / 100);
+        }
+        save.textContent = "✓";
+        save.classList.add("saved");
+        setTimeout(() => { save.textContent = "save"; save.classList.remove("saved"); save.disabled = false; }, 1200);
+      } catch (e) {
+        save.textContent = "!";
+        save.title = e.message;
+        save.disabled = false;
+      }
+    };
+  });
 }
 
 // ---------- Agent log tab ----------

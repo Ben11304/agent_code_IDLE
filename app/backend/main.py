@@ -1350,6 +1350,27 @@ class ChatBody(BaseModel):
     memory_mode: Optional[str] = None  # "on" | "off" | None
 
 
+class ContextPolicyBody(BaseModel):
+    mode: str
+    threshold_tokens: int = 100_000
+
+
+@app.post("/api/projects/{slug}/agents/{agent_id}/context-policy")
+def api_set_context_policy(slug: str, agent_id: str, body: ContextPolicyBody):
+    if not projects.get_agent(slug, agent_id):
+        raise HTTPException(404, "agent not found")
+    mode = (body.mode or "").strip().lower()
+    if mode == "default":
+        db.delete_context_policy(slug, agent_id)
+        return {"mode": "default", "threshold_tokens": None}
+    if mode not in {"off", "compact", "clear"}:
+        raise HTTPException(400, "mode must be default, off, compact, or clear")
+    threshold = int(body.threshold_tokens or 0)
+    if threshold < 1_000 or threshold > 10_000_000:
+        raise HTTPException(400, "threshold_tokens must be between 1,000 and 10,000,000")
+    return db.set_context_policy(slug, agent_id, mode, threshold)
+
+
 def _get_children(project_data: dict, agent_id: str) -> list[str]:
     return [a["id"] for a in project_data["agents"] if agent_id in (a.get("parents") or [])]
 
@@ -2607,12 +2628,40 @@ async def _auto_compact_if_needed(slug: str, agent_id: str, emit) -> bool:
         pct = round(min(100.0, occupancy / window * 100.0), 1)
     else:
         est_chars = sum(len(m.get("content") or "") for m in db.get_messages(sess["id"]))
-        est_tokens = _ctx_estimate_tokens(root, agent, est_chars)
-        pct = _session_context_pct(sess, model_kind, eff_model, est_tokens)
-    if pct < _auto_compact_pct(model_kind):
+        occupancy = _ctx_estimate_tokens(root, agent, est_chars)
+        pct = _session_context_pct(sess, model_kind, eff_model, occupancy)
+
+    policy = db.get_context_policy(slug, agent_id)
+    if policy and policy["mode"] == "off":
+        return False
+    action = policy["mode"] if policy else "compact"
+    threshold = int(policy["threshold_tokens"]) if policy else None
+    if threshold is not None:
+        should_rotate = occupancy >= threshold
+    else:
+        should_rotate = pct >= _auto_compact_pct(model_kind)
+    if not should_rotate:
         return False
 
-    await emit({"type": "compact_started", "agent": agent_id, "auto": True, "pct": pct})
+    event = {"type": "compact_started", "agent": agent_id, "auto": True,
+             "action": action, "pct": pct, "tokens": occupancy, "threshold_tokens": threshold}
+    await emit(event)
+
+    # Clear intentionally creates no recap: it books the outgoing turn and starts
+    # cold from AGENT.md/state on the pending user turn.
+    if action == "clear":
+        await asyncio.to_thread(_book_current_session_tokens, slug, agent_id)
+        new_sess = db.new_session(slug, agent_id)
+        db.add_message(
+            new_sess["id"], "assistant",
+            f"🧹 **Auto-clear @ {occupancy:,} context tokens** — threshold "
+            f"{threshold:,}; the next turn starts a fresh CLI session.",
+        )
+        db.update_session_status(new_sess["id"], "ok")
+        await emit({"type": "compacted", "agent": agent_id, "new_session_id": new_sess["id"],
+                    "auto": True, "action": "clear"})
+        return True
+
     tracker: list = []
     summary = (await _run_agent(slug, agent_id, _COMPACT_PROMPT, emit, tracker) or "").strip()
     if tracker:
@@ -2625,7 +2674,7 @@ async def _auto_compact_if_needed(slug: str, agent_id: str, emit) -> bool:
         db.set_session_seed(new_sess["id"], summary)
         db.add_message(
             new_sess["id"], "assistant",
-            f"📦 **Auto-compact @ {pct}% context** — new session seeded with the recap below. "
+            f"📦 **Auto-compact @ {occupancy:,} tokens ({pct}%)** — new session seeded with the recap below. "
             "The next turn continues from this recap.\n\n---\n\n" + summary,
         )
     else:
@@ -2634,7 +2683,7 @@ async def _auto_compact_if_needed(slug: str, agent_id: str, emit) -> bool:
         # is worse. The cold-start preamble (state/progress.md) covers recovery.
         db.add_message(
             new_sess["id"], "assistant",
-            f"📦 **Auto-compact @ {pct}% context** — recap empty (old session overloaded?); "
+            f"📦 **Auto-compact @ {occupancy:,} tokens ({pct}%)** — recap empty (old session overloaded?); "
             "the new session will start from the cold-start preamble built from `state/progress.md`.",
         )
     db.update_session_status(new_sess["id"], "ok")
@@ -3176,9 +3225,11 @@ async def api_dashboard(bucket: str = "hour", hours: int = 48):
         if not full:
             continue
         overrides = db.list_agent_overrides(slug)
+        context_policies = db.list_context_policies(slug)
         for a in full["agents"]:
             aid = a["id"]
             ov = overrides.get(aid) or {}
+            context_policy = context_policies.get(aid)
             model_kind = ov.get("model") or a.get("model", "claude")
             if model_kind == "grok":
                 eff_model = ov.get("grok_model") or a.get("grok_model") or "grok-build"
@@ -3228,6 +3279,10 @@ async def api_dashboard(bucket: str = "hour", hours: int = 48):
                 "context_window": window,
                 "context_pct": round(min(100.0, (ctx_tokens or 0) / window * 100.0), 1) if window else 0.0,
                 "compact_at_pct": _auto_compact_pct(model_kind),
+                "context_policy": context_policy or {"mode": "default", "threshold_tokens": None},
+                "compact_at_tokens": (context_policy.get("threshold_tokens") if context_policy
+                                      and context_policy.get("mode") in {"compact", "clear"}
+                                      else round(window * _auto_compact_pct(model_kind) / 100)),
                 "updated_at": sess.get("updated_at") if sess else None,
                 "turns": t.get("turns") or 0,
                 "requests": t.get("requests") or 0,

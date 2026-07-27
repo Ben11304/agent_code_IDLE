@@ -16,4 +16,7 @@ fi
 
 echo "[keepalive $(date '+%F %T')] server down (HTTP ${code:-none}), restarting" >> "$LOG"
 cd "$APP_DIR" || exit 1
-setsid nohup bash run.sh </dev/null >>"$LOG" 2>&1 &
+# A reload worker can wait forever for long-lived SSE/CLI connections during a
+# code change while its inherited listener keeps 5174 occupied. Persistence is
+# more important here; deploys restart explicitly after validation.
+RELOAD=0 setsid nohup bash run.sh </dev/null >>"$LOG" 2>&1 &

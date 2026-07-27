@@ -122,6 +122,14 @@ def init_db() -> None:
                 key TEXT PRIMARY KEY,
                 value TEXT NOT NULL
             );
+            CREATE TABLE IF NOT EXISTS context_policies (
+                project_slug TEXT NOT NULL,
+                agent_id TEXT NOT NULL,
+                mode TEXT NOT NULL CHECK(mode IN ('off','compact','clear')),
+                threshold_tokens INTEGER NOT NULL,
+                updated_at REAL NOT NULL,
+                PRIMARY KEY (project_slug, agent_id)
+            );
             CREATE TABLE IF NOT EXISTS context_log (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 project_slug TEXT NOT NULL,
@@ -892,6 +900,48 @@ def set_setting(key: str, value: str) -> None:
             "INSERT INTO settings(key, value) VALUES (?, ?) "
             "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
             (key, value),
+        )
+
+
+# Per-agent automatic context handling. A missing row means the adapter's
+# existing percentage default; an explicit `off` row disables automation.
+def get_context_policy(project_slug: str, agent_id: str) -> dict | None:
+    with _conn() as c:
+        row = c.execute(
+            "SELECT * FROM context_policies WHERE project_slug=? AND agent_id=?",
+            (project_slug, agent_id),
+        ).fetchone()
+    return dict(row) if row else None
+
+
+def list_context_policies(project_slug: str) -> dict[str, dict]:
+    with _conn() as c:
+        rows = c.execute(
+            "SELECT * FROM context_policies WHERE project_slug=?", (project_slug,)
+        ).fetchall()
+    return {r["agent_id"]: dict(r) for r in rows}
+
+
+def set_context_policy(project_slug: str, agent_id: str, mode: str,
+                       threshold_tokens: int) -> dict:
+    if mode not in {"off", "compact", "clear"}:
+        raise ValueError("invalid context policy mode")
+    now = time.time()
+    with _conn() as c:
+        c.execute(
+            "INSERT INTO context_policies(project_slug, agent_id, mode, threshold_tokens, updated_at) "
+            "VALUES (?,?,?,?,?) ON CONFLICT(project_slug, agent_id) DO UPDATE SET "
+            "mode=excluded.mode, threshold_tokens=excluded.threshold_tokens, updated_at=excluded.updated_at",
+            (project_slug, agent_id, mode, int(threshold_tokens), now),
+        )
+    return get_context_policy(project_slug, agent_id) or {}
+
+
+def delete_context_policy(project_slug: str, agent_id: str) -> None:
+    with _conn() as c:
+        c.execute(
+            "DELETE FROM context_policies WHERE project_slug=? AND agent_id=?",
+            (project_slug, agent_id),
         )
 
 
