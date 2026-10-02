@@ -1,0 +1,6 @@
+[block, review]
+/ @openai/codex-cloud
+
+# Tempest automation; legacy TEMPEST.md remains the parity witness.
+[tempest::evaluate-only]
+/[except=/TEMPEST.md]

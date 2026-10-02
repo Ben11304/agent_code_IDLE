@@ -1,0 +1,8 @@
+{
+  "apps": {
+    "deep-research-work": {
+      "id": "connector_openai_deep_research_work",
+      "required": true
+    }
+  }
+}

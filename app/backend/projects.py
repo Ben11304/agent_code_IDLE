@@ -104,6 +104,16 @@ def get_project(slug: str) -> dict[str, Any] | None:
             "name": cfg.get("name", root.name),
             "description": cfg.get("description", ""),
             "root": cfg["root"],
+            # Optional project-level inventory used by the graph's Papers / Models
+            # monitor. Paths and glob patterns are resolved by the read-only API.
+            "resources": cfg.get("resources", {}) or {},
+            # Optional per-project persistent-memory policy.  Keeping this in the
+            # project descriptor lets new memory behaviour roll out one project at
+            # a time instead of silently changing every registered agent system.
+            "memory": cfg.get("memory", {}) or {},
+            # Optional versioned Notion report form. The backend loads and
+            # validates the referenced project-owned schema on demand.
+            "notion_report": cfg.get("notion_report", {}) or {},
             "agents": [
                 {
                     "id": a["id"],
@@ -115,6 +125,7 @@ def get_project(slug: str) -> dict[str, Any] | None:
                     "glm_model": a.get("glm_model", "glm-4.6"),
                     "codex_model": a.get("codex_model", "gpt-5.6-terra"),
                     "effort": a.get("effort"),
+                    "notion_url": a.get("notion_url", ""),
                     "cwd": a.get("cwd", "."),
                     "system_prompt_file": a.get("system_prompt_file", ""),
                     "parents": a.get("parents", []) or [],
@@ -381,6 +392,8 @@ def _clean_agent(a: dict[str, Any]) -> dict[str, Any]:
         out["codex_model"] = a["codex_model"]
     if a.get("effort"):
         out["effort"] = a["effort"]
+    if a.get("notion_url"):
+        out["notion_url"] = a["notion_url"]
     if a.get("system_prompt_file"):
         out["system_prompt_file"] = a["system_prompt_file"]
     if a.get("cwd"):
@@ -486,7 +499,10 @@ def preview_project(payload: dict[str, Any]) -> dict[str, Any]:
     agents = payload.get("agents") or []
     ctx = _project_ctx(name, payload.get("description", ""), agents, date.today().isoformat())
 
-    files: list[str] = ["README.md", "sync.sh", ".agentui/project.yaml"]
+    files: list[str] = [
+        "README.md", "sync.sh", ".agentui/project.yaml",
+        "paper_collection/README.md", "paper_collection/CATALOG.md",
+    ]
     files += [f"shared/{f}" for f in _SHARED_FILES]
     for a in agents:
         files += [f"{a['id']}/{rel}" for rel in _AGENT_TEMPLATE_FILES]
@@ -543,11 +559,23 @@ def create_project(payload: dict[str, Any]) -> tuple[bool, str, str]:
         # sync.sh + README
         _write(root / "sync.sh", generate_sync_sh(agents), executable=True)
         _write(root / "README.md", render_readme(ctx))
+        _write(root / "paper_collection" / "README.md", _load_template("paper_collection/README.md"))
+        _write(root / "paper_collection" / "CATALOG.md", _load_template("paper_collection/CATALOG.md"))
         # project.yaml
         project_yaml = {
             "name": name,
             "slug": slug,
             "description": description,
+            "resources": {
+                "notion": {
+                    "url": "https://www.notion.so/",
+                },
+                "papers": {
+                    "roots": ["paper_collection"],
+                    "extensions": ["pdf"],
+                    "catalogs": ["paper_collection/CATALOG.md"],
+                },
+            },
             "agents": [_project_agent_entry(a) for a in agents],
         }
         cfg_path = root / ".agentui" / "project.yaml"
@@ -596,6 +624,8 @@ def _project_agent_entry(a: dict[str, Any]) -> dict[str, Any]:
         out["codex_model"] = a.get("codex_model") or "gpt-5.6-terra"
     if a.get("effort"):
         out["effort"] = a["effort"]
+    if a.get("notion_url"):
+        out["notion_url"] = a["notion_url"]
     out["system_prompt_file"] = f"{a['id']}/AGENT.md"
     out["cwd"] = a["id"]
     out["parents"] = a.get("parents") or []

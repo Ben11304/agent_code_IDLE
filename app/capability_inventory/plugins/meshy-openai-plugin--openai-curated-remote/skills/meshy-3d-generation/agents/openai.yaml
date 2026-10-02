@@ -1,0 +1,5 @@
+interface:
+  display_name: "Meshy 3D Generation"
+  short_description: "Generate 3D models and assets"
+  icon_small: "./assets/meshy-composer-icon.svg"
+  default_prompt: "Use $meshy-3d-generation to generate a 3D model from this description."

@@ -1,6 +1,12 @@
 # AgentUI Pitch Deck
 
-File: `AgentUI_Pitch_Deck.pptx` (850KB)
+Files: `AgentUI_Pitch_Deck.pptx`, `story.pdf`, ảnh chụp và hai bản Markdown nội dung.
+
+**Đối chiếu 2026-09-07:** PPTX/PDF và `generate-deck.js` là snapshot pitch cũ.
+Markdown story đã cập nhật các mô tả runtime/ownership/ledger. Generator có text
+hard-coded riêng, không đọc các Markdown này; chạy lại nguyên trạng sẽ tái tạo
+nội dung cũ (ví dụ chỉ Claude/Grok, “không API billing”). Chưa tái xuất binary trong
+đợt audit tài liệu; không dùng deck cũ làm specification tính năng hiện tại.
 
 ## Nội dung 12 slides (tiếng Việt)
 
@@ -13,7 +19,7 @@ File: `AgentUI_Pitch_Deck.pptx` (850KB)
 7. **Giao diện thực tế** — Screenshot UI đầy đủ + caption
 8. **Kiến trúc** — 4 layer (Frontend → Backend → Adapter → Agent Projects)
 9. **Công nghệ & Triển khai** — Stack + cách chạy + deploy
-10. **Điểm khác biệt** — 6 điểm vượt trội so với LangGraph, CrewAI, AutoGen...
+10. **Điểm khác biệt** — định vị sản phẩm của pitch cũ; không phải benchmark so sánh framework đã xác minh
 11. **Tiềm năng & Roadmap (Startup angle)** — Hiện tại → Gần → Trung hạn
 12. **Kết luận** — Tóm tắt giá trị + sẵn sàng scale
 
@@ -29,12 +35,14 @@ File: `AgentUI_Pitch_Deck.pptx` (850KB)
 
 ## Gợi ý khi trình bày
 - Tập trung slide 2 (vấn đề) + slide 5 (dispatch magic) + slide 11 (roadmap)
-- Nhấn mạnh: "Không tốn thêm tiền API, dùng subscription bạn đã có"
-- "Graph sáng lên = dispatch thực sự xảy ra" (điểm khác biệt lớn nhất)
+- Mô tả auth theo adapter: Claude/Codex dùng saved login; DeepSeek/GLM cần provider key.
+- Graph phản ánh dispatch events; ledger giữ kết quả. Điều này không chứng minh artifact đúng.
 
 ## Tạo lại slide (nếu cần chỉnh)
 ```bash
 cd pitch-deck
+npm ci
+# Trước khi xuất, đồng bộ text trong generator với Markdown đã cập nhật.
 node generate-deck.js
 cp AgentUI_Pitch_Deck.pptx ../
 ```

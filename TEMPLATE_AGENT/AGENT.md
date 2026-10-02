@@ -17,13 +17,13 @@ bash ../sync.sh check <AGENT_ID>    # version-only drift check, no blob copy
 2. `../shared/scope_decisions.md` — frozen scope + hard rules.
 3. `./AGENT.md` (this file).
 4. `./overview.md` — your own slim state.
-   <!-- PARENT variant: replace 4 with `./state/children_status.json` — the derived
-        routing rollup (per-child status + manifest_version + memory_headline). -->
+   <!-- PARENT: current direct-child overviews are injected every turn;
+        the existing children_status rollup is included on cold start. -->
 5. `./inputs/manifest.md` — pinned producer versions (drift-check source at boot).
 
-> Recent progress is **auto-injected** by the control-plane (`progress.json`,
-> newest ~2 days) into your cold-start preamble — do NOT open `state/progress.md`
-> yourself (the full log defeats the trim). You only **append** to it (Hard rules).
+> Recent progress is auto-injected on cold start: JSON if present, otherwise
+> Markdown, newest two activity dates. Do not read the full log at boot. Add new
+> dated entries at the top; optional archival preserves older history.
 
 **On-demand only (NOT at boot):**
 - `../<TEAM>/overview.md` — a parent opens the ONE child it's about to route.
@@ -49,7 +49,7 @@ bash ../sync.sh check <AGENT_ID>    # version-only drift check, no blob copy
 
 ## Deliverables
 Every meaningful turn ends with:
-1. `./state/progress.md` — **append** a `## YYYY-MM-DD HH:MM — headline` entry (with hour).
+1. `./state/progress.md` — **prepend** a `## YYYY-MM-DD HH:MM — headline` entry (with hour).
 2. `./outputs/manifest.md` — **bump version** + History entry when an artifact changes.
 3. The affected artifact itself.
 Trivial turn (ping/status) may skip 1–3 but must say "trivial turn, no log update".
@@ -62,7 +62,7 @@ Trivial turn (ping/status) may skip 1–3 but must say "trivial turn, no log upd
   +artifact same schema → MINOR; metadata → PATCH.
 
 ## Hard rules
-- **Checkpoint every real action** — append one `## YYYY-MM-DD HH:MM — …` line to
+- **Checkpoint every real action** — add a newest-first `## YYYY-MM-DD HH:MM — …` line to
   `progress.md` NOW, don't batch to end-of-session. Silence = treated as stale.
 - **Manifest = contract** — no silent drift; a producer MAJOR bump pings consumers.
 - **No fabrication** — unverifiable value/identifier/citation → `[VERIFY]`, never a guess.

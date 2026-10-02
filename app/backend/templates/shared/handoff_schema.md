@@ -1,7 +1,8 @@
 # Handoff Schema — Manifest format (shared)
 
 A manifest is the **contract** between agents. Every artifact passes through a manifest;
-no agent may read another agent's internals.
+cross-agent artifact access follows the manifest. Slim `overview.md` and derived
+`state/children_status.json` may be read across boundaries for routing only.
 
 ## File location
 - Producer: `<PRODUCER>/outputs/manifest.md`
@@ -9,7 +10,8 @@ no agent may read another agent's internals.
 - Sync with `bash sync.sh <CONSUMER>` (see `sync.sh` at the project root).
 
 Topology (who produces for whom) is derived from `parents` in `.agentui/project.yaml`
-and locked in `scope_decisions.md`.
+and documented in `scope_decisions.md`. The generated sync script captures topology
+at scaffold time; update its mapping deliberately if project edges change.
 
 ## Format
 

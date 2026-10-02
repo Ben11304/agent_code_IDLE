@@ -1,145 +1,107 @@
-# Scheduler — design spec
+# Scheduler — implemented behavior
 
-Recurring / deferred / goal-driven re-invocation of an agent turn. Closes the gap
-where `claude -p` (headless) has no way to wake itself up later, so an agent that
-"promises to monitor every 30 min" goes silent — there was never any mechanism
-behind the promise. A scheduled fire is, by design, **identical to a `POST /chat`**:
-it runs through the same `_Run`/`driver`/`_run_agent` path, streams into the agent's
-chat window, and persists to the `messages` table — so it is visible and replayable.
+Checked against `app/backend/main.py`, `db.py`, and `app/frontend/app.js` on
+2026-09-07. A schedule starts a new agent run through `_start_run`, the same path
+used by chat. An agent promising to monitor does not create a schedule by itself.
 
-## Three modes
+SLURM submission is asynchronous: after successful `sbatch`, report cluster/job ID
+and release the turn. Each monitoring fire should take one status snapshot and exit.
 
-| Mode | Stops when | Decided by | Tag / slash |
-|---|---|---|---|
-| `interval` | `runs_done == max_runs` | counter | `<schedule every="30m" max="8">…` · `/schedule 30m …` |
-| `once` | after 1 fire | counter (max=1) | `<schedule in="2h">…` · `/schedule once 2h …` |
-| `until` | agent emits `<schedule_stop>` (or hits the hard ceiling) | the **agent**, each round | `<schedule every="30m" until="goal">…` · `/track 30m …` |
+## Modes and tags
 
-`until` is the "check every 30m **until done**; done → report & stop; error → fix
-& continue" loop. The termination condition is *semantic* — the agent judges each
-round whether the objective is met and self-terminates.
+| Mode | Registration | Termination |
+|---|---|---|
+| `interval` | `<schedule every="30m" max="8">Task</schedule>` | Optional max count or explicit pause/delete |
+| `once` | `<schedule in="2h">Task</schedule>` | One fire |
+| `until` | `<schedule every="30m" until="goal">Task</schedule>` | Stop tag or max count (default 48) |
 
-**Note for agents**: A global scheduler on/off toggle was added (see CLAUDE.md "Active user custom modifications"). When the toggle is off, `<schedule>` tags and creation APIs are rejected, and the background loop never fires.
-
-## Tag contract (parsed live in `_run_agent`, like `<dispatch>`)
-
-```
-<schedule every="30m" max="8">Task statement.</schedule>      # repeat, stop after 8
-<schedule in="2h">Task statement.</schedule>                  # one-shot, fire once after 2h
-<schedule every="30m" until="SLURM job 123 finished">         # goal loop
-  Check job 123. DONE → report results + <schedule_stop>. FAILED → fix & rerun.
-  Still running → note progress (it persists to state/progress.md), you'll be re-invoked.
+```text
+<schedule every="30m" until="SLURM job 123 finishes">
+Take one status snapshot for job 123. If done, report results and emit schedule_stop;
+if failed, report the failure or perform the authorized fix; then release the turn.
 </schedule>
 
-<schedule_stop reason="job finished, results in results.md"/>  # agent self-terminates its until-loop
+<schedule_stop reason="job finished; results recorded"/>
 ```
 
-- `every` / `in` accept `30m | 2h | 90s | 1d`. **Floor: 300s (5 min) for `every`.**
-- Default target = the agent that emitted the tag (self-monitor). `agent="ID"` attr
-  optional (must be a direct child, same rule as dispatch) — reserved, MVP fires self.
-- The graph lights a **🕒 badge + next-fire countdown** on the owning node, so the
-  user verifies a real schedule was registered (same "verify on the graph" invariant
-  as dispatch — narrating without the tag registers nothing).
+Durations support seconds/minutes/hours/days. Repeating intervals below 300 seconds
+are clamped to 300. An `until` without a valid `every` uses that floor. Ordinary
+interval schedules can have no max; goal loops default to 48. The goal is judged
+by the model, not an external automatic metric validator.
 
-## Safety caps (mandatory for `until`)
+The tag parser schedules the emitting agent. An `agent="…"` attribute is not
+implemented as child targeting. REST creation uses `ScheduleBody.agent_id`.
+Stop tags deactivate that agent's active `until` schedules created **before** the
+current turn began; they do not stop ordinary interval schedules or instantly cancel
+a new goal loop merely echoed in its registration turn.
 
-1. **Hard ceiling** `max_runs` applies even in `until` mode — default **48**
-   (~24h at 30m cadence). Ceiling reached without `<schedule_stop>` → auto-deactivate
-   + inject a `schedule_exhausted` system message into the chat ("gave up after 48
-   checks, still not done").
-2. **Zombie guard** — a schedule untouched for **7 days** auto-deactivates.
-3. **Interval floor** 5 min, to bound subscription-quota burn.
+## Global toggle
 
-## Firing
+`settings.scheduler_enabled` defaults to `"1"`. When off:
 
-- **One scheduler loop** (startup asyncio task, modelled on `_terminal_reaper`),
-  tick every 30s. Selects `active AND next_run_at <= now`.
-- **Skip-on-busy**: if `_active_run(slug, agent)` exists, skip this tick (do not
-  queue/overlap — respects "one active run per agent"); `next_run_at` is recomputed
-  at the *next* completion.
-- Fire = `_start_run(slug, agent, wrapped_prompt, origin="schedule:<id>")`.
-- **`next_run_at` is recomputed at fire completion** (`= completion_time + interval`),
-  not pre-scheduled — avoids drift and overlap when a "fix" round runs long.
-- The fire prompt is wrapped: `[SCHEDULED CHECK #k] <prompt>` (+ for `until`: the
-  goal, the done→`<schedule_stop>` / error→fix-and-continue semantics, and a reminder
-  to write `state/progress.md` so a cold-start round can recover).
+- the scheduler tick does nothing;
+- new API/tag schedules are rejected;
+- existing rows stay stored and can be paused/deleted;
+- already-running fires continue unless explicitly stopped.
 
-## Restart behaviour
+On the **off → on** transition, `_skip_overdue_on_resume` moves overdue repeating
+rows to `now + interval` and retires overdue one-shots. It does not replay the disabled
+period. Resuming one paused row via PATCH is separate and only changes its active flag.
 
-Schedules are SQLite-backed → survive restart (the in-memory `_RUNS` do not). On
-startup the loop simply resumes reading the table. A `next_run_at` in the past
-(server was down at fire time) fires **exactly once** on the first tick, then
-returns to normal cadence — no catch-up burst.
+## Firing and restart
 
-## Data model — `scheduled_tasks`
+`_scheduler_loop` ticks every 30 seconds. `_scheduler_tick` selects due active rows,
+retires owners removed from the project and rows untouched for more than seven days,
+and avoids a second fire for the same row with `_sched_inflight`.
 
-```
-id INTEGER PK
-project_slug TEXT
-agent_id TEXT            -- owner + default fire target
-prompt TEXT             -- raw task; wrapped at fire time
-kind TEXT               -- 'interval' | 'once' | 'until'
-interval_seconds INTEGER -- null for 'once'
-until_goal TEXT         -- human-readable goal, only 'until'
-next_run_at REAL
-last_run_at REAL
-last_status TEXT        -- last fire's run status
-runs_done INTEGER
-max_runs INTEGER        -- hard ceiling (null only for unbounded interval; until→48 default)
-active INTEGER          -- 1/0
-origin TEXT             -- 'agent' | 'user'
-created_at REAL
-updated_at REAL
-```
+If a root `_Run` for the agent is active, the row is deferred by at most 120 seconds;
+at most one fire per agent is scheduled per tick. Direct dispatched workers do not
+own separate `_Run` records, so this is not a universal worker lock.
 
-## Endpoints
+`_run_scheduled_fire` calls `_start_run(..., origin="schedule:<id>")`, waits for it,
+records status/count, and either deactivates the row or sets the next time to
+`completion + interval`. Failed runs count toward max runs. Error/stop behavior is
+not an unlimited automatic retry policy.
+
+Rows survive restart; run buffers do not. With the scheduler left enabled, a due
+row is eligible on the next tick after startup (subject to busy/zombie checks), with
+no accumulated catch-up burst. If the backend died during a fire, its completion
+may not have been booked, so the due work can run again; no exactly-once guarantee.
+This differs from explicitly turning the global toggle back on.
+
+## APIs and persistence
 
 | Endpoint | Method | Purpose |
 |---|---|---|
-| `/api/projects/{slug}/schedules` | GET | list (active + recently-finished) |
-| `/api/projects/{slug}/schedules` | POST | create (slash command path) |
-| `/api/projects/{slug}/schedules/{id}` | PATCH | pause / resume |
-| `/api/projects/{slug}/schedules/{id}` | DELETE | cancel |
+| `/api/projects/{slug}/schedules` | GET / POST | List / create |
+| `/api/projects/{slug}/schedules/{task_id}?active=true` | PATCH | Resume; false pauses |
+| `/api/projects/{slug}/schedules/{task_id}` | DELETE | Deactivate |
+| `/api/scheduler/enabled` | GET / POST | Global toggle; POST body `{"enabled": true}` |
 
-`GET /api/projects/{slug}` payload also gains `schedules` so the UI seeds badges on
-project open.
+SQLite `scheduled_tasks` stores ID, project/agent, prompt, kind, interval, goal,
+next/last fire times, last status, count/max, active/origin, created/updated times.
+Slash commands `/schedule`, `/track`, `/schedules`, `/unschedule` use these paths.
+`GET /api/projects/{slug}` also includes schedules for UI initialization.
 
-## SSE events
+## Visibility and limits
 
-| Event | Fields | Meaning |
-|---|---|---|
-| `schedule_created` | `agent`, `schedule` | a tag/slash registered a schedule |
-| `schedule_fired` | `agent`, `id`, `run`, `n`, `max` | a fire just started (→ toast + node pulse) |
-| `schedule_done` | `agent`, `id`, `reason` | `<schedule_stop>` / once-complete |
-| `schedule_exhausted` | `agent`, `id`, `n` | hit the hard ceiling without stopping |
-| `schedule_cancelled` | `agent`, `id` | user paused/deleted |
+The UI polls active-tab `/runs` every 20 seconds, refreshes schedules every 30 seconds,
+and updates displayed countdowns every second. Node badges and the Schedules dropdown
+show saved schedules. Events include `schedule_created`, `schedule_fired`,
+`schedule_done`, `schedule_exhausted`, and registration errors. Pause/delete state is
+refreshed through API/UI; there is no generic `schedule_cancelled` emitter in this code.
 
-## UI feedback (the load-bearing part)
+Completion events can be published after the root run has finished; they remain in
+its event buffer but delivery to an already-closed subscriber is not guaranteed.
+`scheduled_tasks` plus API refresh is the persisted status source. No durable
+`schedule_exhausted` chat message is inserted by the current completion path.
 
-`reattachActiveRuns()` currently runs only on project open. A scheduled fire that
-starts while you are idle would otherwise run silently — exactly the failure this
-whole feature exists to remove. So:
+Schedule instructions are injected conditionally for active schedules, scheduled
+fires and detected tracking/submission intent. For an explicit user tracking request
+with no schedule tag, the driver can give one extra schedule-nudge turn. Off disables
+that nudge. Prompt instructions require scheduled work rather than background shell
+pollers; this is an agent instruction, not a shell-command enforcement layer.
 
-- **Poll `/runs` on `setInterval` (~20s)**, dedup by `run_id`; a scheduled run that
-  appears auto-opens/streams its chat window.
-- **Toast + node 🕒 pulse + taskbar badge** on `schedule_fired`, even when the chat
-  window is closed.
-- **🕒 Schedules panel** (modelled on the cluster-jobs dropdown): all schedules in the
-  project with next-fire countdown + pause/delete buttons.
-
-## Honesty guard
-
-Appended to the dispatch/system instructions:
-
-> You cannot run background timers or detached processes yourself; a turn ends and
-> the CLI exits. To run recurring/deferred work, emit `<schedule …>` — the control
-> plane is the only thing that can re-invoke you. If you cannot, say so plainly.
-> Never claim you "spawned a process" / "set a timer" to monitor something — that is
-> a lie the user catches because the graph shows no 🕒 badge.
-
-## OSC caveat
-
-A scheduler firing `claude -p` every 30 min on an OSC **login node** is exactly the
-persistent-agent activity OSC flagged (killed ~7GB of processes, threatened account
-restriction). Run AgentUI **off-cluster** (Pi / mini-PC / laptop) before enabling
-recurring schedules. (Not enforced in code; documented here and in CLAUDE.md.)
+`app/keepalive.sh` contains host-specific deployment assumptions. Its presence is not
+proof of an installed cron job or permission to run recurring work on that host.
+See [DEPLOY.md](../DEPLOY.md).

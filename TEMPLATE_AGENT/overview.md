@@ -4,7 +4,7 @@
 <!-- OVERVIEW:HEADER -->
 # OVERVIEW • <AGENT_ID> • <YYYY-MM-DD>
 status: yellow
-manifest_version: 0.0.0
+manifest_version: 0.1.0
 ready_for_parent: no
 body_incomplete: true
 <!-- /OVERVIEW:HEADER -->

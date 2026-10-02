@@ -1,0 +1,31 @@
+{
+  "source_base_commit": "644fd7058aec61404dc696a6b57e292021f00d81",
+  "source_tree_dirty": false,
+  "cli_package": "meshy-cli@0.4.0",
+  "skill_version": "0.6.0",
+  "files": {
+    ".codex-plugin/assets/composer-icon.svg": "64596f7980d440c9ae4c78455bd25c8dd69d87b466dbe2f5607d993348f56a7e",
+    ".codex-plugin/assets/logo.svg": "64596f7980d440c9ae4c78455bd25c8dd69d87b466dbe2f5607d993348f56a7e",
+    ".codex-plugin/plugin.json": "b017eb89ab350335d2139e89bc929b7598e45c9cdd2fc0392ead6a6b6b782552",
+    "LICENSE": "b1646c47cf3e86567c0ed08a81b28cad7ee7c47e4df6bcbff78547324b6d9613",
+    "README.md": "67f5eff4fb65d4309c6000fcb071f57bb6eb67ecd40604f1bc41fef48474e0b5",
+    "assets/meshy-composer-icon.svg": "64596f7980d440c9ae4c78455bd25c8dd69d87b466dbe2f5607d993348f56a7e",
+    "assets/meshy-icon.svg": "9e5eb144cc6910e560f6ebe9cf33ccc07d7224044d343f3db6ccaa3f72e5decb",
+    "skills/meshy-3d-generation/SKILL.md": "7d27c7bac9130182c6da354e5fe4e2573c153ed7568e305686f90d9709697623",
+    "skills/meshy-3d-generation/agents/openai.yaml": "6032b37b7e9e8ac6fb157584a13acd86f2ab5456d35c55ad2eb342a0f8ac2adf",
+    "skills/meshy-3d-generation/assets/meshy-composer-icon.svg": "64596f7980d440c9ae4c78455bd25c8dd69d87b466dbe2f5607d993348f56a7e",
+    "skills/meshy-3d-generation/assets/meshy-icon.svg": "bec6710db9892e3b137e044d4481598b39ee06127e031a2d2b63c17ae89da3e9",
+    "skills/meshy-3d-generation/references/delivery.md": "b2a2648fa499f84a1cb0c53f8bb4c88b195c3abbe7258a37bb86cd2e411c24eb",
+    "skills/meshy-3d-generation/references/pipelines.md": "61fb99e43c76e6b0b8975f169e30d18a0520d406378ed6610642d35efac4d492",
+    "skills/meshy-3d-generation/references/setup.md": "11e96cac86a088d1de036e7d9d34fdea63dbb559193fef7d097974f6541565eb",
+    "skills/meshy-3d-generation/references/troubleshooting.md": "592b8c2fbb1615032463d519a581d81c291663922b05cab5b6d2fab947e728c7",
+    "skills/meshy-3d-printing/SKILL.md": "dcd452088d3719b373cb645110ea51200ed04cb35930905fd5c7c11f89d3146a",
+    "skills/meshy-3d-printing/agents/openai.yaml": "6e0f968aa8ae70fe239bd78e03a3c99da16391244a1974a796ab7413b2a51b96",
+    "skills/meshy-3d-printing/assets/meshy-composer-icon.svg": "64596f7980d440c9ae4c78455bd25c8dd69d87b466dbe2f5607d993348f56a7e",
+    "skills/meshy-3d-printing/assets/meshy-icon.svg": "bec6710db9892e3b137e044d4481598b39ee06127e031a2d2b63c17ae89da3e9",
+    "skills/meshy-3d-printing/references/delivery.md": "b2a2648fa499f84a1cb0c53f8bb4c88b195c3abbe7258a37bb86cd2e411c24eb",
+    "skills/meshy-3d-printing/references/printing.md": "c44ebcc267e6c34d76f7c6bcecb3333e50b75eeb570c8d6f32609e5855d33f5e",
+    "skills/meshy-3d-printing/references/setup.md": "11e96cac86a088d1de036e7d9d34fdea63dbb559193fef7d097974f6541565eb",
+    "skills/meshy-3d-printing/references/troubleshooting.md": "592b8c2fbb1615032463d519a581d81c291663922b05cab5b6d2fab947e728c7"
+  }
+}

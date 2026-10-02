@@ -1,4 +1,4 @@
-"""Adapters wrap subscription-backed CLIs (claude, aas) so the UI never needs an API key.
+"""Adapters wrap subscription-backed runtimes so the UI never needs an API key.
 
 Each adapter is an async generator that yields events:
     {"type": "delta",  "text": "..."}      partial text
@@ -15,9 +15,45 @@ import json
 import os
 import pty
 import random
+import re
 import shutil
+import sys
 import termios
+from pathlib import Path
 from typing import AsyncIterator
+
+from openai_codex import (
+    ApprovalMode,
+    AsyncCodex,
+    CodexConfig,
+    Sandbox,
+    SkillInput,
+    TextInput,
+)
+from openai_codex.generated.v2_all import (
+    AgentMessageDeltaNotification,
+    AgentMessageThreadItem,
+    CommandExecutionThreadItem,
+    ErrorNotification,
+    FileChangeThreadItem,
+    ItemCompletedNotification,
+    McpToolCallThreadItem,
+    ReasoningEffort,
+    ReasoningSummaryTextDeltaNotification,
+    SkillsExtraRootsSetResponse,
+    ThreadTokenUsageUpdatedNotification,
+    TurnCompletedNotification,
+    TurnStartedNotification,
+    TurnStatus,
+    WebSearchThreadItem,
+)
+
+from .capabilities import (
+    codex_config_overrides,
+    enabled_inventory_skills,
+    inherited_capability_config,
+    plugin_extra_roots,
+)
 
 
 class AdapterError(Exception):
@@ -31,6 +67,93 @@ class AdapterError(Exception):
 # not found, and chunk exceed the limit") — which crashed the whole turn. We raise
 # the cap and, in the read loop, recover from an oversized line instead of raising.
 _READER_LIMIT = 64 * 2 ** 20  # 64 MiB
+
+# AgentUI-owned, destination-bound Notion MCP. The stdio server has no external
+# runtime dependencies, so it uses the same interpreter as the backend. Raw
+# Notion MCP writes are disabled only for scoped AgentUI subprocesses; the
+# user's normal terminal configuration remains untouched.
+_NOTION_REPORT_ROOT = (
+    Path(__file__).resolve().parents[1]
+    / "capability_inventory" / "mcp" / "agentui_notion_report"
+    / "implementation" / "notion_report"
+)
+_NOTION_REPORT_PYTHON = Path(sys.executable)
+_NOTION_REPORT_RUNNER = _NOTION_REPORT_ROOT / "run_mcp.py"
+_ENV_NAME_RE = re.compile(r"^[A-Z_][A-Z0-9_]*$")
+
+
+def _agentui_notion_scoped(extra_env: dict | None) -> bool:
+    if os.environ.get("AGENTUI_EVALUATION_MODE", "").lower() in {"1", "true"}:
+        return False
+    env = extra_env or {}
+    return bool(
+        _NOTION_REPORT_RUNNER.is_file()
+        and env.get("AGENTUI_PROJECT_SLUG")
+        and env.get("AGENTUI_AGENT_ID")
+    )
+
+
+def _codex_notion_env_vars(extra_env: dict | None) -> list[str]:
+    """Names Codex may forward to the destination-bound stdio MCP.
+
+    Codex intentionally does not pass arbitrary parent variables to stdio MCP
+    processes.  Its ``env_vars`` setting is an allow-list, so keep values out of
+    CLI arguments and forward only the scoped identity/config plus the token
+    variable name selected by the verified destination registry.
+    """
+    env = extra_env or {}
+    names = [
+        "AGENTUI_PROJECT_SLUG",
+        "AGENTUI_AGENT_ID",
+        "AGENTUI_PROJECT_NAME",
+        "AGENTUI_PROJECT_ROOT_AGENT_ID",
+        "NOTION_REPORT_CONFIG",
+    ]
+    token_env = str(env.get("AGENTUI_NOTION_TOKEN_ENV") or "").strip()
+    if token_env and _ENV_NAME_RE.fullmatch(token_env):
+        names.append(token_env)
+    return names
+
+
+def _notion_mcp_args(extra_env: dict | None) -> list[str]:
+    """Build a secret-free, immutable scope for the MCP launcher."""
+    env = extra_env or {}
+    args = [str(_NOTION_REPORT_RUNNER)]
+    project_slug = str(env.get("AGENTUI_PROJECT_SLUG") or "").strip()
+    agent_id = str(env.get("AGENTUI_AGENT_ID") or "").strip()
+    project_name = str(env.get("AGENTUI_PROJECT_NAME") or "").strip()
+    project_root_agent = str(env.get("AGENTUI_PROJECT_ROOT_AGENT_ID") or "").strip()
+    project_directory = str(env.get("AGENTUI_PROJECT_ROOT") or "").strip()
+    report_schema_file = str(env.get("AGENTUI_REPORT_SCHEMA_FILE") or "").strip()
+    config_path = str(env.get("NOTION_REPORT_CONFIG") or "").strip()
+    if project_slug and agent_id and config_path:
+        args.extend([
+            "--project", project_slug,
+            "--agent", agent_id,
+            "--config", config_path,
+        ])
+        if project_name:
+            args.extend(["--project-name", project_name])
+        if project_root_agent:
+            args.extend(["--project-root-agent", project_root_agent])
+        if project_directory and report_schema_file:
+            args.extend([
+                "--project-directory", project_directory,
+                "--report-schema-file", report_schema_file,
+            ])
+    return args
+
+
+def _claude_notion_mcp_config(extra_env: dict | None = None) -> str:
+    return json.dumps({
+        "mcpServers": {
+            "agentui_notion_report": {
+                "type": "stdio",
+                "command": str(_NOTION_REPORT_PYTHON),
+                "args": _notion_mcp_args(extra_env),
+            }
+        }
+    })
 
 
 # ---------------------------------------------------------------------------
@@ -66,10 +189,18 @@ async def claude_stream(
     # Placement matters: --disallowed-tools is VARIADIC, so it must never sit directly
     # before the positional prompt or it swallows the message as a tool name. Keep it
     # ahead of --model (always present), which terminates the variadic.
+    disallowed_tools = ["Agent", "Task"]
+    notion_scoped = _agentui_notion_scoped(extra_env)
+    if notion_scoped:
+        # The official Notion MCP may still exist in ~/.claude.json. Blocking its
+        # namespace removes the bypass while preserving the user's global config.
+        disallowed_tools.append("mcp__notion__*")
     cmd = ["claude", "-p", "--output-format", "stream-json", "--verbose",
            "--include-partial-messages", "--permission-mode", "bypassPermissions",
-           "--disallowed-tools", "Agent", "Task",
-           "--model", model]
+           "--disallowed-tools", *disallowed_tools]
+    if notion_scoped:
+        cmd += ["--mcp-config", _claude_notion_mcp_config(extra_env)]
+    cmd += ["--model", model]
     if effort:
         cmd += ["--effort", effort]
     if resume_session_id:
@@ -277,22 +408,172 @@ async def claude_stream(
 
 
 # ---------------------------------------------------------------------------
-# Codex adapter — `codex exec --json` is already line-buffered JSONL, so unlike
-# the Node-based Claude CLI it intentionally uses ordinary stdout pipes.
+# Codex adapter — uses the official Python SDK and its pinned app-server
+# runtime. AgentUI keeps its provider-neutral event contract while Codex owns
+# authentication, thread persistence, tool execution, and turn control.
 # ---------------------------------------------------------------------------
 
-def _codex_usage(raw: dict | None) -> dict:
-    """Normalize Codex counters into the existing, non-overlapping buckets."""
-    raw = raw or {}
+def _enum_value(value) -> str:
+    return str(getattr(value, "value", value) or "")
+
+
+def _model_json(value):
+    if hasattr(value, "model_dump"):
+        return value.model_dump(mode="json", by_alias=False)
+    return value
+
+
+def _codex_usage(raw) -> dict:
+    """Normalize SDK/CLI counters into the existing non-overlapping buckets."""
+    if raw is None:
+        raw = {}
+    elif hasattr(raw, "last"):
+        raw = raw.last
+    raw = _model_json(raw) or {}
+    if isinstance(raw, dict) and isinstance(raw.get("last"), dict):
+        raw = raw["last"]
+    if not isinstance(raw, dict):
+        raw = {}
     total_input = int(raw.get("input_tokens") or raw.get("input") or 0)
     cached = int(raw.get("cached_input_tokens") or raw.get("cached_input") or 0)
     fresh = int(raw.get("fresh_input_tokens") or max(0, total_input - cached))
     return {
         "input_tokens": fresh,
         "cache_read_input_tokens": cached,
-        "cache_creation_input_tokens": int(raw.get("cache_creation_input_tokens") or raw.get("cache_write_tokens") or 0),
+        "cache_creation_input_tokens": int(
+            raw.get("cache_write_input_tokens")
+            or raw.get("cache_creation_input_tokens")
+            or raw.get("cache_write_tokens")
+            or 0
+        ),
         "output_tokens": int(raw.get("output_tokens") or raw.get("output") or 0),
     }
+
+
+def _codex_sdk_settings(
+    extra_env: dict | None,
+    capability_policy: dict | None = None,
+) -> tuple[CodexConfig, Sandbox, ApprovalMode, str]:
+    sandbox_mode = os.environ.get(
+        "AGENTUI_CODEX_SANDBOX_MODE", "danger-full-access").strip()
+    if sandbox_mode not in {"read-only", "workspace-write", "danger-full-access"}:
+        sandbox_mode = "danger-full-access"
+    sandbox = {
+        "read-only": Sandbox.read_only,
+        "workspace-write": Sandbox.workspace_write,
+        "danger-full-access": Sandbox.full_access,
+    }[sandbox_mode]
+
+    approval_policy = os.environ.get(
+        "AGENTUI_CODEX_APPROVAL_POLICY", "never").strip()
+    if approval_policy not in {"untrusted", "on-failure", "on-request", "never"}:
+        approval_policy = "never"
+    approval_mode = (
+        ApprovalMode.deny_all
+        if approval_policy == "never"
+        else ApprovalMode.auto_review
+    )
+
+    overrides = ["features.multi_agent=false"]
+    if _agentui_notion_scoped(extra_env):
+        overrides.extend([
+            "mcp_servers.notion.enabled=false",
+            f"mcp_servers.agentui_notion_report.command={json.dumps(str(_NOTION_REPORT_PYTHON))}",
+            f"mcp_servers.agentui_notion_report.args={json.dumps(_notion_mcp_args(extra_env))}",
+            f"mcp_servers.agentui_notion_report.env_vars={json.dumps(_codex_notion_env_vars(extra_env))}",
+        ])
+    # Agent-local policy is appended last, so it can deliberately disable a
+    # control-plane-added MCP server without mutating ~/.codex/config.toml.
+    runtime_env = {**os.environ, **(extra_env or {})}
+    inherited = inherited_capability_config(runtime_env)
+    overrides.extend(codex_config_overrides(capability_policy, inherited, runtime_env))
+
+    child_env = {**os.environ, "NO_COLOR": "1", "TERM": "dumb", **(extra_env or {})}
+    if os.environ.get("AGENTUI_EVALUATION_MODE", "").lower() in {"1", "true"}:
+        # LangSmith credentials belong to AgentUI, not to the Codex runtime
+        # being evaluated.
+        child_env.pop("LANGSMITH_API_KEY", None)
+        child_env.pop("LANGCHAIN_API_KEY", None)
+
+    config = CodexConfig(
+        config_overrides=tuple(overrides),
+        env={str(k): str(v) for k, v in child_env.items()},
+        client_name="agentui",
+        client_title="AgentUI",
+    )
+    return config, sandbox, approval_mode, sandbox_mode
+
+
+def _codex_sdk_tool_event(item) -> dict | None:
+    root = getattr(item, "root", item)
+    if isinstance(root, CommandExecutionThreadItem):
+        return {
+            "type": "tool_use",
+            "tool": "command_execution",
+            "input": {
+                "command": root.command,
+                "cwd": str(root.cwd),
+                "status": _enum_value(root.status),
+                "exit_code": root.exit_code,
+            },
+        }
+    if isinstance(root, FileChangeThreadItem):
+        return {
+            "type": "tool_use",
+            "tool": "file_change",
+            "input": {
+                "changes": [_model_json(change) for change in root.changes],
+                "status": _enum_value(root.status),
+            },
+        }
+    if isinstance(root, McpToolCallThreadItem):
+        args = _model_json(root.arguments)
+        inp = dict(args) if isinstance(args, dict) else {"arguments": args}
+        inp.update({
+            "server": root.server,
+            "status": _enum_value(root.status),
+        })
+        if root.error is not None:
+            inp["error"] = _model_json(root.error)
+        return {"type": "tool_use", "tool": root.tool or "mcp_tool_call", "input": inp}
+    if isinstance(root, WebSearchThreadItem):
+        return {
+            "type": "tool_use",
+            "tool": "web_search",
+            "input": {"query": root.query, "status": "completed"},
+        }
+    return None
+
+
+def _codex_sdk_skill_reads(item, enabled_skills: list[dict]) -> list[dict]:
+    """Identify completed command reads of an enabled Idle-owned SKILL.md.
+
+    Codex app-server currently exposes explicit skills as turn inputs, but no
+    public ``skill/invoked`` notification.  A completed command containing the
+    canonical SKILL.md path is therefore the auditable signal for implicit
+    skill use.  The database de-duplicates this with explicit input for the
+    same skill and turn.
+    """
+    root = getattr(item, "root", item)
+    if not isinstance(root, CommandExecutionThreadItem):
+        return []
+    if _enum_value(root.status) != "completed":
+        return []
+    command = root.command or ""
+    repo_root = Path(__file__).resolve().parents[2]
+    matches: list[dict] = []
+    for skill in enabled_skills:
+        path = str(skill.get("path") or "")
+        if not path:
+            continue
+        aliases = {path}
+        try:
+            aliases.add(str(Path(path).resolve().relative_to(repo_root)))
+        except ValueError:
+            pass
+        if any(alias and alias in command for alias in aliases):
+            matches.append(skill)
+    return matches
 
 
 async def codex_stream(
@@ -302,101 +583,176 @@ async def codex_stream(
     model: str = "gpt-5.6-terra",
     effort: str | None = None,
     resume_session_id: str | None = None,
+    extra_env: dict | None = None,
+    capability_policy: dict | None = None,
+    requested_skills: list[dict] | None = None,
 ) -> AsyncIterator[dict]:
-    if shutil.which("codex") is None:
-        yield {"type": "error", "message": "codex CLI not found on PATH"}
-        return
-
-    # JSON encoding is also valid for a TOML basic string and safely preserves
-    # quotes, newlines, backslashes, and long AGENT.md prompts.
-    config = [
-        "-c", f"developer_instructions={json.dumps(system_prompt or '')}",
-        "-c", 'approval_policy="never"',
-        "-c", 'sandbox_mode="danger-full-access"',
-        "--disable", "multi_agent",
-        "--model", model,
-        "--json",
-    ]
-    if effort and effort != "default":
-        config[0:0] = ["-c", f'model_reasoning_effort="{effort}"']
-    if resume_session_id:
-        cmd = ["codex", "exec", "resume", *config, resume_session_id, "-"]
-    else:
-        cmd = ["codex", "exec", "--cd", cwd, *config, "-"]
-
-    proc = await asyncio.create_subprocess_exec(
-        *cmd, stdin=asyncio.subprocess.PIPE, stdout=asyncio.subprocess.PIPE,
-        stderr=asyncio.subprocess.PIPE, cwd=cwd,
-        env={**os.environ, "NO_COLOR": "1", "TERM": "dumb"},
-        limit=_READER_LIMIT,
+    config, sandbox, approval_mode, sandbox_mode = _codex_sdk_settings(
+        extra_env, capability_policy
     )
-    assert proc.stdin and proc.stdout
-    proc.stdin.write(message.encode("utf-8"))
-    await proc.stdin.drain()
-    proc.stdin.close()
-
+    codex = AsyncCodex(config=config)
+    turn = None
+    stream = None
     assembled: list[str] = []
-    thread_id: str | None = resume_session_id
+    streamed_message_ids: set[str] = set()
+    thread_id = resume_session_id
     usage: dict = {}
     failed: str | None = None
-    while True:
-        try:
-            raw_line = await proc.stdout.readline()
-        except (ValueError, asyncio.LimitOverrunError):
-            continue
-        if not raw_line:
-            break
-        try:
-            evt = json.loads(raw_line.decode("utf-8", errors="replace"))
-        except json.JSONDecodeError:
-            continue
-        etype = evt.get("type")
-        if etype == "thread.started":
-            thread_id = evt.get("thread_id") or evt.get("thread", {}).get("id")
-            yield {"type": "meta", "data": {
-                "claude_session_id": thread_id, "cli_adapter": "codex",
-                "model": model, "cwd": cwd, "permission_mode": "danger-full-access",
-                "init": True,
-            }}
-        elif etype in ("turn.started", "item.started"):
-            yield {"type": "status", "status": "thinking"}
-        elif etype in ("item.completed", "item.updated"):
-            item = evt.get("item") or {}
-            kind = item.get("type")
-            if kind in ("agent_message", "message") and etype == "item.completed":
-                text = item.get("text") or item.get("content") or ""
-                if isinstance(text, list):
-                    text = "".join(p.get("text", "") for p in text if isinstance(p, dict))
-                if text:
-                    assembled.append(text)
-            elif kind in ("command_execution", "mcp_tool_call", "file_change", "tool_call"):
-                tool = item.get("name") or kind
-                inp = item.get("input") or {}
-                if kind == "command_execution":
-                    inp = {"command": item.get("command"), "status": item.get("status")}
-                elif kind == "file_change":
-                    inp = {"changes": item.get("changes") or []}
-                yield {"type": "tool_use", "tool": tool, "input": inp}
-        elif etype == "turn.completed":
-            usage = _codex_usage(evt.get("usage"))
-        elif etype in ("turn.failed", "error"):
-            err = evt.get("error") or evt.get("message") or "Codex turn failed"
-            failed = err.get("message", str(err)) if isinstance(err, dict) else str(err)
+    completed_status: str | None = None
+    enabled_skills = enabled_inventory_skills(capability_policy)
+    enabled_by_path = {skill["path"]: skill for skill in enabled_skills}
+    turn_skills = [
+        enabled_by_path[skill["path"]]
+        for skill in (requested_skills or [])
+        if isinstance(skill, dict) and skill.get("path") in enabled_by_path
+    ]
 
-    rc = await proc.wait()
-    stderr = (await proc.stderr.read()).decode("utf-8", errors="replace") if proc.stderr else ""
-    if failed or rc:
-        yield {"type": "error", "message": failed or f"codex exited {rc}: {stderr[:500]}"}
+    try:
+        await codex.__aenter__()
+        extra_skill_roots = plugin_extra_roots(
+            capability_policy, {**os.environ, **(extra_env or {})}
+        )
+        if extra_skill_roots:
+            # The high-level SDK has not surfaced this app-server method yet.
+            # Keep the request scoped to this SDK process so downloaded plugin
+            # skills can be enabled for one agent without changing global config.
+            await codex._client.request(
+                "skills/extraRoots/set",
+                {"extraRoots": extra_skill_roots},
+                response_model=SkillsExtraRootsSetResponse,
+            )
+        if resume_session_id:
+            thread = await codex.thread_resume(
+                resume_session_id,
+                cwd=cwd,
+                developer_instructions=system_prompt or "",
+                model=model,
+                sandbox=sandbox,
+                approval_mode=approval_mode,
+            )
+        else:
+            thread = await codex.thread_start(
+                cwd=cwd,
+                developer_instructions=system_prompt or "",
+                model=model,
+                sandbox=sandbox,
+                approval_mode=approval_mode,
+            )
+        thread_id = thread.id
+        yield {"type": "meta", "data": {
+            "claude_session_id": thread_id,
+            "cli_adapter": "codex",
+            "codex_transport": "sdk",
+            "model": model,
+            "cwd": cwd,
+            "permission_mode": sandbox_mode,
+            "capability_revision": int((capability_policy or {}).get("revision") or 0),
+            "init": True,
+        }}
+
+        turn_effort = None
+        if effort and effort != "default":
+            turn_effort = ReasoningEffort(effort)
+        turn_input = [TextInput(message)]
+        turn_input.extend(
+            SkillInput(name=skill["name"], path=skill["path"])
+            for skill in turn_skills
+        )
+        turn = await thread.turn(
+            turn_input,
+            effort=turn_effort,
+            model=model,
+            sandbox=sandbox,
+            approval_mode=approval_mode,
+        )
+        for skill in turn_skills:
+            yield {
+                "type": "skill_use",
+                "skill": skill["name"],
+                "path": skill["path"],
+                "source": "explicit_input",
+                "thread_id": thread_id,
+                "turn_id": turn.id,
+            }
+        stream = turn.stream()
+        async for event in stream:
+            payload = event.payload
+            if isinstance(payload, TurnStartedNotification):
+                yield {"type": "status", "status": "thinking"}
+            elif isinstance(payload, AgentMessageDeltaNotification):
+                if payload.delta:
+                    streamed_message_ids.add(payload.item_id)
+                    assembled.append(payload.delta)
+                    yield {"type": "delta", "text": payload.delta}
+            elif isinstance(payload, ReasoningSummaryTextDeltaNotification):
+                if payload.delta:
+                    yield {"type": "thinking", "text": payload.delta}
+            elif isinstance(payload, ItemCompletedNotification):
+                root = getattr(payload.item, "root", payload.item)
+                if isinstance(root, AgentMessageThreadItem):
+                    if root.id not in streamed_message_ids and root.text:
+                        assembled.append(root.text)
+                        yield {"type": "delta", "text": root.text}
+                else:
+                    tool_event = _codex_sdk_tool_event(payload.item)
+                    if tool_event:
+                        yield tool_event
+                    for skill in _codex_sdk_skill_reads(payload.item, enabled_skills):
+                        yield {
+                            "type": "skill_use",
+                            "skill": skill["name"],
+                            "path": skill["path"],
+                            "source": "skill_file_read",
+                            "thread_id": payload.thread_id,
+                            "turn_id": payload.turn_id,
+                        }
+            elif isinstance(payload, ThreadTokenUsageUpdatedNotification):
+                usage = _codex_usage(payload.token_usage)
+            elif isinstance(payload, ErrorNotification):
+                if not payload.will_retry:
+                    failed = payload.error.message or "Codex turn failed"
+            elif isinstance(payload, TurnCompletedNotification):
+                completed_status = _enum_value(payload.turn.status)
+                if payload.turn.status == TurnStatus.completed:
+                    failed = None
+                elif payload.turn.error is not None:
+                    failed = payload.turn.error.message or failed
+    except asyncio.CancelledError:
+        if turn is not None:
+            try:
+                await asyncio.shield(turn.interrupt())
+            except Exception:
+                pass
+        raise
+    except Exception as exc:
+        failed = str(exc) or type(exc).__name__
+    finally:
+        if stream is not None:
+            try:
+                await stream.aclose()
+            except Exception:
+                pass
+        try:
+            await asyncio.shield(codex.close())
+        except Exception:
+            pass
+
+    if completed_status == TurnStatus.interrupted.value and not failed:
+        failed = "Codex turn interrupted"
+    elif completed_status == TurnStatus.failed.value and not failed:
+        failed = "Codex turn failed"
+    if failed:
+        yield {"type": "error", "message": failed}
         return
+
     text = "".join(assembled)
     if usage:
         yield {"type": "meta", "data": {"usage": usage}}
-    # Codex agent messages arrive atomically in JSONL; emitting here preserves the
-    # existing dispatch/schedule parser without pretending token-level streaming.
-    if text:
-        yield {"type": "delta", "text": text}
     yield {"type": "done", "text": text, "meta": {
-        "claude_session_id": thread_id, "cli_adapter": "codex", "usage": usage,
+        "claude_session_id": thread_id,
+        "cli_adapter": "codex",
+        "codex_transport": "sdk",
+        "usage": usage,
     }}
 
 
@@ -665,6 +1021,7 @@ async def deepseek_stream(
     model: str = "deepseek-v4-flash",
     effort: str | None = None,
     resume_session_id: str | None = None,
+    runtime_env: dict | None = None,
 ) -> AsyncIterator[dict]:
     key = os.environ.get("DEEPSEEK_API_KEY")
     if not key:
@@ -673,6 +1030,7 @@ async def deepseek_stream(
         return
     base_url = os.environ.get("DEEPSEEK_BASE_URL", "https://api.deepseek.com/anthropic")
     extra_env = {
+        **(runtime_env or {}),
         "ANTHROPIC_BASE_URL": base_url,
         "ANTHROPIC_API_KEY": key,
         "ANTHROPIC_AUTH_TOKEN": key,
@@ -737,6 +1095,7 @@ async def glm_stream(
     model: str = "glm-4.6",
     effort: str | None = None,
     resume_session_id: str | None = None,
+    runtime_env: dict | None = None,
 ) -> AsyncIterator[dict]:
     # Token source = the user's ~/.config/glm/env (the `glm` wrapper config),
     # falling back to GLM_API_KEY env var if the file is absent. ONE token,
@@ -750,6 +1109,7 @@ async def glm_stream(
     base_url = (cfg.get("GLM_BASE_URL") or os.environ.get("GLM_BASE_URL")
                 or "https://api.z.ai/api/anthropic")
     extra_env = {
+        **(runtime_env or {}),
         "ANTHROPIC_BASE_URL": base_url,
         "ANTHROPIC_API_KEY": key,
         "ANTHROPIC_AUTH_TOKEN": key,

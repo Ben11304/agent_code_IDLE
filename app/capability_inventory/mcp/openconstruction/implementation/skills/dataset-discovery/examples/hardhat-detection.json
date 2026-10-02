@@ -1,0 +1,16 @@
+{
+  "id": "hardhat-detection",
+  "request": "Find open datasets for construction safety helmet detection.",
+  "inputs": {
+    "task": "construction safety helmet detection",
+    "modality": "image",
+    "object_class": "hardhat, worker",
+    "annotation": "bounding boxes",
+    "license": "open"
+  },
+  "expected_outputs": [
+    "candidate_datasets",
+    "selection_notes",
+    "next_actions"
+  ]
+}

@@ -1,0 +1,15 @@
+{
+  "version": 1,
+  "destinations": {
+    "gelsight:BOSS": {
+      "project_slug": "gelsight",
+      "agent_id": "BOSS",
+      "parent_url": "https://www.notion.so/Research-Agent-Reports-00000000000000000000000000000000",
+      "parent_page_id": "00000000-0000-0000-0000-000000000000",
+      "token_env": "NOTION_GELSIGHT_TOKEN",
+      "workspace_id": "11111111-1111-1111-1111-111111111111",
+      "workspace_name": "Research Lab",
+      "parent_title": "Research Agent Reports"
+    }
+  }
+}

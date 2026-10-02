@@ -1,14 +1,47 @@
-# BUILD_HANDBOOK — Checklist tiến độ
+# BUILD_HANDBOOK — Checklist implementation
 
-> Trạng thái triển khai slim-overview. Cập nhật 2026-06-27.
-> Handbook gốc (đặc tả how-exact): `BUILD_HANDBOOK.md`. Spec: `system_architech.md`.
-> Repo: `VietHuy/DFU-Pipeline-AGENT/` (contract) + `VietHuy/agent_code_IDLE/` (control-plane).
+Đối chiếu working tree **2026-09-07**, không suy ra deployment/live test từ việc có code.
+Nguồn: [handbook](BUILD_HANDBOOK.md), [audit](docs/documentation-audit.md).
+Ký hiệu: ✅ có implementation · 🟡 có một phần/điều kiện · ⬜ chưa có.
 
-Ký hiệu: ✅ xong · 🟡 một phần · ⬜ chưa · 👤 cần user.
+| Hạng mục | Trạng thái | Evidence / giới hạn |
+|---|---|---|
+| Dispatch ledger + 3 continuations | ✅ | `_start_run`, `_dispatched_run`, `_format_results_as_context` |
+| Detached browser runs, replay, Stop | ✅ | `_Run`, `_run_subscriber_sse`; restart vẫn mất run/buffer |
+| Overview cold-start + fallback | ✅ | `_session_preamble`; input head 600/1200 chars |
+| Child overviews every parent turn | ✅ | `_children_overview_context`; không chỉ cold start |
+| Derived children rollup | ✅ | `_write_children_rollups`; object keyed by ID |
+| Structured parse + retry | 🟡 | Một retry; absent blocks hợp lệ, lần hai không có hard reject |
+| Stamp overview | 🟡 | Version/date/placeholder heuristic; không kiểm đủ role schema |
+| Version pin check | 🟡 | Python best-effort + warning; không auto sync/hard block |
+| Escalation state + route | ✅ | `db.open_escalation`, resolve, ledger parent đầu tiên |
+| DATA/SUBTASK/TOOL auto-resolution | ⬜ | Không tự pull/dispatch/execute theo escalation type |
+| HALT | 🟡 | Parse, log, ledger; evidence chỉ kiểm không rỗng |
+| DISSENT | 🟡 | DB open/resolve + prompt warning; không hard veto/role enforcement |
+| Verify watermark | 🟡 | Lưu claim, so version/hint; không cưỡng chế tool skip |
+| Goal acceptance / budget / plateau | 🟡 | External-acceptance guidance; metric/budget/plateau checker chưa có |
+| CONTINUE_SELF | ⬜ | Không có parser/resume path |
+| Multi-level dispatch | ✅ | Graph children + ancestor-loop rejection |
+| Global worker serialization | ⬜ | Busy guard chỉ nhìn root `_Run` |
+| Owner reconciliation | ✅ | Project opt-in; receipt/hash/provenance gate |
+| Progress archival | ✅ | Global toggle mặc định off; hai ngày hoạt động, explicit JSON migration |
+| New project/agent bootstrap | ✅ | Sáu agent files + shared templates + paper collection |
+| Bulk migration mọi project cũ | ⬜ | Không có generic overview-content migration |
+| Claude/Codex/Grok/DeepSeek/GLM | ✅ | `adapters.get_stream`; auth tùy adapter |
+| Capabilities | ✅ | Inventory local; per-agent policy áp dụng Codex; Delete global |
+| Persistent terminal | ✅ | tmux session + transient attachment; không session TTL |
+| Scheduler | ✅ | Ba mode, global toggle; không replay thời gian disabled |
+| Notion System Hub/project scope/report schema | ✅ | `notion_settings`, `notion_report`; runtime config cần verify riêng |
+| Offline evaluation harnesses | ✅ | BOSS/worker/reliability; kết quả remote không chạy lại trong audit |
+| Plan/todo trên graph | ⬜ | Đã chủ động xóa; không phải pending implementation |
 
----
+## Lịch sử pilot (không phải snapshot hiện tại)
 
-## A. Lớp contract/markdown — `DFU-Pipeline-AGENT/` (✅ HOÀN TẤT)
+Các bảng dưới được giữ để truy vết ghi nhận trước đây. Số corpus, phiên bản agent,
+trạng thái project ngoài repo, pass counts và live Notion không được xác minh lại
+trong audit tài liệu 2026-09-07. Kết quả kiểm tra của đợt này nằm trong audit.
+
+## H1. Ghi nhận 2026-06-27 — Lớp contract/markdown — `DFU-Pipeline-AGENT/` (✅ HOÀN TẤT)
 
 | # | Hạng mục | TT | File |
 |---|---|---|---|
@@ -26,52 +59,32 @@ Ký hiệu: ✅ xong · 🟡 một phần · ⬜ chưa · 👤 cần user.
 
 ---
 
-## B. Control-plane code — `agent_code_IDLE/app/backend/main.py` (đã `py_compile` PASS)
-
-| # | § | Hạng mục | TT | Ghi chú |
-|---|---|---|---|---|
-| B1 | §6.2 | `[AUGMENT]` `_session_preamble` inject `overview.md` + fallback | ✅ | down-cap manifest khi overview usable; `body_incomplete:true`/rỗng → giữ full manifest |
-| B2 | §6.4 | `[NEW]` `_parse_structured` (regex `[RESULT]`/`[ESCALATE]`, detect malformed) | ✅ | absent block ≠ malformed |
-| B3 | §6.4 | `[NEW]` `_read_manifest_version` + `_stamp_overview` (đóng dấu HEADER máy) | ✅ | manifest_version/last_updated/body_incomplete + open_escalation |
-| B4 | §6.4 | retry ĐÚNG 1 lần (param `retry_count`) wired vào finalize | ✅ | malformed → 1 corrective re-run; không loop |
-| B5 | §6.4 | escalate routing (superseded bởi B9) | ✅ | xem B9 |
-| B6 | §6.1 | Ledger `<dispatch_result>` | ✅ | REUSE nguyên, không đụng |
-| B7 | §6.3 | `[AUGMENT]` `_write_children_rollups` +3 field (`manifest_version`/`overview_path`/`body_incomplete`) | ✅ | smoke-test trên DFU: version+flag đọc đúng |
-| B8 | §6.5 | `[NEW]` `_check_version_pins` drift detect (Python, không phụ thuộc sync.sh exit) | ✅ | **soft-block** (warn+instruct vào message, KHÔNG hard-return → tránh deadlock self-sync). Bắt đúng drift INTEGRITY thật |
-| B9 | §6.6 | `[NEW]` `_handle_escalate` → route vào ledger của parent | ✅ | auto-pull(DATA)/auto-dispatch(SUBTASK)/tool(TOOL) **cố ý KHÔNG tự chạy** (rủi ro pull sai/chạy tool tùy ý) → đẩy BOSS arbitrate |
-| B10 | §6.8 | `[NEW]` acceptance goal-gate trong `_dispatched_run` | ✅ | enforce **PROCESS** (child tự-khai goal = CLAIM, không phải acceptance; route acceptance_by). Metric-plateau detector KHÔNG generic-được → không build |
-| B11 | §6.9 | `[AUGMENT]` `_format_results_as_context` digest + exception-guidance | ✅ | `[digest] status/goal/escalate/summary`; BOSS deep-read chỉ exception. Full-scan định kỳ (cần counter bền) **chưa** tự động |
-
----
-
-## C. Bootstrap / vận hành
+## H2. Ghi nhận 2026-08-07 — chuẩn tài nguyên dự án — cập nhật 2026-08-07
 
 | # | Hạng mục | TT | Ghi chú |
 |---|---|---|---|
-| C1 | overview.md lần đầu cho agent cũ (§8) | 🟡 | DFU làm TAY (6 file); chưa có script tự sinh cho AEC/VLM |
-| C2 | Restart uvicorn để nạp B1-B4 | 👤 ⬜ | **off-cluster only** (không OSC login node). `lsof -ti tcp:5174 \| xargs kill -9; cd app && ./run.sh` |
-| C3 | Acceptance tests §10 (A1-A10) | ⬜ | CHƯA chạy — sau khi restart |
+| F1 | Mỗi agent-system mới có `paper_collection/` | ✅ | Scaffold tự sinh `README.md` + `CATALOG.md` |
+| F2 | `.agentui/project.yaml` khai báo `papers.roots` + `papers.catalogs` | ✅ | PDF local và metadata-only cùng xuất hiện trên panel |
+| F3 | Ghép PDF với catalog bằng `ShortID` đầu filename | ✅ | Ví dụ `Yuan2017_....pdf` ↔ `**Yuan2017**` |
+| F4 | GELSIGHT migration | ✅ | 62 catalog entries; 3 local PDFs trong `GELSIGHT-AGENT/paper_collection/` |
+| F5 | Parent pre-flight đọc overview của mọi direct child mỗi turn | ✅ | Nội dung được inject thật vào prompt; UI phát vàng trên overview của child (tối thiểu 2.4 giây) |
 
 ---
 
-## D. Map theo build order spec §11
+## H3. Ghi nhận 2026-08-16 — Notion reporting cấp project — cập nhật 2026-08-16
 
-| Bước | Nội dung | TT |
-|---|---|---|
-| **P0** | §6.2 preamble + fallback | ✅ |
-| **P1** | schema overview ✅ · children_status +3 field (B7) ✅ · bootstrap tay | 🟡 (chỉ thiếu script bootstrap cho AEC/VLM) |
-| **P2** | Phase 0-4 vào AGENT.md + BOSS overview (DFU) | ✅ |
-| **P3** | parse/stamp/retry (B2-B4) ✅ · version-pin (B8) ✅ | ✅ |
-| **P4** | `_handle_escalate` (B9) ✅ + acceptance tests (C3) ⬜ | 🟡 (code xong; chưa chạy live) |
-| **P5** | goal grammar ✅ · acceptance gate code (B10) ✅ · agency: Propose&Commit field ✅, CONTINUE_SELF/micro-orch ⬜ | 🟡 |
-
----
-
-## E. Tóm tắt 1 dòng
-
-> **Contract DFU = XONG. Control-plane B1–B11 = XONG** (P0/§6.2 + §6.4 parse/stamp/retry + B7 rollup +
-> B8 drift + B9 escalate-route + B10 goal-gate + B11 digest) — `py_compile` PASS + smoke-test helper trên
-> DFU thật (version/flag/drift đọc đúng).
-> **Còn lại = vận hành + hardening:** 👤 restart off-cluster (C2) · chạy acceptance §10 live (C3) ·
-> bootstrap-script cho AEC/VLM (C1) · phần cố-ý-hoãn: escalate auto-resolve theo type, metric-plateau
-> detector, full-scan định kỳ, CONTINUE_SELF/micro-orchestrator (đều cần project-specific / state bền).
+| # | Hạng mục | TT | Ghi chú |
+|---|---|---|---|
+| G1 | Một binding Notion ở root dùng chung cho toàn project | ✅ | Worker resolve/inherit, không cần destination record riêng |
+| G2 | Canonical project/agent scope do backend inject qua MCP argv | ✅ | Model không còn tự gửi hoặc đoán slug/agent ID |
+| G3 | Một server token, secret không lưu trong destination registry/argv | ✅ | `env_vars` + scoped `.env.local` fallback cho Codex resume |
+| G4 | Worker thấy inherited Notion status nhưng không được rebind | ✅ | API trả `destination_owner_agent_id` + `inherited` |
+| G5 | Exact-child create/append + read-back | ✅ | Create cần `create_if_missing=true`; retry identical không duplicate |
+| G6 | Ambiguous/missing project destination fail closed | ✅ | Không workspace-root write, không tự chọn parent |
+| G7 | System Hub bind một lần cho toàn AgentUI | ✅ | Dashboard có UI + API `/api/notion-system-settings` |
+| G8 | Project mới auto-provision dưới Hub | ✅ | Exact child `<name> [<slug>]`, root-owned destination, inter-process lock |
+| G9 | Inventory/read toàn project subtree | ✅ | Page ngoài subtree bị reject; read trả content SHA-256 |
+| G10 | Managed report sync không đè manual content | ✅ | Dry-run mặc định; chỉ replace marker range; read-back bắt buộc |
+| G11 | Agent không còn yêu cầu cài Notion plugin | ✅ | Control-plane system prompt + raw/global Notion MCP bị disable |
+| G12 | Live GelSight read-only pilot | ✅ | 7 pages; `propose` 7 blocks; không truncate, không write |
+| G13 | Regression suite Notion | ✅ | 36 pass, 1 optional MCP SDK smoke skipped |

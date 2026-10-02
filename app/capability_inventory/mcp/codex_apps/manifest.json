@@ -1,0 +1,410 @@
+{
+  "schema_version": 1,
+  "id": "codex_apps",
+  "name": "codex_apps",
+  "description": "",
+  "auth_status": "bearerToken",
+  "baseline_enabled": true,
+  "controllable": false,
+  "runtime_managed": true,
+  "tool_inventory_complete": true,
+  "resource_count": 29,
+  "tools": [
+    {
+      "id": "codex_document_control.execute_document_command",
+      "name": "codex_document_control.execute_document_command",
+      "title": "execute_document_command",
+      "description": "Execute one supported surface-specific tool against a connected Codex document session. First call `list_document_sessions` to choose the intended `executor_session_id` and `supported_tools[].name`, then call `get_document_tool_schemas` for the selected `surface`, that `supported_tools[].name` as `tool_name`, and `version` before constructing `args`. `idemp…",
+      "baseline_enabled": true,
+      "read_only": false
+    },
+    {
+      "id": "codex_document_control.get_document_tool_schemas",
+      "name": "codex_document_control.get_document_tool_schemas",
+      "title": "get_document_tool_schemas",
+      "description": "Fetch the concrete input schemas for tools supported by a selected Codex document session before constructing `execute_document_command.args`. First call `list_document_sessions`, then pass the exact `surface`, selected `supported_tools[].name` as `tool_name`, and `version` values from that session's `supported_tools` records.",
+      "baseline_enabled": true,
+      "read_only": true
+    },
+    {
+      "id": "codex_document_control.list_document_sessions",
+      "name": "codex_document_control.list_document_sessions",
+      "title": "list_document_sessions",
+      "description": "List the user's currently connected Codex document sessions and the surface-specific tools each session supports. Call this before executing a document-control command so you can choose the intended `executor_session_id` and `supported_tools[].name`.",
+      "baseline_enabled": true,
+      "read_only": true
+    },
+    {
+      "id": "hotline.get_local_hotline",
+      "name": "hotline.get_local_hotline",
+      "title": "get_local_hotline",
+      "description": "Look up local suicide or self harm helpline information for the user based on country inferred from the conversation. You must use this tool before providing a suicide or self-harm helpline; do not use web search or guess the suicide or self harm helpline information.",
+      "baseline_enabled": true,
+      "read_only": true
+    },
+    {
+      "id": "plugin_management.get_app_permissions",
+      "name": "plugin_management.get_app_permissions",
+      "title": "get_app_permissions",
+      "description": "Inspect one named ChatGPT plugin's global/default and plugin-specific permission settings. Use when the user asks what the plugin may read, write, or do, whether it must ask first, or whether it inherits the default. For a missing/broad target such as my plugins, all, or Google, make no call and ask which plugin. Never pass global. Do not use for OAuth/admi…",
+      "baseline_enabled": true,
+      "read_only": true
+    },
+    {
+      "id": "plugin_management.get_plugin_dependencies",
+      "name": "plugin_management.get_plugin_dependencies",
+      "title": "get_plugin_dependencies",
+      "description": "Resolve the canonical public plugins declared by one plugin's app manifest. Use only when a skill or user explicitly asks for dependency metadata. Pass a plugin ID or name@marketplace reference unchanged. Named references resolve by globally listed plugin name. This reports metadata plus current user-aware plugin status, installation policy, and installed s…",
+      "baseline_enabled": true,
+      "read_only": true
+    },
+    {
+      "id": "plugin_management.uninstall_app",
+      "name": "plugin_management.uninstall_app",
+      "title": "uninstall_app",
+      "description": "Uninstall ChatGPT plugins only for explicit uninstall, remove, or disconnect intent. Pass every exact, user-approved target in one call. For a missing/broad target such as Google, all/risky plugins, or a choice left to you, make no call and ask. Disable is not uninstall. Never use this for install/connect/undo/how-to, sentiment, negation, ordinary plugin us…",
+      "baseline_enabled": true,
+      "read_only": false
+    },
+    {
+      "id": "plugin_management.update_app_permissions",
+      "name": "plugin_management.update_app_permissions",
+      "title": "update_app_permissions",
+      "description": "Update global ChatGPT plugin permissions or a plugin-specific override. Omit app_id for global-only updates and provide it for plugin-specific updates. Map Always ask to always_ask, Any changes to ask_before_writes, Important actions to review_important_actions, Never ask to full_access, and Use my default to inherit. For plugin-specific changes, a missing/…",
+      "baseline_enabled": true,
+      "read_only": false
+    },
+    {
+      "id": "safety_settings.get_family_info",
+      "name": "safety_settings.get_family_info",
+      "title": "get_family_info",
+      "description": "Call first for any Parental Controls question or action, including unnamed children. Returns Family status, product information, and authorized member IDs.",
+      "baseline_enabled": true,
+      "read_only": true
+    },
+    {
+      "id": "safety_settings.get_parental_controls",
+      "name": "safety_settings.get_parental_controls",
+      "title": "get_parental_controls",
+      "description": "Read one family member's controls. Call get_family_info first; use only an ID from its latest result.",
+      "baseline_enabled": true,
+      "read_only": true
+    },
+    {
+      "id": "safety_settings.get_trusted_contact",
+      "name": "safety_settings.get_trusted_contact",
+      "title": "get_trusted_contact",
+      "description": "Call first for any Trusted Contact setup, status, privacy, or notification question. Returns product information and active, pending, or unconfigured status.",
+      "baseline_enabled": true,
+      "read_only": true
+    },
+    {
+      "id": "safety_settings.prepare_parental_control_update",
+      "name": "safety_settings.prepare_parental_control_update",
+      "title": "prepare_parental_control_update",
+      "description": "Validate one authorized parental-control change and return the exact approval summary and operation ID. If already set, stop. Does not change the child's settings.",
+      "baseline_enabled": true,
+      "read_only": true
+    },
+    {
+      "id": "safety_settings.update_parental_control",
+      "name": "safety_settings.update_parental_control",
+      "title": "update_parental_control",
+      "description": "Apply a prepared parental-control change only after the parent explicitly approves its exact confirmation summary.",
+      "baseline_enabled": true,
+      "read_only": false
+    },
+    {
+      "id": "sites.add_custom_domain",
+      "name": "sites.add_custom_domain",
+      "title": "add_custom_domain",
+      "description": "Add a custom domain to a published site. The response includes a CNAME target for subdomains, A record targets for zone apex domains, and all App Garden and Cloudflare validation records that must be set before the custom domain can route to the Site. This tool is part of plugin `Sites`.",
+      "baseline_enabled": true,
+      "read_only": false
+    },
+    {
+      "id": "sites.change_site_slug",
+      "name": "sites.change_site_slug",
+      "title": "change_site_slug",
+      "description": "Change a site's public URL label. The change runs asynchronously. When the result is pending, use get_site to observe the current slug; do not call this mutation again to poll. This tool is part of plugin `Sites`.",
+      "baseline_enabled": true,
+      "read_only": false
+    },
+    {
+      "id": "sites.check_slug_availability",
+      "name": "sites.check_slug_availability",
+      "title": "check_slug_availability",
+      "description": "Check a candidate public Sites slug before creating a site. This tool is part of plugin `Sites`.",
+      "baseline_enabled": true,
+      "read_only": true
+    },
+    {
+      "id": "sites.create_site",
+      "name": "sites.create_site",
+      "title": "create_site",
+      "description": "Create a site only when .openai/hosting.json has no project_id. If it has one, reuse that site. Never call this tool more than once for the same local site. This tool does not create local source. Immediately merge the response's id unchanged as project_id into .openai/hosting.json, preserving all other fields, and write the file atomically. When present, u…",
+      "baseline_enabled": true,
+      "read_only": false
+    },
+    {
+      "id": "sites.create_source_repository_write_credential",
+      "name": "sites.create_source_repository_write_credential",
+      "title": "create_source_repository_write_credential",
+      "description": "Create a short-lived source repository write credential when the credential returned by create_site is missing or no longer usable. Use it to push the source state later referenced by commit_sha. The credential can be reused until it expires; use per-command Git authentication. Never expose or persist its token. This tool is part of plugin `Sites`.",
+      "baseline_enabled": true,
+      "read_only": false
+    },
+    {
+      "id": "sites.delete_site",
+      "name": "sites.delete_site",
+      "title": "delete_site",
+      "description": "Permanently delete a site. Use only when the user explicitly asks to delete the site. This does not unpublish or roll back a deployment and does not delete local files. This tool is part of plugin `Sites`.",
+      "baseline_enabled": true,
+      "read_only": false
+    },
+    {
+      "id": "sites.deploy_private_site_version",
+      "name": "sites.deploy_private_site_version",
+      "title": "deploy_private_site_version",
+      "description": "Deploy a saved site version to production for a site created in the current flow whose owner-only access has not changed, or an existing site already known to be owner-private for the selected account. The backend also requires verified owner-only access that makes the current caller the sole explicitly allowed viewer and allows no groups. Never use this to…",
+      "baseline_enabled": true,
+      "read_only": false
+    },
+    {
+      "id": "sites.deploy_site_version",
+      "name": "sites.deploy_site_version",
+      "title": "deploy_site_version",
+      "description": "Deploy a saved site version to production when the site is shared, public, cannot be verified as owner-only, or private deployment is unavailable. For existing sites not already known to be owner-private for the selected account, call get_site before deployment to resolve the current audience. This remains an open-world deployment. Privately publish a Site…",
+      "baseline_enabled": true,
+      "read_only": false
+    },
+    {
+      "id": "sites.generate_siwc_bypass_token",
+      "name": "sites.generate_siwc_bypass_token",
+      "title": "generate_siwc_bypass_token",
+      "description": "Generate a bearer token for identity-less API requests that bypasses a site's Sign in with ChatGPT gate. Call this explicit token tool only when the user asks for a bypass token. Calling this tool creates a token if none exists, or rotates and immediately invalidates the existing token. Pass the returned token as OAI-Sites-Authorization: Bearer {siwc_bypass…",
+      "baseline_enabled": true,
+      "read_only": false
+    },
+    {
+      "id": "sites.get_database_overview",
+      "name": "sites.get_database_overview",
+      "title": "get_database_overview",
+      "description": "Inspect D1 bindings and tables for the Sites Settings database viewer. This tool is part of plugin `Sites`.",
+      "baseline_enabled": true,
+      "read_only": true
+    },
+    {
+      "id": "sites.get_database_table_rows",
+      "name": "sites.get_database_table_rows",
+      "title": "get_database_table_rows",
+      "description": "Read one page of database rows for the Sites Settings database viewer. This tool is part of plugin `Sites`.",
+      "baseline_enabled": true,
+      "read_only": true
+    },
+    {
+      "id": "sites.get_deployment_status",
+      "name": "sites.get_deployment_status",
+      "title": "get_deployment_status",
+      "description": "Get the current status of a production deployment. Only poll when a deployment ID is available; the deployment owns its saved version, so do not supply version_id. Continue polling a non-terminal deployment when progress is requested, unless the user asks to stop. On success, report the production URL. On failure, report the failure message and the site, ve…",
+      "baseline_enabled": true,
+      "read_only": true
+    },
+    {
+      "id": "sites.get_environment",
+      "name": "sites.get_environment",
+      "title": "get_environment",
+      "description": "Deprecated legacy Codex app alias. Use get_environment_variables instead. This tool is part of plugin `Sites`.",
+      "baseline_enabled": true,
+      "read_only": true
+    },
+    {
+      "id": "sites.get_environment_variables",
+      "name": "sites.get_environment_variables",
+      "title": "get_environment_variables",
+      "description": "Get the production runtime environment variables for a site. These values are separate from local .env files and .openai/hosting.json. This tool is part of plugin `Sites`.",
+      "baseline_enabled": true,
+      "read_only": true
+    },
+    {
+      "id": "sites.get_project",
+      "name": "sites.get_project",
+      "title": "get_project",
+      "description": "Deprecated legacy Codex app alias. Use get_site instead. This tool is part of plugin `Sites`.",
+      "baseline_enabled": true,
+      "read_only": true
+    },
+    {
+      "id": "sites.get_site",
+      "name": "sites.get_site",
+      "title": "get_site",
+      "description": "Get a site and its current access configuration, including external visitors. For a Library Site result, copy its server-returned site_metadata.project_id unchanged as project_id; the Library text is only a captured publication. external_visitor_invites_enabled says whether the owner may add external viewers. Set include_mcp_connection=true to include the s…",
+      "baseline_enabled": true,
+      "read_only": true
+    },
+    {
+      "id": "sites.get_site_analytics_overview",
+      "name": "sites.get_site_analytics_overview",
+      "title": "get_site_analytics_overview",
+      "description": "Get overall and hourly or daily page views, unique visitors, and the top five pages for a site analytics dashboard. Hourly windows may be up to 30 days and daily windows up to 90 days. Both timestamps must align to the requested bucket anchored at fixed UTC-08:00. This tool is part of plugin `Sites`.",
+      "baseline_enabled": true,
+      "read_only": true
+    },
+    {
+      "id": "sites.get_site_version",
+      "name": "sites.get_site_version",
+      "title": "get_site_version",
+      "description": "Get a saved site version and its source provenance. Retain version_id for follow-up calls, but report the user-facing version number when possible. This tool is part of plugin `Sites`.",
+      "baseline_enabled": true,
+      "read_only": true
+    },
+    {
+      "id": "sites.get_site_worker_logs",
+      "name": "sites.get_site_worker_logs",
+      "title": "get_site_worker_logs",
+      "description": "Read recent production Cloudflare Worker logs for a Site when diagnosing why a deployed website is crashing, returning an error, or failing after a click or tap. Resolve the exact Site from the current thread, its deployed URL, or Sites discovery tools. The user does not need to name this tool. For a reported failure, start with errors_only=true and widen t…",
+      "baseline_enabled": true,
+      "read_only": true
+    },
+    {
+      "id": "sites.list_custom_domains",
+      "name": "sites.list_custom_domains",
+      "title": "list_custom_domains",
+      "description": "List custom domains attached to a site. This tool is part of plugin `Sites`.",
+      "baseline_enabled": true,
+      "read_only": true
+    },
+    {
+      "id": "sites.list_projects",
+      "name": "sites.list_projects",
+      "title": "list_projects",
+      "description": "Deprecated legacy Codex app alias. Use list_sites instead. This tool is part of plugin `Sites`.",
+      "baseline_enabled": true,
+      "read_only": true
+    },
+    {
+      "id": "sites.list_site_analytics_events",
+      "name": "sites.list_site_analytics_events",
+      "title": "list_site_analytics_events",
+      "description": "List custom event names observed for a site during a window of up to 90 days. This tool is part of plugin `Sites`.",
+      "baseline_enabled": true,
+      "read_only": true
+    },
+    {
+      "id": "sites.list_site_versions",
+      "name": "sites.list_site_versions",
+      "title": "list_site_versions",
+      "description": "List saved site versions in newest-first order for history, deployment, or rollback selection. A saved version is not necessarily deployed to production. This tool is part of plugin `Sites`.",
+      "baseline_enabled": true,
+      "read_only": true
+    },
+    {
+      "id": "sites.list_sites",
+      "name": "sites.list_sites",
+      "title": "list_sites",
+      "description": "List Sites you own in the selected account, including personal accounts. Use role=editor for shared editable Sites; use search_sites for broader workspace discovery. If .openai/hosting.json has project_id, reuse it without listing. Otherwise use a returned item's id unchanged as project_id; never derive or replace it from a title or slug. This tool is part…",
+      "baseline_enabled": true,
+      "read_only": true
+    },
+    {
+      "id": "sites.list_sites_creator_control_panel_projects",
+      "name": "sites.list_sites_creator_control_panel_projects",
+      "title": "list_sites_creator_control_panel_projects",
+      "description": "List the next page of projects for the Sites control panel. This tool is part of plugin `Sites`.",
+      "baseline_enabled": true,
+      "read_only": true
+    },
+    {
+      "id": "sites.query_site_analytics_event",
+      "name": "sites.query_site_analytics_event",
+      "title": "query_site_analytics_event",
+      "description": "Query daily occurrence counts and unique visitors for one custom site event. The requested window may be up to 90 days and must align to daily buckets anchored at fixed UTC-08:00. This tool is part of plugin `Sites`.",
+      "baseline_enabled": true,
+      "read_only": true
+    },
+    {
+      "id": "sites.read_database_overview",
+      "name": "sites.read_database_overview",
+      "title": "read_database_overview",
+      "description": "Inspect the user tables in a deployed site's live Cloudflare D1 database before reading rows. Returns only exact binding and table names that fit the bounded model response; identifiers are omitted rather than truncated, with omission counts in model_projection. Use exact returned names in subsequent calls. If an identifier is omitted, use the Sites Setting…",
+      "baseline_enabled": true,
+      "read_only": true
+    },
+    {
+      "id": "sites.read_database_table_rows",
+      "name": "sites.read_database_table_rows",
+      "title": "read_database_table_rows",
+      "description": "Read one bounded page of rows from a user table in a deployed site's live Cloudflare D1 database. Call read_database_overview first and pass exact binding and table names from its response. Table names are validated against the schema and results are read-only. Use model_projection.next_offset for the next page when present. Returned schema names, column na…",
+      "baseline_enabled": true,
+      "read_only": true
+    },
+    {
+      "id": "sites.refresh_custom_domain_status",
+      "name": "sites.refresh_custom_domain_status",
+      "title": "refresh_custom_domain_status",
+      "description": "Refresh custom domain validation status for a site. This tool is part of plugin `Sites`.",
+      "baseline_enabled": true,
+      "read_only": false
+    },
+    {
+      "id": "sites.remove_custom_domain",
+      "name": "sites.remove_custom_domain",
+      "title": "remove_custom_domain",
+      "description": "Remove a custom domain from a site. This tool is part of plugin `Sites`.",
+      "baseline_enabled": true,
+      "read_only": false
+    },
+    {
+      "id": "sites.save_site_version",
+      "name": "sites.save_site_version",
+      "title": "save_site_version",
+      "description": "Save a site version. After the source push exits successfully, run `git rev-parse --verify HEAD` in the Site checkout. Copy its full SHA output verbatim as commit_sha; never guess, reconstruct, or pad it from abbreviated commit or push output. The SHA must match the current HEAD of the site's configured remote source branch and identify the source used to b…",
+      "baseline_enabled": true,
+      "read_only": false
+    },
+    {
+      "id": "sites.update_access",
+      "name": "sites.update_access",
+      "title": "update_access",
+      "description": "Deprecated legacy Codex app alias. Use update_site_access instead. This tool is part of plugin `Sites`.",
+      "baseline_enabled": true,
+      "read_only": false
+    },
+    {
+      "id": "sites.update_environment",
+      "name": "sites.update_environment",
+      "title": "update_environment",
+      "description": "Deprecated legacy Codex app alias. Use update_environment_variables instead. This tool is part of plugin `Sites`.",
+      "baseline_enabled": true,
+      "read_only": false
+    },
+    {
+      "id": "sites.update_environment_variables",
+      "name": "sites.update_environment_variables",
+      "title": "update_environment_variables",
+      "description": "Update production runtime environment variables for a site. Only listed keys change; all others remain unchanged. Store runtime values in Sites, not .openai/hosting.json. Deploy a saved version after any change to apply the new environment revision. This tool is part of plugin `Sites`.",
+      "baseline_enabled": true,
+      "read_only": false
+    },
+    {
+      "id": "sites.update_site_access",
+      "name": "sites.update_site_access",
+      "title": "update_site_access",
+      "description": "Update who can visit a site only when the user asks to change access. Set access_mode only when the user explicitly requests a different audience; omit it for collaborator-only updates. Never change the audience to deploy a site. The owner always remains allowed. For workspace sites, call list_available_access_groups before adding groups and use only the ID…",
+      "baseline_enabled": true,
+      "read_only": false
+    },
+    {
+      "id": "sites.update_site_metadata",
+      "name": "sites.update_site_metadata",
+      "title": "update_site_metadata",
+      "description": "Update a site's display title. This does not change the site's public URL. This tool is part of plugin `Sites`.",
+      "baseline_enabled": true,
+      "read_only": false
+    }
+  ],
+  "launch": {
+    "managed_by": "codex-runtime",
+    "transport": "runtime-aggregate"
+  }
+}

@@ -1,0 +1,3 @@
+# The MCP stdio transport and Notion HTTP client use only Python's standard
+# library. PyYAML loads optional project-owned report forms.
+PyYAML>=6.0

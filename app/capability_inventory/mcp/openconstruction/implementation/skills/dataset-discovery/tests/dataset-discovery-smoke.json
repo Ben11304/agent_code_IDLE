@@ -1,0 +1,15 @@
+{
+  "id": "dataset-discovery-smoke",
+  "tool": "run_dataset_discovery",
+  "inputs": {
+    "task": "helmet detection",
+    "modality": "image",
+    "object_class": "hardhat",
+    "annotation": "bounding boxes"
+  },
+  "checks": [
+    "returns at least one candidate when catalog metadata is available",
+    "each candidate includes a title, resource id, fit score, and fit reasons",
+    "response includes next actions for inspection or comparison"
+  ]
+}

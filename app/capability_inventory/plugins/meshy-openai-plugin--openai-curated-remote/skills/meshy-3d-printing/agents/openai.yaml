@@ -1,0 +1,5 @@
+interface:
+  display_name: "Meshy 3D Printing"
+  short_description: "Prepare models for 3D printing"
+  icon_small: "./assets/meshy-composer-icon.svg"
+  default_prompt: "Use $meshy-3d-printing to prepare this Meshy model for 3D printing."

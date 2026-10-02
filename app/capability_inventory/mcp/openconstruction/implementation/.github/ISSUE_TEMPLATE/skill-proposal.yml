@@ -1,0 +1,125 @@
+name: Skill proposal
+description: Propose a new OpenConstruction skill workflow.
+title: "Skill proposal: "
+labels:
+  - skill-proposal
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Share a proposed OpenConstruction workflow. Maintainers will help turn strong proposals into accepted skill files.
+  - type: input
+    id: skill_name
+    attributes:
+      label: Skill name
+      placeholder: Dataset comparison
+    validations:
+      required: true
+  - type: dropdown
+    id: lifecycle_stage
+    attributes:
+      label: Lifecycle stage
+      options:
+        - discover
+        - select
+        - access
+        - understand
+        - analyze
+        - execute
+    validations:
+      required: true
+  - type: input
+    id: source_url
+    attributes:
+      label: Skill source URL
+      description: Link to a GitHub folder, ZIP file, or documentation page that reviewers can inspect.
+      placeholder: https://github.com/org/repo/tree/main/skills/my-skill
+    validations:
+      required: true
+  - type: textarea
+    id: user_problem
+    attributes:
+      label: User problem
+      placeholder: What should this skill help a user do?
+    validations:
+      required: true
+  - type: textarea
+    id: inputs
+    attributes:
+      label: Inputs
+      placeholder: task, modality, resource ids, license preference...
+    validations:
+      required: true
+  - type: textarea
+    id: outputs
+    attributes:
+      label: Outputs
+      placeholder: ranked candidates, checks, comparison table, next actions...
+    validations:
+      required: true
+  - type: textarea
+    id: tool_plan
+    attributes:
+      label: Tool plan
+      placeholder: Which API or MCP tools should this workflow call, and in what order?
+    validations:
+      required: false
+  - type: input
+    id: license
+    attributes:
+      label: License
+      placeholder: Apache-2.0
+    validations:
+      required: true
+  - type: textarea
+    id: rights
+    attributes:
+      label: Copyright and permission
+      placeholder: Who owns the skill content, examples, and any attached files? Do you have permission to share them?
+    validations:
+      required: true
+  - type: textarea
+    id: verification
+    attributes:
+      label: Verification notes
+      placeholder: How should reviewers test this skill?
+    validations:
+      required: false
+  - type: textarea
+    id: example_requests
+    attributes:
+      label: Example requests
+      placeholder: Add 2-3 realistic user requests.
+    validations:
+      required: true
+  - type: textarea
+    id: metadata_json
+    attributes:
+      label: Proposed metadata.json
+      description: Paste a draft skill metadata JSON object if you have one.
+      render: json
+      placeholder: |
+        {
+          "id": "dataset-comparison",
+          "name": "Dataset Comparison",
+          "lifecycle_stage": "select",
+          "inputs": [],
+          "outputs": [],
+          "tools": [],
+          "permissions": ["read_openconstruction"],
+          "license": "Apache-2.0",
+          "source_url": "",
+          "rights": {},
+          "verification": {}
+        }
+    validations:
+      required: false
+  - type: checkboxes
+    id: checklist
+    attributes:
+      label: Submission checklist
+      options:
+        - label: This proposal describes a workflow, not only a prompt.
+          required: true
+        - label: This proposal does not include private or sensitive data.
+          required: true

@@ -81,6 +81,9 @@ body { margin: 0; background: var(--surface-1); }
 .dash-head .spacer { margin-left: auto; }
 .dash a.back { color: var(--dash-dim); text-decoration: none; font-size: 12px; }
 .dash a.back:hover { color: var(--dash-text); text-decoration: underline; }
+.system-notion-btn { border: 1px solid var(--dash-line); border-radius: 8px; padding: 6px 10px;
+  background: transparent; color: var(--dash-text); font: inherit; font-size: 12px; cursor: pointer; }
+.system-notion-btn:hover { border-color: var(--series-1); }
 
 /* filters: one row above the charts */
 .filters { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; margin-bottom: 16px; }
@@ -131,6 +134,107 @@ table.tbl { width: 100%; border-collapse: collapse; font-size: 12.5px; }
 .agent-cell { display: inline-flex; align-items: center; gap: 6px; }
 .agent-cell i { width: 9px; height: 9px; border-radius: 2px; }
 .mono { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 11.5px; }
+.agent-settings-cell { width: 34px; text-align: right; }
+.agent-settings-btn { width: 28px; height: 28px; display: inline-grid; place-items: center;
+  border: 1px solid transparent; border-radius: 7px; background: transparent; color: var(--dash-dim);
+  font: 17px/1 system-ui, sans-serif; cursor: pointer; }
+.agent-settings-btn:hover, .agent-settings-btn:focus-visible { color: var(--dash-text);
+  border-color: var(--dash-line); background: color-mix(in srgb, var(--dash-line) 62%, transparent); outline: none; }
+
+/* Per-agent settings dialog. The backdrop owns the viewport so the panel remains
+   centered even when the dashboard table is horizontally scrolled. */
+.agent-settings-backdrop { position: fixed; inset: 0; z-index: 100; display: grid; place-items: center;
+  padding: 24px; background: rgba(0,0,0,.46); backdrop-filter: blur(2px); }
+.agent-settings-backdrop[hidden] { display: none; }
+.agent-settings-panel { width: min(560px, calc(100vw - 36px)); max-height: calc(100vh - 48px); overflow: auto;
+  border: 1px solid var(--dash-line); border-radius: 14px; background: var(--surface-1);
+  box-shadow: 0 22px 70px rgba(0,0,0,.32); }
+.agent-settings-head { display: flex; align-items: center; gap: 10px; padding: 16px 18px;
+  border-bottom: 1px solid var(--dash-line); }
+.agent-settings-title { font-size: 15px; font-weight: 650; }
+.agent-settings-sub { color: var(--dash-dim); font-size: 11.5px; }
+.agent-settings-close { margin-left: auto; width: 30px; height: 30px; border: 0; border-radius: 7px;
+  background: transparent; color: var(--dash-dim); font: 22px/1 system-ui; cursor: pointer; }
+.agent-settings-close:hover { background: var(--dash-line); color: var(--dash-text); }
+.agent-settings-body { padding: 18px; }
+.settings-section-title { font-size: 12px; font-weight: 650; text-transform: uppercase;
+  letter-spacing: .06em; margin-bottom: 10px; }
+.settings-field { display: grid; gap: 6px; }
+.settings-field label { font-size: 12px; font-weight: 600; }
+.settings-field input { width: 100%; box-sizing: border-box; border: 1px solid var(--dash-line);
+  border-radius: 8px; padding: 9px 10px; background: var(--surface-1); color: var(--dash-text);
+  font: 12px/1.4 ui-monospace, SFMono-Regular, Menlo, monospace; }
+.settings-field input:focus { outline: 2px solid color-mix(in srgb, var(--series-1) 35%, transparent);
+  border-color: var(--series-1); }
+.settings-help, .settings-empty { margin-top: 8px; color: var(--dash-dim); font-size: 11.5px; }
+.settings-status { margin-top: 12px; min-height: 20px; font-size: 12px; }
+.settings-status.good { color: var(--st-good); }
+.settings-status.error { color: var(--st-crit); }
+.settings-actions { display: flex; justify-content: flex-end; gap: 8px; margin-top: 16px; }
+.settings-actions button { border: 1px solid var(--dash-line); border-radius: 8px; padding: 7px 12px;
+  background: transparent; color: var(--dash-text); font: inherit; cursor: pointer; }
+.settings-actions .primary { border-color: var(--series-1); background: var(--series-1); color: #fff; }
+.settings-actions button:disabled { opacity: .55; cursor: wait; }
+
+/* Per-agent Codex capability control. The inventory is intentionally split into
+   two columns: skills are a short list, while MCP can contain many nested tools. */
+.cap-controls { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; margin-bottom: 12px; }
+.cap-controls select, .cap-controls input { border: 1px solid var(--dash-line); border-radius: 8px;
+  background: var(--surface-1); color: var(--dash-text); padding: 7px 9px; font: inherit; font-size: 12px; }
+.cap-controls select { min-width: 260px; }
+.cap-controls input { flex: 1; min-width: 220px; }
+.cap-controls button { border: 1px solid var(--dash-line); border-radius: 8px; padding: 7px 11px;
+  background: transparent; color: var(--dash-text); font: inherit; cursor: pointer; }
+.cap-controls button:hover { border-color: var(--series-1); }
+.cap-controls button.active { border-color: var(--series-1); color: var(--series-1);
+  background: color-mix(in srgb, var(--series-1) 10%, transparent); }
+.cap-controls button:disabled { opacity: .5; cursor: wait; }
+.cap-notice { margin-bottom: 12px; border: 1px solid var(--dash-line); border-radius: 9px;
+  padding: 9px 11px; color: var(--dash-dim); font-size: 11.5px; }
+.cap-notice.good { border-color: color-mix(in srgb, var(--st-good) 40%, var(--dash-line)); }
+.cap-notice.error { color: var(--st-crit); border-color: color-mix(in srgb, var(--st-crit) 45%, var(--dash-line)); }
+.cap-layout { display: grid; grid-template-columns: minmax(280px, .8fr) minmax(420px, 1.2fr); gap: 14px; }
+.cap-layout .panel { margin: 0; min-width: 0; }
+.cap-layout .cap-plugin-panel { grid-column: 1 / -1; }
+.cap-list { display: grid; gap: 7px; margin-top: 10px; }
+.cap-row { display: flex; align-items: center; gap: 9px; border-top: 1px solid var(--dash-line);
+  padding: 9px 2px; }
+.cap-row:first-child { border-top: 0; }
+.cap-row.off { opacity: .58; }
+.cap-copy { min-width: 0; flex: 1; display: grid; gap: 2px; }
+.cap-copy b { font: 600 11.5px/1.35 ui-monospace, SFMono-Regular, Menlo, monospace;
+  overflow-wrap: anywhere; }
+.cap-copy small { color: var(--dash-dim); font-size: 10.5px; line-height: 1.35;
+  display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; overflow: hidden; }
+.cap-badge { border: 1px solid var(--dash-line); border-radius: 999px; padding: 1px 6px;
+  color: var(--dash-dim); font: 9px ui-monospace, SFMono-Regular, Menlo, monospace; white-space: nowrap; }
+.cap-delete { flex: 0 0 auto; border: 1px solid color-mix(in srgb, var(--st-crit) 52%, var(--dash-line));
+  border-radius: 7px; padding: 4px 8px; background: transparent; color: var(--st-crit);
+  font: 600 9.5px ui-monospace, SFMono-Regular, Menlo, monospace; cursor: pointer; }
+.cap-delete:hover { color: #fff; background: var(--st-crit); border-color: var(--st-crit); }
+.cap-delete:disabled { opacity: .45; cursor: wait; }
+.cap-switch { position: relative; display: inline-flex; flex: 0 0 auto; width: 34px; height: 19px; cursor: pointer; }
+.cap-switch input { position: absolute; opacity: 0; pointer-events: none; }
+.cap-switch span { position: absolute; inset: 0; border-radius: 12px; background: var(--dash-line); transition: .15s; }
+.cap-switch span::after { content: ""; position: absolute; width: 15px; height: 15px; top: 2px; left: 2px;
+  border-radius: 50%; background: #fff; box-shadow: 0 1px 3px rgba(0,0,0,.25); transition: .15s; }
+.cap-switch input:checked + span { background: var(--series-1); }
+.cap-switch input:checked + span::after { transform: translateX(15px); }
+.cap-switch:has(input:disabled) { opacity: .42; cursor: not-allowed; }
+.cap-server { border: 1px solid var(--dash-line); border-radius: 9px; overflow: hidden; }
+.cap-server + .cap-server { margin-top: 8px; }
+.cap-server-head { display: flex; align-items: center; gap: 9px; padding: 10px; cursor: pointer; }
+.cap-server-head:hover { background: color-mix(in srgb, var(--dash-line) 45%, transparent); }
+.cap-server-head .cap-copy small { -webkit-line-clamp: 1; }
+.cap-expander { width: 20px; flex: 0 0 20px; color: var(--dash-dim); font-size: 11px; }
+.cap-tools { display: none; border-top: 1px solid var(--dash-line); }
+.cap-server.open .cap-tools { display: block; }
+.cap-tool { padding-left: 39px; padding-right: 10px; }
+.cap-empty { padding: 14px 3px; color: var(--dash-dim); font-size: 11.5px; }
+@media (max-width: 880px) {
+  .cap-layout { grid-template-columns: 1fr; }
+  .cap-controls select, .cap-controls input { min-width: min(100%, 260px); flex: 1 1 100%; }
+}
 
 /* status: icon + label, never colour alone */
 .st { display: inline-flex; align-items: center; gap: 4px; font-size: 11.5px; }
@@ -176,12 +280,14 @@ table.tbl { width: 100%; border-collapse: collapse; font-size: 12.5px; }
     <div class="dash-title">📊 Dashboard</div>
     <div class="dash-sub" id="sub">loading…</div>
     <div class="spacer"></div>
+    <button class="system-notion-btn" id="systemNotionBtn" type="button">N Notion System Hub</button>
     <a class="back" href="/">← back to workspace</a>
   </div>
 
   <div class="tabs" id="tabs">
     <button data-tab="overview" class="tab on">📈 Overview</button>
     <button data-tab="log" class="tab">📜 Agent log</button>
+    <button data-tab="capabilities" class="tab">⚡ Capabilities</button>
   </div>
 
   <div id="view-overview">
@@ -221,8 +327,55 @@ table.tbl { width: 100%; border-collapse: collapse; font-size: 12.5px; }
       <div id="logEmpty" class="hint" style="padding:14px 4px">pick an agent to start tailing its activity.</div>
     </div>
   </div>
+
+  <div id="view-capabilities" hidden>
+    <div class="cap-controls">
+      <span class="f-label">agent</span>
+      <select id="capAgent" aria-label="Agent capability target"></select>
+      <input id="capSearch" type="search" placeholder="Filter plugins, skills, MCP servers or tools">
+      <button id="capRefresh" type="button">↻ Rescan</button>
+      <button id="capEdit" type="button">Edit</button>
+      <button id="capReset" type="button">Reset inherited</button>
+    </div>
+    <div class="cap-notice" id="capNotice">Choose an agent to inspect its capability policy.</div>
+    <div class="cap-layout">
+      <section class="panel cap-plugin-panel">
+        <div class="panel-h">
+          <div class="panel-t">Downloaded plugins</div>
+          <div class="panel-s" id="capPluginCount"></div>
+        </div>
+        <div class="cap-list" id="capPlugins"></div>
+      </section>
+      <section class="panel">
+        <div class="panel-h">
+          <div class="panel-t">Skills</div>
+          <div class="panel-s" id="capSkillCount"></div>
+        </div>
+        <div class="cap-list" id="capSkills"></div>
+      </section>
+      <section class="panel">
+        <div class="panel-h">
+          <div class="panel-t">MCP servers &amp; tools</div>
+          <div class="panel-s" id="capMcpCount"></div>
+        </div>
+        <div class="cap-list" id="capMcp"></div>
+      </section>
+    </div>
+  </div>
 </div>
 <div class="tip" id="tip"></div>
+<div class="agent-settings-backdrop" id="agentSettingsBackdrop" hidden>
+  <section class="agent-settings-panel" role="dialog" aria-modal="true" aria-labelledby="agentSettingsTitle">
+    <div class="agent-settings-head">
+      <div>
+        <div class="agent-settings-title" id="agentSettingsTitle">Agent settings</div>
+        <div class="agent-settings-sub" id="agentSettingsSub"></div>
+      </div>
+      <button class="agent-settings-close" id="agentSettingsClose" type="button" aria-label="Close settings">×</button>
+    </div>
+    <div class="agent-settings-body" id="agentSettingsBody"></div>
+  </section>
+</div>
 
 <script>
 const $ = (id) => document.getElementById(id);
@@ -329,6 +482,7 @@ function render() {
   renderKpis(agents, series);
   renderChart(series, cmap);
   renderAgents(agents, cmap, win);
+  if (logState.tab === "capabilities") fillCapabilityAgents();
 }
 
 function renderFilters(d) {
@@ -592,7 +746,7 @@ function renderAgents(agents, cmap, win) {
       <th>context</th><th>auto context</th><th class="num">raw · ${rl}</th>
       <th class="num" title="Official Codex rate card: Sol 125/12.5/750 and Terra 62.5/6.25/375 credits per 1M fresh/cached/output tokens.">OpenAI credits · ${rl}</th>
       <th class="num">output · ${rl}</th>
-      <th class="num">turns · ${rl}</th><th class="num">last</th></tr></thead><tbody>` +
+      <th class="num">turns · ${rl}</th><th class="num">last</th><th aria-label="settings"></th></tr></thead><tbody>` +
     rows.map((a) => {
       const k = a.project + "/" + a.agent;
       const w = wof(a);
@@ -615,6 +769,9 @@ function renderAgents(agents, cmap, win) {
         <td class="num"${dim}>${fmt(w.out)}</td>
         <td class="num"${dim}>${w.turns}</td>
         <td class="num">${ago(a.updated_at)}</td>
+        <td class="agent-settings-cell"><button class="agent-settings-btn" type="button"
+          data-project="${esc(a.project)}" data-agent="${esc(a.agent)}"
+          aria-label="Settings for ${esc(a.agent)}" title="Agent settings">⚙</button></td>
       </tr>`;
     }).join("") + `</tbody>`;
 
@@ -647,17 +804,505 @@ function renderAgents(agents, cmap, win) {
       }
     };
   });
+  document.querySelectorAll(".agent-settings-btn").forEach((button) => {
+    button.onclick = () => openAgentSettings(button.dataset.project, button.dataset.agent);
+  });
 }
+
+// ---------- Per-agent settings modal ----------
+const agentSettingsState = { project: null, agent: null, system: false };
+
+function closeAgentSettings() {
+  $("agentSettingsBackdrop").hidden = true;
+  agentSettingsState.project = null;
+  agentSettingsState.agent = null;
+  agentSettingsState.system = false;
+}
+
+function notionSettingsMarkup(settings, system = false) {
+  if (!settings.editable) {
+    return `<div class="settings-empty">Chưa có mục cấu hình cho agent này. Panel đã được giữ sẵn để bổ sung tính năng sau.</div>`;
+  }
+  const credential = settings.token_available
+    ? `Credential <span class="mono">${esc(settings.token_env)}</span> đã sẵn sàng trên server.`
+    : `Server chưa có credential <span class="mono">${esc(settings.token_env)}</span>. URL chỉ được lưu sau khi credential có thể xác minh workspace và trang cha.`;
+  const verified = settings.configured
+    ? `<div class="settings-status good">✓ Đã khóa vào ${esc(settings.workspace_name || "workspace đã xác minh")}` +
+      `${settings.parent_title ? ` · ${esc(settings.parent_title)}` : ""}</div>`
+    : `<div class="settings-status"></div>`;
+  const purpose = system
+    ? `<div class="settings-help">Thiết lập một lần: mỗi dự án chưa có binding sẽ tự tạo một page con dưới Hub này, rồi bị khóa vào đúng subtree của dự án đó.</div>`
+    : (settings.auto_provision_available && !settings.configured
+      ? `<div class="settings-help">System Hub đã sẵn sàng; project page sẽ được tự tạo khi connector được dùng lần đầu.</div>`
+      : "");
+  return `<div class="settings-section-title">${system ? "Notion System Hub" : "Notion report"}</div>
+    <div class="settings-field">
+      <label for="notionUrlInput">Notion URL</label>
+      <input id="notionUrlInput" type="url" inputmode="url" autocomplete="off"
+        placeholder="https://www.notion.so/Your-parent-page-..." value="${esc(settings.notion_url)}">
+    </div>
+    ${purpose}<div class="settings-help">${credential}</div>
+    ${verified}
+    <div class="settings-actions">
+      <button type="button" id="agentSettingsCancel">Cancel</button>
+      <button type="button" class="primary" id="notionSettingsSave">Save &amp; verify</button>
+    </div>`;
+}
+
+async function openAgentSettings(project, agent) {
+  agentSettingsState.project = project;
+  agentSettingsState.agent = agent;
+  agentSettingsState.system = false;
+  $("agentSettingsTitle").textContent = `${agent} settings`;
+  $("agentSettingsSub").textContent = project;
+  $("agentSettingsBody").innerHTML = `<div class="settings-empty">Loading…</div>`;
+  $("agentSettingsBackdrop").hidden = false;
+  try {
+    const url = `/api/projects/${encodeURIComponent(project)}/agents/${encodeURIComponent(agent)}/notion-settings`;
+    const response = await fetch(url);
+    const settings = await response.json();
+    if (!response.ok) throw new Error(settings.detail || "Cannot load settings");
+    if (agentSettingsState.project !== project || agentSettingsState.agent !== agent) return;
+    $("agentSettingsBody").innerHTML = notionSettingsMarkup(settings, false);
+    const cancel = $("agentSettingsCancel");
+    if (cancel) cancel.onclick = closeAgentSettings;
+    const save = $("notionSettingsSave");
+    if (save) save.onclick = saveNotionSettings;
+    const input = $("notionUrlInput");
+    if (input) { input.focus(); input.setSelectionRange(input.value.length, input.value.length); }
+  } catch (error) {
+    $("agentSettingsBody").innerHTML = `<div class="settings-status error">${esc(error.message)}</div>`;
+  }
+}
+
+async function openSystemNotionSettings() {
+  agentSettingsState.project = "agentui-system";
+  agentSettingsState.agent = "ROOT";
+  agentSettingsState.system = true;
+  $("agentSettingsTitle").textContent = "Notion System Hub";
+  $("agentSettingsSub").textContent = "One verified parent for all AgentUI projects";
+  $("agentSettingsBody").innerHTML = `<div class="settings-empty">Loading…</div>`;
+  $("agentSettingsBackdrop").hidden = false;
+  try {
+    const response = await fetch("/api/notion-system-settings");
+    const settings = await response.json();
+    if (!response.ok) throw new Error(settings.detail || "Cannot load system settings");
+    if (!agentSettingsState.system) return;
+    $("agentSettingsBody").innerHTML = notionSettingsMarkup(settings, true);
+    $("agentSettingsCancel").onclick = closeAgentSettings;
+    $("notionSettingsSave").onclick = saveNotionSettings;
+    const input = $("notionUrlInput");
+    input.focus();
+    input.setSelectionRange(input.value.length, input.value.length);
+  } catch (error) {
+    $("agentSettingsBody").innerHTML = `<div class="settings-status error">${esc(error.message)}</div>`;
+  }
+}
+
+async function saveNotionSettings() {
+  const input = $("notionUrlInput");
+  const button = $("notionSettingsSave");
+  const project = agentSettingsState.project;
+  const agent = agentSettingsState.agent;
+  if (!input || !button || !project || !agent) return;
+  button.disabled = true;
+  button.textContent = "Verifying…";
+  let status = $("agentSettingsBody").querySelector(".settings-status");
+  if (!status) {
+    status = document.createElement("div");
+    status.className = "settings-status";
+    $("agentSettingsBody").insertBefore(status, $("agentSettingsBody").querySelector(".settings-actions"));
+  }
+  status.className = "settings-status";
+  status.textContent = "Checking workspace and parent-page access…";
+  try {
+    const url = agentSettingsState.system
+      ? "/api/notion-system-settings"
+      : `/api/projects/${encodeURIComponent(project)}/agents/${encodeURIComponent(agent)}/notion-settings`;
+    const response = await fetch(url, {
+      method: "POST",
+      headers: {"Content-Type": "application/json"},
+      body: JSON.stringify({notion_url: input.value.trim()}),
+    });
+    const result = await response.json();
+    if (!response.ok) throw new Error(result.detail || "Save failed");
+    status.className = "settings-status good";
+    status.textContent = `✓ Saved · ${result.workspace_name || "workspace verified"}` +
+      (result.parent_title ? ` · ${result.parent_title}` : "");
+    button.textContent = "Saved";
+    setTimeout(() => { if (!$("agentSettingsBackdrop").hidden) closeAgentSettings(); }, 900);
+  } catch (error) {
+    status.className = "settings-status error";
+    status.textContent = error.message;
+    button.disabled = false;
+    button.textContent = "Save & verify";
+  }
+}
+
+$("agentSettingsClose").onclick = closeAgentSettings;
+$("systemNotionBtn").onclick = openSystemNotionSettings;
+$("agentSettingsBackdrop").addEventListener("click", (event) => {
+  if (event.target === $("agentSettingsBackdrop")) closeAgentSettings();
+});
+document.addEventListener("keydown", (event) => {
+  if (event.key === "Escape" && !$("agentSettingsBackdrop").hidden) closeAgentSettings();
+});
+
+// ---------- Per-agent Skills + MCP capability tab ----------
+const capabilityState = {
+  key: null,
+  data: null,
+  loading: false,
+  query: "",
+  expanded: new Set(),
+  editing: false,
+  seq: 0,
+  message: "",
+};
+
+function capabilityKeyParts(key) {
+  const split = (key || "").indexOf("::");
+  return split < 0 ? [null, null] : [key.slice(0, split), key.slice(split + 2)];
+}
+
+function fillCapabilityAgents() {
+  if (!state.data) return;
+  const select = $("capAgent");
+  const agents = state.data.agents.slice().sort((a, b) =>
+    a.project.localeCompare(b.project) || a.agent.localeCompare(b.agent));
+  const valid = new Set(agents.map((a) => `${a.project}::${a.agent}`));
+  if (!capabilityState.key || !valid.has(capabilityState.key)) {
+    capabilityState.key = agents.length ? `${agents[0].project}::${agents[0].agent}` : null;
+    capabilityState.data = null;
+    capabilityState.editing = false;
+  }
+  select.innerHTML = agents.length
+    ? agents.map((a) => {
+        const key = `${a.project}::${a.agent}`;
+        return `<option value="${esc(key)}"${key === capabilityState.key ? " selected" : ""}>${esc(a.agent)} · ${esc(a.project)} · ${esc(a.model || "")}</option>`;
+      }).join("")
+    : `<option value="">— no agents —</option>`;
+  select.onchange = () => {
+    capabilityState.key = select.value || null;
+    capabilityState.data = null;
+    capabilityState.message = "";
+    capabilityState.editing = false;
+    loadCapabilities();
+  };
+  if (capabilityState.key && !capabilityState.data && !capabilityState.loading) {
+    loadCapabilities();
+  } else {
+    renderCapabilities();
+  }
+}
+
+async function loadCapabilities(force = false) {
+  const [project, agent] = capabilityKeyParts(capabilityState.key);
+  if (!project || !agent) { renderCapabilities(); return; }
+  const key = capabilityState.key;
+  const seq = ++capabilityState.seq;
+  capabilityState.loading = true;
+  capabilityState.message = "";
+  renderCapabilities();
+  try {
+    const url = `/api/projects/${encodeURIComponent(project)}/agents/${encodeURIComponent(agent)}/capabilities${force ? "?refresh=true" : ""}`;
+    const response = await fetch(url);
+    const payload = await response.json().catch(() => ({}));
+    if (!response.ok) throw new Error(payload.detail || `HTTP ${response.status}`);
+    if (capabilityState.key === key && capabilityState.seq === seq) {
+      capabilityState.data = payload;
+    }
+  } catch (error) {
+    if (capabilityState.key === key && capabilityState.seq === seq) {
+      capabilityState.data = {error: error.message || String(error)};
+    }
+  } finally {
+    if (capabilityState.key === key && capabilityState.seq === seq) {
+      capabilityState.loading = false;
+    }
+    renderCapabilities();
+  }
+}
+
+function dashboardSwitch(checked, disabled, title) {
+  return `<label class="cap-switch" title="${esc(title)}"><input type="checkbox" ` +
+    `${checked ? "checked " : ""}${disabled ? "disabled " : ""}><span></span></label>`;
+}
+
+function dashboardSkillUsage(skill) {
+  const count = Number(skill.usage_count || 0);
+  const last = skill.last_used_at
+    ? ` · last ${new Date(skill.last_used_at * 1000).toLocaleString()}`
+    : " · no verified use yet";
+  return `${count} use${count === 1 ? "" : "s"}${last}`;
+}
+
+function renderCapabilities() {
+  const notice = $("capNotice");
+  const pluginRoot = $("capPlugins");
+  const skillRoot = $("capSkills");
+  const mcpRoot = $("capMcp");
+  if (!notice || !pluginRoot || !skillRoot || !mcpRoot) return;
+  const data = capabilityState.data;
+  pluginRoot.innerHTML = "";
+  skillRoot.innerHTML = "";
+  mcpRoot.innerHTML = "";
+  $("capRefresh").disabled = capabilityState.loading;
+  $("capEdit").disabled = capabilityState.loading || !data?.inventory_delete_enabled;
+  $("capEdit").textContent = capabilityState.editing ? "Done" : "Edit";
+  $("capEdit").classList.toggle("active", capabilityState.editing);
+  $("capReset").disabled = capabilityState.loading || !data?.override_count;
+  if (!capabilityState.key) {
+    notice.className = "cap-notice";
+    notice.textContent = "No agent is available.";
+    $("capPluginCount").textContent = "";
+    $("capSkillCount").textContent = "";
+    $("capMcpCount").textContent = "";
+    return;
+  }
+  if (capabilityState.loading && !data) {
+    notice.className = "cap-notice";
+    notice.textContent = "Reading the current Codex runtime inventory…";
+    pluginRoot.innerHTML = `<div class="cap-empty">Scanning downloaded plugins…</div>`;
+    skillRoot.innerHTML = `<div class="cap-empty">Loading skills…</div>`;
+    mcpRoot.innerHTML = `<div class="cap-empty">Loading MCP servers and tools…</div>`;
+    return;
+  }
+  if (!data || data.error) {
+    notice.className = "cap-notice error";
+    notice.textContent = data?.error || "Capability inventory is unavailable.";
+    return;
+  }
+  notice.className = "cap-notice good";
+  notice.textContent = capabilityState.message || (data.applies_now
+    ? `Idle-owned inventory for ${data.agent_id}. Policy r${data.revision || 0}; skill usage tracking started ${data.skill_usage_tracking_started_at ? new Date(data.skill_usage_tracking_started_at * 1000).toLocaleString() : "now"}. A change resets only its Codex provider thread, while chat and memory remain.`
+    : `Policy r${data.revision || 0} is isolated for ${data.agent_id} and will activate when its adapter is Codex (current: ${data.adapter}).`);
+
+  const query = capabilityState.query.trim().toLowerCase();
+  const plugins = (data.plugins || []).filter((plugin) =>
+    !query || `${plugin.name} ${plugin.display_name || ""} ${plugin.description || ""} ${plugin.marketplace || ""}`.toLowerCase().includes(query));
+  $("capPluginCount").textContent = `${plugins.length}/${(data.plugins || []).length} packages`;
+  if (!plugins.length) pluginRoot.innerHTML = `<div class="cap-empty">No matching downloaded plugins.</div>`;
+  plugins.forEach((plugin) => {
+    const row = document.createElement("div");
+    row.className = `cap-row${plugin.enabled ? "" : " off"}`;
+    const connectorNote = plugin.has_apps || plugin.has_mcp_servers ? " · connector tools are listed below" : "";
+    row.innerHTML = `<div class="cap-copy"><b>${esc(plugin.display_name || plugin.name)}</b>` +
+      `<small>${esc(plugin.description || plugin.path)}</small></div>` +
+      `<span class="cap-badge">${esc(plugin.marketplace)} · v${esc(plugin.version)} · ${plugin.skill_count || 0} skills${connectorNote}</span>` +
+      dashboardSwitch(plugin.enabled, capabilityState.loading, `Toggle plugin ${plugin.name}`);
+    row.querySelector("input").onchange = (event) =>
+      toggleDashboardCapability("plugin", plugin.id, event.target.checked);
+    pluginRoot.appendChild(row);
+  });
+
+  const skills = (data.skills || []).filter((skill) =>
+    !query || `${skill.name} ${skill.display_name || ""} ${skill.description || ""} ${skill.scope || ""} ${skill.plugin_name || ""}`.toLowerCase().includes(query));
+  $("capSkillCount").textContent = `${skills.length}/${(data.skills || []).length}`;
+  if (!skills.length) skillRoot.innerHTML = `<div class="cap-empty">No matching skills.</div>`;
+  skills.forEach((skill) => {
+    const row = document.createElement("div");
+    row.className = `cap-row${skill.enabled ? "" : " off"}`;
+    row.innerHTML = `<div class="cap-copy"><b>${esc(skill.display_name || skill.name)}</b>` +
+      `<small>${esc(skill.description || skill.path)}</small></div>` +
+      `<span class="cap-badge" title="${esc(dashboardSkillUsage(skill))}">${esc(skill.plugin_name || skill.scope || "skill")}${skill.overridden ? " · override" : ""} · ${skill.usage_count || 0} uses</span>` +
+      dashboardSwitch(skill.enabled,
+        capabilityState.loading || skill.available === false,
+        skill.available === false ? "Enable the parent plugin first" : `Toggle ${skill.name}`) +
+      (capabilityState.editing && data.inventory_delete_enabled
+        ? `<button class="cap-delete" type="button" title="Permanently remove this skill from Idle inventory">Delete</button>`
+        : "");
+    row.querySelector("input").onchange = (event) =>
+      toggleDashboardCapability("skill", skill.id, event.target.checked);
+    const deleteButton = row.querySelector(".cap-delete");
+    if (deleteButton) deleteButton.onclick = () =>
+      deleteDashboardCapability("skill", skill.id, skill.display_name || skill.name);
+    skillRoot.appendChild(row);
+  });
+
+  const servers = (data.mcp_servers || []).filter((server) => {
+    if (!query) return true;
+    if (`${server.name} ${server.description || ""}`.toLowerCase().includes(query)) return true;
+    return (server.tools || []).some((tool) =>
+      `${tool.name} ${tool.title || ""} ${tool.description || ""}`.toLowerCase().includes(query));
+  });
+  const totalTools = servers.reduce((count, server) => count + (server.tools || []).length, 0);
+  $("capMcpCount").textContent = `${servers.length}/${(data.mcp_servers || []).length} servers · ${totalTools} tools`;
+  if (!servers.length) mcpRoot.innerHTML = `<div class="cap-empty">No matching MCP capabilities.</div>`;
+  servers.forEach((server) => renderCapabilityServer(mcpRoot, server, query));
+}
+
+function renderCapabilityServer(root, server, query) {
+  const open = capabilityState.expanded.has(server.id) || Boolean(query);
+  const card = document.createElement("div");
+  card.className = `cap-server${open ? " open" : ""}${server.enabled ? "" : " off"}`;
+  card.innerHTML = `<div class="cap-server-head"><span class="cap-expander">${open ? "▾" : "▸"}</span>` +
+    `<div class="cap-copy"><b>${esc(server.name)}</b><small>${server.enabled_tool_count || 0}/${(server.tools || []).length} tools · ${esc(server.auth_status || "unknown auth")}${server.tool_inventory_complete ? "" : " · inventory unavailable"}${server.controllable ? "" : " · runtime-managed"}</small></div>` +
+    dashboardSwitch(server.enabled, capabilityState.loading || !server.controllable,
+      server.controllable ? `Toggle MCP server ${server.name}` : "Managed by the Codex runtime") +
+    (capabilityState.editing && server.controllable && capabilityState.data?.inventory_delete_enabled
+      ? `<button class="cap-delete" type="button" title="Permanently remove this MCP server from Idle inventory">Delete</button>`
+      : "") +
+    `</div><div class="cap-tools"></div>`;
+  const head = card.querySelector(".cap-server-head");
+  head.onclick = () => {
+    if (capabilityState.expanded.has(server.id)) capabilityState.expanded.delete(server.id);
+    else capabilityState.expanded.add(server.id);
+    renderCapabilities();
+  };
+  const serverSwitch = head.querySelector(".cap-switch");
+  serverSwitch.onclick = (event) => event.stopPropagation();
+  if (server.controllable) {
+    serverSwitch.querySelector("input").onchange = (event) =>
+      toggleDashboardCapability("mcp_server", server.id, event.target.checked);
+  }
+  const deleteButton = head.querySelector(".cap-delete");
+  if (deleteButton) {
+    deleteButton.onclick = (event) => {
+      event.stopPropagation();
+      deleteDashboardCapability("mcp_server", server.id, server.name);
+    };
+  }
+  if (open) {
+    const toolsRoot = card.querySelector(".cap-tools");
+    const tools = (server.tools || []).filter((tool) =>
+      !query || `${server.name} ${tool.name} ${tool.title || ""} ${tool.description || ""}`.toLowerCase().includes(query));
+    if (!tools.length) toolsRoot.innerHTML = `<div class="cap-empty cap-tool">${server.tool_inventory_complete ? "No tools exposed." : "Tool list unavailable; this server may require authentication or a successful connection."}</div>`;
+    tools.forEach((tool) => {
+      const row = document.createElement("div");
+      row.className = `cap-row cap-tool${tool.enabled ? "" : " off"}`;
+      row.innerHTML = `<div class="cap-copy"><b>${esc(tool.title || tool.name)}</b>` +
+        `<small>${esc(tool.description || tool.name)}</small></div>` +
+        dashboardSwitch(tool.configured_enabled,
+          capabilityState.loading || !server.enabled || !server.controllable,
+          server.controllable ? `Toggle ${tool.name}` : "Managed by the Codex runtime");
+      if (server.controllable) {
+        row.querySelector("input").onchange = (event) =>
+          toggleDashboardCapability("mcp_tool", tool.id, event.target.checked, server.id);
+      }
+      toolsRoot.appendChild(row);
+    });
+  }
+  root.appendChild(card);
+}
+
+async function toggleDashboardCapability(kind, target, enabled, server = null) {
+  const data = capabilityState.data;
+  if (!data || capabilityState.loading) return;
+  const key = capabilityState.key;
+  const seq = ++capabilityState.seq;
+  capabilityState.loading = true;
+  renderCapabilities();
+  try {
+    const url = `/api/projects/${encodeURIComponent(data.project_slug)}/agents/${encodeURIComponent(data.agent_id)}/capabilities/toggle`;
+    const response = await fetch(url, {method: "POST", headers: {"Content-Type": "application/json"},
+      body: JSON.stringify({kind, target, enabled, server})});
+    const payload = await response.json().catch(() => ({}));
+    if (!response.ok) throw new Error(payload.detail || `HTTP ${response.status}`);
+    if (capabilityState.key !== key || capabilityState.seq !== seq) return;
+    capabilityState.data = payload;
+    capabilityState.message = `${enabled ? "Enabled" : "Disabled"} for ${payload.agent_id} · policy r${payload.revision}` +
+      (payload.runtime_reset ? " · Codex thread reset" : "");
+  } catch (error) {
+    if (capabilityState.key === key && capabilityState.seq === seq) {
+      capabilityState.message = `Change failed: ${error.message || error}`;
+    }
+  } finally {
+    if (capabilityState.key === key && capabilityState.seq === seq) capabilityState.loading = false;
+    renderCapabilities();
+  }
+}
+
+async function deleteDashboardCapability(kind, target, label) {
+  const data = capabilityState.data;
+  if (!data || capabilityState.loading || !data.inventory_delete_enabled) return;
+  const typeLabel = kind === "skill" ? "skill" : "MCP server";
+  if (!confirm(
+    `Permanently delete ${typeLabel} “${label}” from Agent Idle?\n\n` +
+    "This affects ALL agents, removes its local inventory files, and prevents the importer from automatically restoring it."
+  )) return;
+  const key = capabilityState.key;
+  const seq = ++capabilityState.seq;
+  capabilityState.loading = true;
+  renderCapabilities();
+  try {
+    const url = `/api/projects/${encodeURIComponent(data.project_slug)}/agents/${encodeURIComponent(data.agent_id)}/capabilities/delete`;
+    const response = await fetch(url, {
+      method: "POST",
+      headers: {"Content-Type": "application/json"},
+      body: JSON.stringify({kind, target}),
+    });
+    const payload = await response.json().catch(() => ({}));
+    if (!response.ok) throw new Error(payload.detail || `HTTP ${response.status}`);
+    if (capabilityState.key !== key || capabilityState.seq !== seq) return;
+    capabilityState.data = payload;
+    if (kind === "mcp_server") capabilityState.expanded.delete(target);
+    capabilityState.message = `Deleted ${label} from Idle inventory for all agents` +
+      (payload.runtime_reset_count ? ` · reset ${payload.runtime_reset_count} Codex runtime(s)` : "");
+  } catch (error) {
+    if (capabilityState.key === key && capabilityState.seq === seq) {
+      capabilityState.message = `Delete failed: ${error.message || error}`;
+    }
+  } finally {
+    if (capabilityState.key === key && capabilityState.seq === seq) capabilityState.loading = false;
+    renderCapabilities();
+  }
+}
+
+$("capSearch").oninput = (event) => {
+  capabilityState.query = event.target.value;
+  renderCapabilities();
+};
+$("capRefresh").onclick = () => loadCapabilities(true);
+$("capEdit").onclick = () => {
+  if (!capabilityState.data?.inventory_delete_enabled || capabilityState.loading) return;
+  capabilityState.editing = !capabilityState.editing;
+  renderCapabilities();
+};
+$("capReset").onclick = async () => {
+  const data = capabilityState.data;
+  if (!data || !data.override_count || capabilityState.loading) return;
+  if (!confirm(`Reset all ${data.override_count} capability override(s) for ${data.agent_id}?`)) return;
+  const key = capabilityState.key;
+  const seq = ++capabilityState.seq;
+  capabilityState.loading = true;
+  renderCapabilities();
+  try {
+    const url = `/api/projects/${encodeURIComponent(data.project_slug)}/agents/${encodeURIComponent(data.agent_id)}/capabilities/reset`;
+    const response = await fetch(url, {method: "POST"});
+    const payload = await response.json().catch(() => ({}));
+    if (!response.ok) throw new Error(payload.detail || `HTTP ${response.status}`);
+    if (capabilityState.key !== key || capabilityState.seq !== seq) return;
+    capabilityState.data = payload;
+    capabilityState.message = `All overrides removed for ${payload.agent_id}` +
+      (payload.runtime_reset ? " · Codex thread reset" : "");
+  } catch (error) {
+    if (capabilityState.key === key && capabilityState.seq === seq) {
+      capabilityState.message = `Reset failed: ${error.message || error}`;
+    }
+  } finally {
+    if (capabilityState.key === key && capabilityState.seq === seq) capabilityState.loading = false;
+    renderCapabilities();
+  }
+};
 
 // ---------- Agent log tab ----------
 const logState = { tab: "overview", agent: null, offset: 0, session: null, timer: null, seenIds: {} };
 
 function switchTab(tab) {
   logState.tab = tab;
+  if (tab !== "capabilities") capabilityState.editing = false;
   document.querySelectorAll(".tab").forEach((b) => b.classList.toggle("on", b.dataset.tab === tab));
   $("view-overview").hidden = tab !== "overview";
   $("view-log").hidden = tab !== "log";
-  if (tab === "log") { fillLogAgents(); startLogPoll(); } else { stopLogPoll(); }
+  $("view-capabilities").hidden = tab !== "capabilities";
+  if (tab === "log") {
+    fillLogAgents();
+    startLogPoll();
+  } else {
+    stopLogPoll();
+    if (tab === "capabilities") fillCapabilityAgents();
+  }
 }
 
 function fillLogAgents() {
@@ -754,8 +1399,15 @@ async function pollLog() {
   }
 }
 
-document.querySelectorAll(".tab").forEach((b) => { b.onclick = () => switchTab(b.dataset.tab); });
+document.querySelectorAll(".tab").forEach((b) => {
+  b.onclick = () => {
+    switchTab(b.dataset.tab);
+    history.replaceState(null, "", `#${b.dataset.tab}`);
+  };
+});
 
+const initialTab = location.hash.slice(1);
+if (["overview", "log", "capabilities"].includes(initialTab)) switchTab(initialTab);
 load();
 setInterval(load, 30000);
 </script>

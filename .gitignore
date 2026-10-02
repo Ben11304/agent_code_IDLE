@@ -4,6 +4,7 @@ __pycache__/
 *.pyo
 *.egg-info/
 .venv/
+.venv.*/
 venv/
 .python-version
 
@@ -30,6 +31,7 @@ Thumbs.db
 .env
 .env.*
 !.env.example
+app/.maintenance
 
 # CodeGraph index (regenerable local state — created by `codegraph init`)
 .codegraph/

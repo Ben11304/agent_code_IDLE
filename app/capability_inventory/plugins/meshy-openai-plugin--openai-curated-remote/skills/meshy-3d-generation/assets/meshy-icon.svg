@@ -1,0 +1,17 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 256 256" width="256" height="256" role="img" aria-labelledby="title desc">
+  <title id="title">Meshy 3D</title>
+  <desc id="desc">A blue geometric M mark for Meshy 3D</desc>
+  <defs>
+    <linearGradient id="background" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#173BFF"/>
+      <stop offset="1" stop-color="#05B8C8"/>
+    </linearGradient>
+    <linearGradient id="mark" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#FFFFFF"/>
+      <stop offset="1" stop-color="#D9FFFF"/>
+    </linearGradient>
+  </defs>
+  <rect width="256" height="256" rx="56" fill="url(#background)"/>
+  <path d="M54 184V72h30l44 57 44-57h30v112h-30v-66l-44 55-44-55v66H54Z" fill="url(#mark)"/>
+  <path d="M128 129 172 72v46l-44 55-44-55V72l44 57Z" fill="#9FF7F2" opacity=".55"/>
+</svg>

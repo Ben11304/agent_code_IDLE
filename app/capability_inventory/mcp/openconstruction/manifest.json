@@ -1,0 +1,201 @@
+{
+  "schema_version": 1,
+  "id": "openconstruction",
+  "name": "openconstruction",
+  "description": "",
+  "auth_status": "unsupported",
+  "baseline_enabled": true,
+  "controllable": true,
+  "runtime_managed": false,
+  "tool_inventory_complete": true,
+  "resource_count": 0,
+  "tools": [
+    {
+      "id": "analyze_catalog_gaps",
+      "name": "analyze_catalog_gaps",
+      "title": "Catalog Gap Analysis",
+      "description": "Inspect catalog coverage by type and return possible metadata gaps for a topic.",
+      "baseline_enabled": true,
+      "read_only": false
+    },
+    {
+      "id": "ask_openconstruction",
+      "name": "ask_openconstruction",
+      "title": "Ask OpenConstruction",
+      "description": "Answer a catalog-grounded question with matching resources.",
+      "baseline_enabled": true,
+      "read_only": false
+    },
+    {
+      "id": "cancel_download",
+      "name": "cancel_download",
+      "title": "Cancel Dataset Download",
+      "description": "Request cancellation of a running local OC dataset download job.",
+      "baseline_enabled": true,
+      "read_only": false
+    },
+    {
+      "id": "check_dataset_installation",
+      "name": "check_dataset_installation",
+      "title": "Check Dataset Installation",
+      "description": "Check whether a matching dataset package is installed, partially downloaded and resumable, absent, or conflicts with another source at the selected OC library location.",
+      "baseline_enabled": true,
+      "read_only": false
+    },
+    {
+      "id": "compare_resources",
+      "name": "compare_resources",
+      "title": "Compare OpenConstruction resources",
+      "description": "Compare two or more catalog resources for a user goal.",
+      "baseline_enabled": true,
+      "read_only": false
+    },
+    {
+      "id": "download_dataset",
+      "name": "download_dataset",
+      "title": "Download Dataset Locally",
+      "description": "Install, reuse, or resume a dataset in the default OC library or an explicitly selected library_dir. Matching verified files are reused and HTTP partial files resume when supported. If status is auth_required, show its local provider login instructions and retry payload; never ask the user to paste credentials into chat. Requires explicit license acceptance…",
+      "baseline_enabled": true,
+      "read_only": false
+    },
+    {
+      "id": "explain_schema",
+      "name": "explain_schema",
+      "title": "Schema Explainer",
+      "description": "Explain common OpenConstruction metadata fields and where they appear in catalog records.",
+      "baseline_enabled": true,
+      "read_only": false
+    },
+    {
+      "id": "find_datasets",
+      "name": "find_datasets",
+      "title": "Dataset Discovery",
+      "description": "Find datasets by task, modality, object class, annotation type, license, or access needs.",
+      "baseline_enabled": true,
+      "read_only": false
+    },
+    {
+      "id": "find_models",
+      "name": "find_models",
+      "title": "Model Discovery",
+      "description": "Find models by task, dataset, modality, method, or publication evidence.",
+      "baseline_enabled": true,
+      "read_only": false
+    },
+    {
+      "id": "get_catalog_stats",
+      "name": "get_catalog_stats",
+      "title": "Get catalog statistics",
+      "description": "Return counts by resource type for the loaded catalog snapshot.",
+      "baseline_enabled": true,
+      "read_only": false
+    },
+    {
+      "id": "get_dataset_download_plan",
+      "name": "get_dataset_download_plan",
+      "title": "Get Dataset Download Plan",
+      "description": "Resolve the trusted OpenConstruction dataset and related-paper routes without writing files, including local provider-auth guidance when required.",
+      "baseline_enabled": true,
+      "read_only": false
+    },
+    {
+      "id": "get_dataset_paper_plan",
+      "name": "get_dataset_paper_plan",
+      "title": "Get Related Paper Plan",
+      "description": "Return the OC paper metadata, provenance, rights-review status, source URL, checksum, and expected size for one dataset.",
+      "baseline_enabled": true,
+      "read_only": false
+    },
+    {
+      "id": "get_download_status",
+      "name": "get_download_status",
+      "title": "Get Dataset Download Status",
+      "description": "Return agent-ready progress text, percentage, bar, speed, ETA, files, and errors for a local OC dataset download job.",
+      "baseline_enabled": true,
+      "read_only": false
+    },
+    {
+      "id": "get_research_preparation_status",
+      "name": "get_research_preparation_status",
+      "title": "Get Research Preparation Status",
+      "description": "Show restart-safe progress for a research package and return its dataset, original PDF, licenses, and bundle location when ready. An interrupted result includes the safe retry that resumes saved progress.",
+      "baseline_enabled": true,
+      "read_only": false
+    },
+    {
+      "id": "get_resource",
+      "name": "get_resource",
+      "title": "Get OpenConstruction resource",
+      "description": "Get one resource by type and id.",
+      "baseline_enabled": true,
+      "read_only": false
+    },
+    {
+      "id": "get_skill",
+      "name": "get_skill",
+      "title": "Get OpenConstruction skill",
+      "description": "Get one OpenConstruction skill definition by id.",
+      "baseline_enabled": true,
+      "read_only": false
+    },
+    {
+      "id": "list_skills",
+      "name": "list_skills",
+      "title": "List OpenConstruction skills",
+      "description": "List repo-defined OpenConstruction skill metadata.",
+      "baseline_enabled": true,
+      "read_only": false
+    },
+    {
+      "id": "prepare_benchmark_submission",
+      "name": "prepare_benchmark_submission",
+      "title": "Benchmark Submission Prep",
+      "description": "Create a checklist for preparing benchmark metadata and linked resources.",
+      "baseline_enabled": true,
+      "read_only": false
+    },
+    {
+      "id": "prepare_dataset_for_research",
+      "name": "prepare_dataset_for_research",
+      "title": "Prepare Dataset for Research",
+      "description": "Recommended one-step workflow for non-technical researchers. Reuse an exact completed package or resume a matching checkpoint automatically; otherwise review the package, accept the dataset license, download the dataset plus original related PDF, and create a provenance-tracked Research Bundle. Papers are included by default and are never converted to Markd…",
+      "baseline_enabled": true,
+      "read_only": false
+    },
+    {
+      "id": "run_dataset_discovery",
+      "name": "run_dataset_discovery",
+      "title": "Run Dataset Discovery Skill",
+      "description": "Run the Dataset Discovery skill as a structured workflow that searches, ranks, and explains dataset candidates.",
+      "baseline_enabled": true,
+      "read_only": false
+    },
+    {
+      "id": "search_resources",
+      "name": "search_resources",
+      "title": "Search OpenConstruction resources",
+      "description": "Search datasets, models, workflows, OERs, tools, guides, contributors, benchmarks, and vocabulary.",
+      "baseline_enabled": true,
+      "read_only": false
+    },
+    {
+      "id": "validate_metadata_record",
+      "name": "validate_metadata_record",
+      "title": "Metadata Validation",
+      "description": "Check one draft metadata record for important missing fields.",
+      "baseline_enabled": true,
+      "read_only": false
+    }
+  ],
+  "launch": {
+    "command": "uv",
+    "args": [
+      "--directory",
+      "app/capability_inventory/mcp/openconstruction/implementation",
+      "run",
+      "--frozen",
+      "openconstruction-mcp"
+    ],
+    "source_path": "/users/PGS0407/binben14/VietHuy/OpenConstruction/OC-mcp"
+  }
+}

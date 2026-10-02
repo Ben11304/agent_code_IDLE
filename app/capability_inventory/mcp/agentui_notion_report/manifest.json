@@ -1,0 +1,77 @@
+{
+  "schema_version": 1,
+  "id": "agentui_notion_report",
+  "name": "agentui_notion_report",
+  "description": "",
+  "auth_status": "unsupported",
+  "baseline_enabled": true,
+  "controllable": true,
+  "runtime_managed": false,
+  "tool_inventory_complete": true,
+  "resource_count": 0,
+  "tools": [
+    {
+      "id": "append_notion_child_page",
+      "name": "append_notion_child_page",
+      "title": "append_notion_child_page",
+      "description": "Publish report blocks to exactly one direct child page matched by exact title under the user's pre-bound parent, then read back and verify. Creation is allowed only when create_if_missing=true; duplicate exact titles always fail.",
+      "baseline_enabled": true,
+      "read_only": false
+    },
+    {
+      "id": "create_notion_report",
+      "name": "create_notion_report",
+      "title": "create_notion_report",
+      "description": "Create a report below the user's pre-bound parent page. In sections_json, a section may include tables=[{key,caption,columns,rows}] to create native Notion tables, diagrams=[{key,format:'mermaid',source,caption}] to create native Mermaid diagrams, and highlights=[text] for bold change callouts. The custom writer validates the structured form, compiles it to…",
+      "baseline_enabled": true,
+      "read_only": false
+    },
+    {
+      "id": "get_current_report_schema",
+      "name": "get_current_report_schema",
+      "title": "get_current_report_schema",
+      "description": "Reload and return the current project-owned report schema plus the system-owned USER NOTE / SCHEMA NOTE authority policy. Call this after an authorized schema edit and use the returned version, hash, and contract for the successor report.",
+      "baseline_enabled": true,
+      "read_only": true
+    },
+    {
+      "id": "list_notion_project_tree",
+      "name": "list_notion_project_tree",
+      "title": "list_notion_project_tree",
+      "description": "Inventory pages only inside the control-plane-bound project subtree. Use this for 'all Notion' requests; it never scans the whole workspace.",
+      "baseline_enabled": true,
+      "read_only": true
+    },
+    {
+      "id": "notion_report_destination",
+      "name": "notion_report_destination",
+      "title": "notion_report_destination",
+      "description": "Show and optionally verify this agent's control-plane-bound project Notion destination. Project and agent identity are injected automatically; never ask the user for them.",
+      "baseline_enabled": true,
+      "read_only": true
+    },
+    {
+      "id": "read_notion_project_page",
+      "name": "read_notion_project_page",
+      "title": "read_notion_project_page",
+      "description": "Read blocks from one page after proving it belongs to the bound project subtree. Returns normalized text and a content SHA-256 for audit/staleness checks.",
+      "baseline_enabled": true,
+      "read_only": true
+    },
+    {
+      "id": "sync_notion_managed_report",
+      "name": "sync_notion_managed_report",
+      "title": "sync_notion_managed_report",
+      "description": "Dry-run or synchronize an AgentUI-owned report section on an exact direct child page. Manual page content is preserved; dry_run defaults true and writes require read-back.",
+      "baseline_enabled": true,
+      "read_only": false
+    }
+  ],
+  "launch": {
+    "managed_by": "agentui",
+    "transport": "stdio",
+    "implementation": "app/capability_inventory/mcp/agentui_notion_report/implementation/notion_report/run_mcp.py",
+    "source_path": "/users/PGS0407/binben14/VietHuy/agent_code_IDLE/notion_report",
+    "runtime_config_external": "notion_report/destinations.json"
+  }
+}

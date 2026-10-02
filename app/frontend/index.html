@@ -5,7 +5,7 @@
   <meta name="viewport" content="width=device-width,initial-scale=1" />
   <title>AgentUI</title>
   <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/xterm@5.3.0/css/xterm.min.css" />
-  <link rel="stylesheet" href="/styles.css" />
+  <link rel="stylesheet" href="/styles.css?v=local-paper-viewer-20260809-8" />
 </head>
 <body>
   <div class="app">
@@ -33,7 +33,7 @@
              title="Token usage, context and agent state across every project">📊 Dashboard</a>
           <button id="procBtn" class="topbar-btn" title="Submitted SLURM jobs across all clusters">▦ Process running</button>
           <button id="schedBtn" class="topbar-btn" title="Recurring / deferred scheduled agent runs">🕒 Schedules</button>
-          <button id="skillsBtn" class="topbar-btn" title="Installed skills panel">⚡ Skills</button>
+          <button id="skillsBtn" class="topbar-btn" title="Per-agent skills and MCP tools">⚡ Capabilities</button>
         </div>
         <div id="procDropdown" class="proc-dropdown" hidden></div>
         <div id="schedDropdown" class="sched-dropdown" hidden></div>
@@ -47,13 +47,13 @@
     </main>
   </div>
 
-  <button id="skillsTab" class="skills-tab" title="Skills — installed skills panel">⚡<span>Skills</span></button>
+  <button id="skillsTab" class="skills-tab" title="Per-agent capabilities">⚡<span>Capabilities</span></button>
   <aside id="skillsPanel" class="skills-panel">
     <div class="skills-panel-head">
-      <span>⚡ Installed skills</span>
+      <span id="skillsPanelTitle">⚡ Agent capabilities</span>
       <button id="skillsClose" class="skills-close" title="hide panel">×</button>
     </div>
-    <div class="skills-panel-hint">You stay in full control. Click <b>Use</b> to insert the skill call into the open agent chat — edit it, then send.</div>
+    <div id="skillsPanelHint" class="skills-panel-hint">Select an agent chat to inspect its isolated capability policy.</div>
     <div id="skillsList" class="skills-list"></div>
   </aside>
 
@@ -61,6 +61,6 @@
   <script src="https://cdn.jsdelivr.net/npm/dompurify@3.0.9/dist/purify.min.js"></script>
   <script src="https://cdn.jsdelivr.net/npm/xterm@5.3.0/lib/xterm.min.js"></script>
   <script src="https://cdn.jsdelivr.net/npm/xterm-addon-fit@0.8.0/lib/xterm-addon-fit.min.js"></script>
-  <script src="/app.js?v=codex-adapter-20260725-2"></script>
+  <script src="/app.js?v=agent-capabilities-20260906-1"></script>
 </body>
 </html>

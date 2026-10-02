@@ -1,100 +1,81 @@
-# Paper PDF Extractor (PyMuPDF based)
+# Paper PDF Extractor
 
-Dedicated, lightweight tool for extracting scientific papers into clean Markdown + figures + structured tables.
+CPU PyMuPDF extractor for paper text, rendered figure regions and candidate tables.
+Checked against `extract.py` and `run_corpus.py` on 2026-09-07. This is a standalone
+script/function, not an automatically registered AgentUI MCP tool.
 
-**Why this?**
-- Reliable text extraction
-- Extracts figures by **rendering the exact page region** at the chosen DPI (not raw XObject bytes). This keeps the full visual "nguyên" — including any text labels, subfigure letters (a/b), legends, numbers, and overlays that belong to the figure.
-- Reasonable table extraction (with post-cleaning)
-- No heavy VLM by default → fast, low resource, no hallucination risk in extraction
-- Easy to call from AgentUI / multi-agent system (exactly as a tool the agent calls instead of reading raw PDF)
+## Setup and single-paper use
 
-## Environment (clean, on scratch)
+From this directory, create a dedicated environment and install the local requirements:
 
 ```bash
-# The dedicated venv (created on scratch to avoid home quota)
-VENV_PY=/fs/scratch/PGS0407/binben14/envs/paper_parser_venv/bin/python
-
-# Activate / use directly
-$VENV_PY --version
+python3 -m venv .venv
+.venv/bin/python -m pip install -r requirements.txt
+.venv/bin/python extract.py --pdf /path/to/paper.pdf --output_dir output/paper --dpi 150
 ```
 
-Packages inside: pymupdf, pdfplumber, tqdm, pillow (minimal).
+Dependencies: PyMuPDF, pdfplumber, tqdm, Pillow. Camelot is an optional fallback
+when already installed; it is not in `requirements.txt`. Torch is optional device
+detection only: extraction uses the CPU path and does not require a GPU.
+No OCR/VLM stage is implemented, so scanned documents may have little usable text.
 
-## Usage as script (recommended for jobs)
-
-```bash
-$VENV_PY extract.py \
-  --pdf "input_test/s42452-025-06745-4 (2).pdf" \
-  --output_dir "output/my_paper" \
-  --paper_id "s42452-025-06745-4" \
-  --dpi 150
-```
-
-## Usage as Python function (for agents / wrapper)
+From repository root, the Python API is:
 
 ```python
-import sys
-sys.path.insert(0, "/users/PGS0407/binben14/VietHuy/agent_code_IDLE/pdf_extractor")
-
-from extract import extract_paper
-
-result = extract_paper(
-    pdf_path="input_test/s42452-025-06745-4 (2).pdf",
-    output_dir="output/my_paper",
-    paper_id="s42452-025-06745-4",
-    dpi=150
-)
-print(result)  # {"figures": N, "tables": M}
+from pdf_extractor.extract import extract_paper
+counts = extract_paper('/path/to/paper.pdf', 'output/paper', dpi=150)
+# {"figures": int, "tables": int}
 ```
 
-The function is the wrapped main method.
+`paper_id` / `--paper_id` are accepted but currently do not reach the extraction
+writer: metadata uses the source filename stem, and output location is exactly
+`output_dir`. `--device` is parsed but not passed to the wrapper; it does not select
+a GPU extraction backend.
 
-## Output format (consistent with what you like)
+## Outputs
 
+```text
+output/paper/
+├── full_text.md
+├── metadata.json
+├── figures/                 # rendered region PNGs
+├── figures_metadata.json    # written only if figures were found
+└── tables.json              # written only if tables were found
 ```
-output/my_paper/
-├── full_text.md           # full paper as markdown (with page markers)
-├── figures/               # extracted images (fig_pX_....png)
-├── figures_metadata.json
-├── tables.json            # list of extracted tables (cleaned)
-└── metadata.json
-```
 
-In `full_text.md` you will also find a nice markdown version of important tables (e.g. Wagner classification) even if the auto extractor was partial.
+Figure regions are rendered from the page at the requested DPI, including text
+inside the crop. Region detection is heuristic; complete figure/label coverage is
+not guaranteed. Table extraction tries pdfplumber, optional Camelot, then text/layout
+patterns. Layout patterns can mistake ordinary text for tables; inspect source pages.
 
-## For pitzer / cluster jobs
+**Existing hard-coded behavior:** if extracted text contains `Wagner classification`
+or `Grade 0`, `extract.py` appends a fixed Wagner table and labels it page 2. That
+content is not reconstructed/verified from the source PDF. Treat it as an injected
+legacy table, not source evidence. This documentation audit records the behavior;
+it does not modify the extractor or reproduce its medical content as guidance.
 
-See `jobs/run_extractor_pitzer.sh`
+Reusing an output directory does not clear old conditional JSON/images, so stale
+files can remain if a later extraction finds fewer figures/tables. Use a fresh
+output directory when comparing results. The function writes files and prints logs;
+it is not a pure side-effect-free function.
 
-Simple example sbatch (adapt paths):
+## Corpus runner
 
 ```bash
-#!/bin/bash
-#SBATCH --job-name=pdf_extract
-#SBATCH --partition=gpu-exp
-#SBATCH --account=pgs0407
-#SBATCH --time=02:00:00
-#SBATCH --nodes=1
-#SBATCH --ntasks=1
-#SBATCH --cpus-per-task=4
-#SBATCH --mem=32G
-
-VENV_PY=/fs/scratch/PGS0407/binben14/envs/paper_parser_venv/bin/python
-cd /users/PGS0407/binben14/VietHuy/agent_code_IDLE/pdf_extractor
-
-$VENV_PY extract.py --pdf "$1" --output_dir "output/$2" --paper_id "$2" --dpi 150
+.venv/bin/python run_corpus.py \
+  --corpus /path/to/corpus --output /path/to/extracted --workers 6 --dpi 150
 ```
 
-Submit example:
-```bash
-sbatch -M pitzer jobs/run_extractor_pitzer.sh "input/xxx.pdf" "paper_xxx"
-```
+It extracts top-level PDFs in parallel to one subdirectory per stem, skips completed
+outputs, records failures in `.FAILED`, and copies matching `*_fulltext.md` sources
+by default. Options include `--limit`, `--force`, `--no_md`. It is a batch CLI, not
+an AgentUI scheduler. `--force` reprocesses; it does not clean every prior artifact.
 
-## Notes
+## Site-specific SLURM wrappers
 
-- No torch required (device detection falls back to cpu gracefully).
-- If you later want optional VLM enhancement for tables/figures, you can extend the function (we had that before but removed for simplicity and reliability).
-- The function is pure and side-effect free except for writing to output_dir.
-
-Run it, the output will look like the one you liked in `/users/PGS0407/binben14/VietHuy/agent_code_IDLE/pdf_extractor/output`.
+`jobs/run_extractor_pitzer.sh`, `run_corpus_extract.sh`, and `run_bench_extract.sh`
+contain fixed OSC paths, environment locations, accounts/partitions and corpus
+locations. Inspect/adapt them to the target host; their presence does not prove
+those resources or the scratch venv exist today. Create the configured log folder
+before submission. After `sbatch`, report job ID and return; use one-shot status
+checks or AgentUI scheduled monitoring, not foreground polling loops.

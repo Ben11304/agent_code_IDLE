@@ -1,0 +1,26 @@
+{
+  "apps": "./.app.json",
+  "author": {
+    "name": "Canva Pty Ltd."
+  },
+  "description": "Bring your Canva design workflow into Codex and create, refine, and review designs through natural conversation.\n\nWhat Canva can do: \nCreate designs: Turn a brief, outline, or draft copy into a presentation, doc, poster, flyer, social post, resume, and more. \nGenerate images: Create photos, illustrations, icons, and graphics from a prompt, or restyle an image you already have. \nRemove backgrounds: Lift the subject out of an image onto a transparent background. Upload files: Bring attachments and files from your chat into Canva to use in your designs. \nResize for social media: Adapt a design for Facebook, Instagram, and LinkedIn in one step. \nBulk create: Generate multiple designs from spreadsheet data using a brand template. \nEdit designs: Update text, media, and formatting, or reposition and resize elements. \nGet design feedback: Receive structured feedback on visual hierarchy, layout, readability, consistency, and accessibility. \nImplement feedback: Review comment threads and apply clear, actionable changes. Brand check: Check colors, fonts, logo usage, and copy against your Brand Kit.\n\nOnce installed, describe what you want in plain language or invoke Canva directly with @Canva.\n\nTry prompts like:\n\n@Canva, create a pitch deck from this outline.\n@Canva, make an Instagram post announcing our Friday sale.\n@Canva, generate an illustration of a lighthouse at dawn.\n@Canva, remove the background from this photo.\n@Canva, upload this PDF and turn it into a presentation.\n@Canva, resize this design for social media.\n@Canva, create designs from this spreadsheet using my brand template.\n@Canva, update the headline in this design.\n@Canva, implement the feedback in the comment threads.\n@Canva, check this design against my Brand Kit.\nRequirements: Connect your Canva account to use the plugin. Bulk Create requires an eligible Canva Enterprise plan. Design and image generation use Canva AI credits.\n\nWant to take a more hands-on approach? Instantly open your design in Canva's powerful editor for the final touches.",
+  "interface": {
+    "capabilities": [],
+    "category": "Creativity",
+    "defaultPrompt": [
+      "Create some social media posts based on our October campaign brief",
+      "Use these latest investor meeting notes to make a Q1 2026 pitch deck",
+      "Can you resize this poster as an Instagram post for my online store?"
+    ],
+    "developerName": "Canva Pty Ltd.",
+    "displayName": "Canva",
+    "longDescription": "Bring your Canva design workflow into Codex and create, refine, and review designs through natural conversation.\n\nWhat Canva can do: \nCreate designs: Turn a brief, outline, or draft copy into a presentation, doc, poster, flyer, social post, resume, and more. \nGenerate images: Create photos, illustrations, icons, and graphics from a prompt, or restyle an image you already have. \nRemove backgrounds: Lift the subject out of an image onto a transparent background. Upload files: Bring attachments and files from your chat into Canva to use in your designs. \nResize for social media: Adapt a design for Facebook, Instagram, and LinkedIn in one step. \nBulk create: Generate multiple designs from spreadsheet data using a brand template. \nEdit designs: Update text, media, and formatting, or reposition and resize elements. \nGet design feedback: Receive structured feedback on visual hierarchy, layout, readability, consistency, and accessibility. \nImplement feedback: Review comment threads and apply clear, actionable changes. Brand check: Check colors, fonts, logo usage, and copy against your Brand Kit.\n\nOnce installed, describe what you want in plain language or invoke Canva directly with @Canva.\n\nTry prompts like:\n\n@Canva, create a pitch deck from this outline.\n@Canva, make an Instagram post announcing our Friday sale.\n@Canva, generate an illustration of a lighthouse at dawn.\n@Canva, remove the background from this photo.\n@Canva, upload this PDF and turn it into a presentation.\n@Canva, resize this design for social media.\n@Canva, create designs from this spreadsheet using my brand template.\n@Canva, update the headline in this design.\n@Canva, implement the feedback in the comment threads.\n@Canva, check this design against my Brand Kit.\nRequirements: Connect your Canva account to use the plugin. Bulk Create requires an eligible Canva Enterprise plan. Design and image generation use Canva AI credits.\n\nWant to take a more hands-on approach? Instantly open your design in Canva's powerful editor for the final touches.",
+    "privacyPolicyURL": "https://www.canva.com/policies/privacy-policy/",
+    "shortDescription": "Create, review, edit designs",
+    "supportURL": "https://www.canva.com/help/contact-us/",
+    "termsOfServiceURL": "https://www.canva.com/policies/terms-of-use/",
+    "websiteURL": "https://www.canva.com"
+  },
+  "name": "canva",
+  "version": "17.0.1"
+}
