@@ -1,0 +1,129 @@
+{
+  "id": "dataset-discovery",
+  "name": "Dataset Discovery",
+  "author": "OpenConstruction",
+  "version": "0.1.0",
+  "tier": "official",
+  "status": "draft",
+  "lifecycle_stage": "discover",
+  "description": "Find construction datasets by task, modality, annotation type, object class, license, source, and access constraints.",
+  "inputs": [
+    {
+      "name": "task",
+      "type": "string",
+      "required": true,
+      "description": "Construction AI task or research goal."
+    },
+    {
+      "name": "modality",
+      "type": "string",
+      "required": false,
+      "description": "Preferred data modality such as images, video, point clouds, BIM, text, or sensor data."
+    },
+    {
+      "name": "object_class",
+      "type": "string",
+      "required": false,
+      "description": "Target object, class, element, hazard, activity, or asset type."
+    },
+    {
+      "name": "annotation",
+      "type": "string",
+      "required": false,
+      "description": "Required annotation style such as bounding boxes, masks, labels, trajectories, or metadata fields."
+    },
+    {
+      "name": "license",
+      "type": "string",
+      "required": false,
+      "description": "License or reuse constraint."
+    }
+  ],
+  "outputs": [
+    {
+      "name": "candidate_datasets",
+      "type": "array",
+      "description": "Ranked dataset candidates with title, id, summary, license, source link, fit score, fit reasons, and checks."
+    },
+    {
+      "name": "selection_notes",
+      "type": "array",
+      "description": "Short notes about fit, access, metadata gaps, and follow-up checks."
+    },
+    {
+      "name": "next_actions",
+      "type": "array",
+      "description": "Suggested MCP tool calls for inspecting or comparing the strongest candidates."
+    }
+  ],
+  "tools": [
+    "run_dataset_discovery",
+    "find_datasets",
+    "search_resources",
+    "get_resource",
+    "compare_resources"
+  ],
+  "permissions": [
+    "read_openconstruction"
+  ],
+  "risk_level": "low",
+  "license": "Apache-2.0",
+  "review": {
+    "reviewer": "OpenConstruction",
+    "reviewed_date": null,
+    "test_status": "runtime-tested",
+    "security_notes": "Uses public OpenConstruction metadata only. No external account access and no code execution."
+  },
+  "workflow": [
+    "Capture the user's task, modality, annotation, object class, license, and access constraints.",
+    "Search dataset records with the most specific constraints first.",
+    "Retrieve promising records and inspect source metadata for access, license, and citation signals.",
+    "Compare candidates by task fit, data modality, annotation match, evidence, and reuse constraints.",
+    "Return a concise ranked list with links and note any missing metadata that should be checked manually."
+  ],
+  "runtime": {
+    "tool": "run_dataset_discovery",
+    "module": "openconstruction_mcp.workflows",
+    "function": "dataset_discovery"
+  },
+  "instruction_path": "skills/dataset-discovery/SKILL.md",
+  "source_url": "https://github.com/Ben11304/OC-mcp/tree/main/skills/dataset-discovery",
+  "download_url": "https://github.com/Ben11304/OC-mcp/raw/main/packages/skills/dataset-discovery.zip",
+  "ui": [
+    {
+      "type": "text",
+      "name": "task",
+      "label": "Task",
+      "placeholder": "helmet detection, point cloud segmentation, bridge inspection"
+    },
+    {
+      "type": "text",
+      "name": "modality",
+      "label": "Modality",
+      "placeholder": "image, video, point cloud, BIM, sensor"
+    },
+    {
+      "type": "text",
+      "name": "object_class",
+      "label": "Object or class",
+      "placeholder": "hardhat, worker, crack, equipment, wall"
+    },
+    {
+      "type": "text",
+      "name": "annotation",
+      "label": "Annotation",
+      "placeholder": "bounding boxes, masks, labels, trajectories"
+    },
+    {
+      "type": "text",
+      "name": "license",
+      "label": "License",
+      "placeholder": "open, CC BY, Apache-2.0"
+    }
+  ],
+  "example_prompts": [
+    "Find open datasets for construction safety helmet detection.",
+    "Find point cloud datasets for construction scene segmentation.",
+    "Which datasets can support equipment detection with reusable licenses?"
+  ]
+}

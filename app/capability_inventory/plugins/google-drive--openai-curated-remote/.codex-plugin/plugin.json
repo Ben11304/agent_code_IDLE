@@ -1,0 +1,52 @@
+{
+  "name": "google-drive",
+  "version": "0.1.16",
+  "description": "Use Google Drive as the single entrypoint for Drive, Docs, Sheets, and Slides work.",
+  "author": {
+    "name": "OpenAI",
+    "email": "support@openai.com",
+    "url": "https://openai.com/"
+  },
+  "homepage": "https://workspace.google.com/products/drive/",
+  "repository": "https://github.com/openai/plugins",
+  "license": "MIT",
+  "keywords": [
+    "google-drive",
+    "google",
+    "google workspace",
+    "drive",
+    "docs",
+    "sheets",
+    "slides",
+    "files",
+    "google-docs",
+    "google-sheets",
+    "google-slides",
+    "productivity"
+  ],
+  "skills": "./skills/",
+  "apps": "./.app.json",
+  "interface": {
+    "displayName": "Google Drive",
+    "shortDescription": "Drive, Docs, Sheets or Slides",
+    "longDescription": "Use Google Drive as one unified Google file plugin for search, file organization, sharing, and Google Docs, Google Sheets, and Google Slides workflows.",
+    "developerName": "OpenAI",
+    "category": "Productivity",
+    "capabilities": [
+      "Interactive",
+      "Write"
+    ],
+    "composerIcon": "./assets/logo.png",
+    "logo": "./assets/logo.png",
+    "websiteURL": "https://workspace.google.com/products/drive/",
+    "privacyPolicyURL": "https://policies.google.com/privacy",
+    "termsOfServiceURL": "https://policies.google.com/terms",
+    "defaultPrompt": [
+      "Search my Drive for the latest Q4 board deck and write a 10-bullet executive recap with the 3 biggest risks and 3 next actions",
+      "Rewrite this product one-pager using our brand guidelines doc: match the voice and format while keeping facts intact",
+      "From [folder], pull key deliverables, timeline, and open questions, then draft a client-ready status update"
+    ],
+    "brandColor": "#0F9D58",
+    "screenshots": []
+  }
+}

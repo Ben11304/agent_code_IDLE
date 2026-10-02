@@ -6,7 +6,8 @@ Closed scope decisions. Subagents must NOT overturn them on their own. To overtu
 - Agents: {{agent_ids_csv}}.
 - Each agent is a **self-contained context boundary**. Communication happens only via manifests
   (`<producer>/outputs/manifest.md` ↔ `<consumer>/inputs/manifest.md`).
-- Do NOT read each other's internals. Found an issue outside your scope → escalate.
+- Slim `overview.md` and derived `state/children_status.json` are read-only routing exceptions.
+  Other cross-agent access follows manifests. Found an issue outside your scope → escalate.
 - Topology (parent-child) is declared in `.agentui/project.yaml` field `parents`.
 
 > Whenever a new scope decision is closed (splitting an agent, transferring ownership, locking

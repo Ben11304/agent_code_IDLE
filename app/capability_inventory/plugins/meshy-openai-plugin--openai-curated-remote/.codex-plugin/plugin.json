@@ -1,0 +1,62 @@
+{
+  "author": {
+    "name": "Meshy",
+    "url": "https://github.com/meshy-dev"
+  },
+  "description": "Turn text, photos, and concept art into 3D assets for games, animation, and 3D printing. Generate PBR textures, refine geometry, animate humanoid characters, and prepare single-color or multicolor print files.",
+  "homepage": "https://www.meshy.ai",
+  "interface": {
+    "capabilities": [
+      "Text, Image, and Multi-View 3D Generation",
+      "Game Props, Characters, and Low-Poly Assets",
+      "PBR Texturing and Model Retexturing",
+      "Polygon-Budget Remeshing and UV Unwrapping",
+      "Humanoid Auto-Rigging and Animation",
+      "Text-to-Motion and AI Reference Images",
+      "Printability Analysis and Mesh Repair",
+      "Single-Color and Multicolor 3MF Preparation",
+      "Creative Lab: Figurines, Lamps, Keychains, and Fridge Magnets",
+      "Model Resizing, Orientation, and Slicer Handoff",
+      "GLB, FBX, OBJ, STL, USDZ, and 3MF Export Workflows",
+      "Project Asset Delivery and Follow-Up Editing"
+    ],
+    "category": "Creativity",
+    "composerIcon": "./.codex-plugin/assets/composer-icon.svg",
+    "defaultPrompt": [
+      "Create a low-poly treasure chest for my game, target 2,000 triangles, add PBR textures, and save it as GLB in ./assets.",
+      "Rig this textured humanoid character, add a walking animation, and export it as FBX.",
+      "Turn this photo into a 75 mm figurine, check its printability, and prepare a multicolor 3MF for a compatible slicer."
+    ],
+    "developerName": "Meshy LLC",
+    "displayName": "Meshy",
+    "logo": "./.codex-plugin/assets/logo.svg",
+    "longDescription": "Turn text, photos, or sketches into 3D assets for games, animation, and 3D printing. Generate PBR textures, refine geometry, rig humanoid characters, and bring them to life with animation. Prepare models with printability checks, mesh repair, and multicolor 3MF workflows, or explore Creative Lab to create figurines, lamps, keychains, and fridge magnets. Export in popular 3D formats and save assets directly into your project.",
+    "shortDescription": "From ideas to 3D creations",
+    "termsOfServiceURL": "https://www.meshy.ai/terms-of-use",
+    "websiteURL": "https://www.meshy.ai"
+  },
+  "keywords": [
+    "meshy",
+    "3d",
+    "asset-generation",
+    "text-to-3d",
+    "image-to-3d",
+    "game-development",
+    "low-poly",
+    "pbr-texturing",
+    "remeshing",
+    "rigging",
+    "animation",
+    "3d-printing",
+    "multicolor",
+    "creative-lab",
+    "glb",
+    "fbx",
+    "3mf"
+  ],
+  "license": "MIT",
+  "name": "meshy-openai-plugin",
+  "repository": "https://github.com/meshy-dev/meshy-3d-agent",
+  "skills": "./skills/",
+  "version": "0.6.0"
+}

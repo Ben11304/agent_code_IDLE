@@ -4,43 +4,42 @@ Common tool conventions for every agent in the project. Read at pre-flight.
 
 ## RTK — token-optimized CLI (file reading/exploration)
 
-For read-only filesystem operations, prefer `rtk` over raw commands
-(saves tokens, compact output):
+Follow the active workspace RTK policy. Where all shell commands require an
+RTK prefix, use `rtk proxy <command>` for operations without a dedicated wrapper:
 
 ```bash
 rtk ls <path>          # instead of ls / ls -la
 rtk read <file>        # instead of cat / head / tail
 rtk grep <pat> <path>  # instead of grep -n
-rtk find <path> ...    # instead of find (does NOT support -not/-exec → use raw find when needed)
+rtk proxy find <path> ... # supports exact find options
 rtk git status         # instead of git status
 rtk git diff           # instead of git diff
 rtk git log            # instead of git log
-rtk wc / du / df / ps / tree
+rtk proxy <command>     # pass through commands without a dedicated wrapper
 ```
 
-**Raw commands are allowed** when rtk does not cover them: complex pipes `a | b | c`,
-compound `&&`/`||`, exact stderr redirects, SLURM
-(`sbatch`/`squeue`/`sacct`/`scancel`/`scontrol`), `module load`,
-write ops (`mkdir`/`chmod`/`rm`/`mv`), one-shot `python -c`, env exports.
+Use `rtk proxy bash -c '…'` when shell syntax is needed, with correct quoting.
+Availability of RTK or an adapter hook does not itself prove every command has
+been wrapped; keep commands consistent with the actual workspace instructions.
 
-## Consensus MCP — academic paper search (peer-reviewed)
+## SLURM jobs are asynchronous
 
-Search 200M+ peer-reviewed papers (Semantic Scholar, PubMed, Scopus, ArXiv) via the
-`mcp__consensus__search` MCP tool. Call it directly as a tool — no CLI needed.
+Treat a successful `sbatch` as a handoff boundary: record the cluster and job ID,
+then return control to the user. Never hold an agent turn open with `while`/`until`
+polling, `watch`, `tail -f`/`tail -F`, or a sleep-and-check loop. Use a one-shot
+`squeue`/`sacct` snapshot for an immediate status request. For ongoing monitoring,
+use AgentUI's control-plane `<schedule>` mechanism when its scheduling contract is
+present; each scheduled turn must also perform only one snapshot.
 
-Key parameters (all optional except `query`):
-- `query` — use academic terminology, be specific
-- `year_min` / `year_max` — only when user explicitly wants a date range
-- `exclude_preprints: true` — only when user asks for peer-reviewed only
-- Do NOT set `domain`, `study_types`, or other filters unless user explicitly requests them
+## Research tools and skills
 
-When to use: finding papers/DOIs, literature survey, verifying a paper exists,
-  reviewing state-of-the-art on a topic.
-When NOT to use: general web/realtime news, code-level questions, non-academic claims.
-
-For general web research: use `WebSearch` (already permitted in settings).
-For adversarial review / code critique / hard reasoning: use Claude's built-in
-  capabilities (Read + analysis — no external tool needed).
+Use the tools/skills actually exposed by the current adapter and agent policy.
+A template cannot guarantee `Consensus`, `WebSearch`, a global skill directory,
+or any specific MCP schema is installed/enabled. For Codex, AgentUI compiles policy
+from its local capability inventory; other adapters have their own tool surfaces.
+When an academic search tool is available, inspect its schema and use it for paper
+lookup. Read/verify the source before citing, following research-integrity rules.
+Do not assume an imported MCP schema proves the remote service is reachable.
 
 ## Git / filesystem safety (no cross-scope destructive ops)
 

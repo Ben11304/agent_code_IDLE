@@ -1,5 +1,10 @@
 # AgentUI – Story Slides (Phiên bản nội dung)
 
+> Nội dung thuyết trình được đối chiếu 2026-09-07. Đây là narrative, không thay thế
+> tài liệu vận hành. Các PPTX/PDF có sẵn là snapshot trình bày cũ và không tự cập nhật
+> từ Markdown này; xem [README](README.md) trước khi tái sử dụng.
+
+
 **Mục tiêu**: Trình bày câu chuyện phát triển tự nhiên khi sử dụng AI Agent, dẫn dắt dần các tính năng kỹ thuật một cách dễ hiểu cho người không chuyên sâu.  
 **Đối tượng**: Giáo viên + người có thể funding (startup nhỏ).  
 **Tone**: Thực tế, dẫn chuyện, kết hợp kỹ thuật vừa phải, dễ hình dung.
@@ -48,7 +53,7 @@ Giai đoạn 1–2: "Wow" rồi lại "Sao hôm nay nó lại không nhớ gì?"
 **Nội dung:**
 
 - Ban đầu: AI làm rất tốt các tác vụ kỹ thuật → cảm giác mạnh mẽ.
-- Sau đó nhận ra: **Mỗi lần gọi AI là như gọi một người mới hoàn toàn**.
+- Sau đó nhận ra: **Khi không có phiên resume hoặc memory phù hợp, AI thiếu bối cảnh trước đó**.
   - Không nhớ dự án đã làm gì.
   - Không hiểu bối cảnh trước đó.
   - Phải giải thích lại từ đầu mỗi lần.
@@ -95,7 +100,7 @@ Giai đoạn 4: Một agent không thể đảm nhiệm mọi việc
 
 **Cần có:**
 - Mỗi agent chỉ chuyên một vai trò rõ ràng.
-- Ranh giới quyền hạn (sandbox) phải được xác định chặt chẽ.
+- Ranh giới ownership phải được khai báo rõ; contract trong prompt không phải sandbox hệ điều hành.
 
 **Ghi chú trình bày:**  
 "Lúc này bạn không còn dùng AI như một công cụ. Bạn đang **xây dựng một đội ngũ**."
@@ -150,8 +155,8 @@ Thư mục `shared/` và cách Orchestrator thực sự hiểu đội ngũ
 - Khi gửi prompt cho Orchestrator, hệ thống **tự động inject** phần hướng dẫn dispatch dựa trên graph hiện tại.
 - Orchestrator được nhắc lại chính xác:
   - "Bạn chỉ được dispatch cho các agent con trực tiếp."
-  - "DATA chịu trách nhiệm X (xem inputs/outputs manifest)."
-  - "MODELING chịu trách nhiệm Y (xem code_map)."
+  - Current overview của mọi direct child được nạp mỗi parent turn.
+  - Role/scope chi tiết vẫn nằm trong tài liệu project; không tự nạp toàn bộ code_map/manifest.
 - Khi Orchestrator muốn giao việc → dùng cú pháp `<dispatch agent="DATA">...</dispatch>`
 - Hệ thống kiểm tra: chỉ cho phép dispatch đúng theo graph đã định nghĩa.
 
@@ -215,7 +220,7 @@ AgentUI: Control Plane cho Multi-Agent Workflows
 
 - Không phải một framework để tạo thêm agent.
 - Mà là **hệ thống điều hành (operating layer)** cho đội agent bạn đã có.
-- Làm việc trực tiếp với Claude CLI và Grok (qua aas) – không cần API key mới.
+- Hỗ trợ Claude, Codex SDK, Grok qua aas, DeepSeek và GLM; xác thực tùy adapter.
 
 **Giá trị cốt lõi:**
 - Thấy rõ cấu trúc đội (graph trực quan).
@@ -236,7 +241,7 @@ AgentUI giải quyết vấn đề như thế nào?
 
 - **Graph trực quan**: Xem cấu trúc cha-con, trạng thái realtime (idle/running/ok/error).
 - **Auto-dispatch có xác minh**: Orchestrator phát `<dispatch>`, AgentUI parse live, chạy agent con, animate cạnh.
-- **Dispatch Ledger**: Lưu kết quả thực tế của agent con → tự động đưa lại cho orchestrator ở lượt sau (không bịa chuyện).
+- **Dispatch Ledger**: Lưu kết quả thực tế của agent con → tự động đưa lại cho orchestrator ở lượt sau (giúp tổng hợp dựa trên kết quả đã nhận; vẫn cần verify nội dung).
 - **Floating chat windows**: Nhiều agent làm việc đồng thời như một đội thật.
 - **Thiết lập dễ dàng**: Dùng `.agentui/project.yaml` + thư mục agent có sẵn.
 - **Scheduler thực sự**: Agent có thể tự đăng ký chạy định kỳ hoặc "cho đến khi xong".
@@ -275,7 +280,4 @@ Từ công cụ → Đội ngũ → Cần hệ thống điều hành
 
 ---
 
-**File này dùng để duyệt nội dung trước.**  
-Sau khi bạn duyệt và chỉnh sửa, mình sẽ chuyển sang tạo file PowerPoint (.pptx) thực tế dựa trên nội dung này. 
-
-Bạn có muốn mình chỉnh phần nào trước không? (ví dụ: thêm bớt kỹ thuật, thay đổi thứ tự, làm ngắn hơn, nhấn mạnh điểm nào hơn…)
+**Nguồn trình bày:** Markdown này là bản nội dung; generator PPTX hiện có text riêng và không đọc file này.

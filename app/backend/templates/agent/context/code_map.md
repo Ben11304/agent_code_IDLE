@@ -3,6 +3,7 @@
 Files/modules this agent owns or references.
 
 ## Owned (agent is author/maintainer — may write)
+- `./overview.md` — owner BODY; machine fields are control-plane-owned.
 - `./AGENT.md` — role + contract (rarely edited).
 - `./inputs/manifest.md` — synced by `sync.sh`, do not edit by hand.
 - `./outputs/manifest.md` — bump per the Bump rule after each artifact.
@@ -11,6 +12,7 @@ Files/modules this agent owns or references.
 {{owned_extra}}
 
 ## Read-only references (consume, do not modify)
+- Other agents' `overview.md` / derived `state/children_status.json` for routing only.
 - `../shared/` — research_integrity, tool_conventions, handoff_schema,
   scope_decisions, glossary.
 - Upstream agents listed in `./inputs/manifest.md`.

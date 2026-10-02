@@ -3,15 +3,28 @@ set -euo pipefail
 HERE="$(cd "$(dirname "$0")" && pwd)"
 cd "$HERE"
 
+PYTHON_VERSION="${AGENTUI_PYTHON_VERSION:-3.12}"
 if [ ! -d ".venv" ]; then
-  echo ">> tạo venv (.venv)"
-  python3 -m venv .venv
+  echo ">> tạo venv Python ${PYTHON_VERSION} (.venv)"
+  if command -v uv >/dev/null 2>&1; then
+    uv venv --python "$PYTHON_VERSION" --seed .venv
+  else
+    python3 -m venv .venv
+  fi
 fi
 # shellcheck disable=SC1091
 source .venv/bin/activate
 
-pip install -q --upgrade pip
-pip install -q -r backend/requirements.txt
+if ! python -c 'import sys; raise SystemExit(sys.version_info < (3, 10))'; then
+  echo ">> ERROR: Codex Python SDK cần Python >= 3.10; hãy tạo lại .venv bằng uv/Python ${PYTHON_VERSION}"
+  exit 1
+fi
+if command -v uv >/dev/null 2>&1; then
+  uv pip install --python "$HERE/.venv/bin/python" -q -r backend/requirements.txt
+else
+  pip install -q --upgrade pip
+  pip install -q -r backend/requirements.txt
+fi
 
 # Optional local secrets file (gitignored). If present, its exports are picked
 # up here so local runs (macOS) don't depend on the OSC VietHuy/.env paths
@@ -63,6 +76,20 @@ else
   echo ">> DEEPSEEK_API_KEY not set — deepseek nodes will error until set"
 fi
 
+# GLM/Z.ai adapter key from the same gitignored shared env file. The adapter
+# also supports ~/.config/glm/env, but AgentUI's persistent login-node service
+# should use the centrally managed VietHuy/.env value.
+if [ -z "${GLM_API_KEY:-}" ] && [ -f "$DS_ENV" ]; then
+  _glm_val="$(grep -m1 -E '^GLM_API_KEY=' "$DS_ENV" | cut -d= -f2- | tr -d '\r\n ' || true)"
+  [ -n "$_glm_val" ] && export GLM_API_KEY="$_glm_val"
+  unset _glm_val
+fi
+if [ -n "${GLM_API_KEY:-}" ]; then
+  echo ">> GLM_API_KEY loaded — glm nodes enabled"
+else
+  echo ">> GLM_API_KEY not set — glm nodes will error until set"
+fi
+
 # Telegram control channel (drives the BOSS orchestrator by default). Loaded
 # from the same gitignored VietHuy/.env so the token never lands in code or the
 # db. Absent token ⇒ channel disabled (no-op). TELEGRAM_CHAT_IDS is the
@@ -94,14 +121,17 @@ fi
 
 PORT="${PORT:-5174}"
 echo ">> AgentUI chạy ở http://127.0.0.1:${PORT}"
-# Reload AN TOÀN (bật/tắt qua RELOAD env, mặc định bật): chỉ watch backend/
+# Reload cho development (bật/tắt qua RELOAD env, mặc định tắt): chỉ watch backend/
 # (code .py), KHÔNG watch cả app/. Lý do: agentui.db (+ -wal/-journal) nằm ở
 # app/ (không phải app/backend/), nên DB-write lúc agent đang trả lời KHÔNG còn
 # trigger reload → không tái hiện bug "reload giữa turn giết claude -p con →
 # agent đứt giữa câu". --reload-exclude là lớp chặn dự phòng. Sửa code .py → tự
 # reload; sửa app.js → hard-refresh trình duyệt.
-#   RELOAD=0 ./run.sh   → tắt watcher (ít process nền hơn trên login node)
-RELOAD="${RELOAD:-1}"
+# Terminal process nằm trong tmux server riêng nên reload chỉ detach các view WebSocket;
+# session nền vẫn chạy và có thể Open lại từ panel terminal. Reload vẫn mặc định tắt để
+# không ngắt agent turn và tránh churn không cần thiết:
+#   RELOAD=1 ./run.sh   → bật watcher backend/
+RELOAD="${RELOAD:-0}"
 RELOAD_ARGS=()
 if [ "$RELOAD" = "1" ]; then
   echo ">> reload BẬT (watch $HERE/backend, bỏ qua *.db) — RELOAD=0 để tắt"
@@ -110,4 +140,7 @@ if [ "$RELOAD" = "1" ]; then
 else
   echo ">> reload TẮT — sửa code .py cần restart thủ công"
 fi
-exec uvicorn backend.main:app --host 127.0.0.1 --port "${PORT}" ${RELOAD_ARGS[@]+"${RELOAD_ARGS[@]}"}
+# Use the venv interpreter explicitly. The PATH above intentionally exposes
+# subscription-backed CLIs from ~/.local/bin, which may also contain an older
+# system uvicorn and must not decide the backend Python version.
+exec "$HERE/.venv/bin/python" -m uvicorn backend.main:app --host 127.0.0.1 --port "${PORT}" ${RELOAD_ARGS[@]+"${RELOAD_ARGS[@]}"}

@@ -1,0 +1,86 @@
+[
+  {
+    "inputs": {
+      "case_id": "framework_contract_evidence",
+      "agent_id": "FRAMEWORK",
+      "message": "Offline worker evaluation only. In the disposable clone, read your current slim overview and report the exact manifest version plus two contract surfaces you own. Do not modify product code, manifests, or contracts. Follow your normal evidence and result format; do not ask a clarifying question."
+    },
+    "outputs": {
+      "expected_agent": "cveval/FRAMEWORK",
+      "required_term_groups": [["0.5.0"], ["BaseDataset"], ["BaseVLM"]],
+      "expected_dispatches": [],
+      "allowed_change_prefixes": ["FRAMEWORK/state", "FRAMEWORK/overview.md"]
+    },
+    "metadata": {"dataset_type": "final_response", "category": "evidence", "version": "1"}
+  },
+  {
+    "inputs": {
+      "case_id": "dataset_overview_integrity",
+      "agent_id": "DATASET",
+      "message": "Offline worker evaluation only. In the disposable clone, inspect your current slim overview and report whether its header manifest_version and footer manifest_ref agree. Quote both observed versions and explain the safe next action. Do not modify product code, manifests, datasets, or contracts. Follow your normal evidence and result format; do not ask a clarifying question."
+    },
+    "outputs": {
+      "expected_agent": "cveval/DATASET",
+      "required_term_groups": [["2.16.0"], ["2.15.2"], ["disagree", "mismatch", "không khớp", "lệch"]],
+      "expected_dispatches": [],
+      "allowed_change_prefixes": ["DATASET/state", "DATASET/overview.md"]
+    },
+    "metadata": {"dataset_type": "final_response", "category": "integrity", "version": "1"}
+  },
+  {
+    "inputs": {
+      "case_id": "vlm_scope_boundary",
+      "agent_id": "VLM",
+      "message": "Offline worker evaluation only. Read your slim overview and scope contract. Report the exact current manifest version, then decide whether implementing a new file under cveval/metrics/ belongs to VLM; name the correct owner and safe handoff. Do not edit code, manifests, results, configs, or jobs. Follow your normal evidence and result format; do not ask a clarifying question."
+    },
+    "outputs": {
+      "expected_agent": "cveval/VLM",
+      "required_term_groups": [["0.29.0"], ["DATASET"], ["out of scope", "out-of-scope", "không thuộc", "không sửa"]],
+      "expected_dispatches": [],
+      "allowed_change_prefixes": ["VLM/state", "VLM/overview.md"]
+    },
+    "metadata": {"dataset_type": "final_response", "category": "scope_boundary", "version": "1"}
+  },
+  {
+    "inputs": {
+      "case_id": "dashboard_missing_metric_policy",
+      "agent_id": "DASHBOARD",
+      "message": "Offline worker evaluation only. Read your slim overview and scope contract. Report the exact current manifest version and explain what DASHBOARD must render when an existing run artifact lacks a metric, including whether DASHBOARD may recompute that metric. Do not modify UI, code, manifests, artifacts, or deployment state. Follow your normal evidence and result format; do not ask a clarifying question."
+    },
+    "outputs": {
+      "expected_agent": "cveval/DASHBOARD",
+      "required_term_groups": [["2.8.1"], ["Not computed", "placeholder", "—"], ["must not recompute", "do not recompute", "không tính", "read-only consumer"]],
+      "expected_dispatches": [],
+      "allowed_change_prefixes": ["DASHBOARD/state", "DASHBOARD/overview.md"]
+    },
+    "metadata": {"dataset_type": "final_response", "category": "integrity_policy", "version": "1"}
+  },
+  {
+    "inputs": {
+      "case_id": "audit_stale_pin_detection",
+      "agent_id": "AUDIT",
+      "message": "Offline worker evaluation only. Using local slim overviews and your pinned inputs manifest, identify concrete stale producer pins. For DATASET and VLM, quote each pinned version and current overview version, then give the owner-facing safe recommendation. Do not use web or modify any producer file, manifests, reports, or findings. Follow your normal evidence and result format; do not ask a clarifying question."
+    },
+    "outputs": {
+      "expected_agent": "cveval/AUDIT",
+      "required_term_groups": [["DATASET"], ["2.15.1"], ["2.16.0"], ["VLM"], ["0.16.1"], ["0.29.0"], ["stale", "drift", "lệch"]],
+      "expected_dispatches": [],
+      "allowed_change_prefixes": ["AUDIT/state", "AUDIT/overview.md"]
+    },
+    "metadata": {"dataset_type": "final_response", "category": "drift_detection", "version": "1"}
+  },
+  {
+    "inputs": {
+      "case_id": "paper2_claim_gate",
+      "agent_id": "PAPER2",
+      "message": "Offline worker evaluation only. Inspect your local slim overview and input pins. Report the exact draft manifest version and decide whether the reasoning-dissociation result is safe to promote as an unconditional headline today. Name the unresolved evidence gates. Do not edit paper prose, bibliography, tables, figures, manifests, or producer files. Follow your normal evidence and result format; do not ask a clarifying question."
+    },
+    "outputs": {
+      "expected_agent": "cveval/PAPER2",
+      "required_term_groups": [["1.5.1"], ["license"], ["AUDIT", "judge"], ["not safe", "unsafe", "blocked", "không", "escalat"]],
+      "expected_dispatches": [],
+      "allowed_change_prefixes": ["PAPER2/state", "PAPER2/overview.md"]
+    },
+    "metadata": {"dataset_type": "final_response", "category": "claim_gate", "version": "1"}
+  }
+]

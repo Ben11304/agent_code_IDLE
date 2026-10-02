@@ -58,6 +58,30 @@ def init_db() -> None:
                 updated_at REAL NOT NULL,
                 PRIMARY KEY (project_slug, agent_id)
             );
+            CREATE TABLE IF NOT EXISTS agent_capability_policies (
+                project_slug TEXT NOT NULL,
+                agent_id TEXT NOT NULL,
+                policy TEXT NOT NULL,
+                revision INTEGER NOT NULL DEFAULT 1,
+                updated_at REAL NOT NULL,
+                PRIMARY KEY (project_slug, agent_id)
+            );
+            CREATE TABLE IF NOT EXISTS agent_skill_usage (
+                project_slug TEXT NOT NULL,
+                agent_id TEXT NOT NULL,
+                skill_path TEXT NOT NULL,
+                skill_name TEXT NOT NULL,
+                provider_thread_id TEXT NOT NULL,
+                turn_id TEXT NOT NULL,
+                source TEXT NOT NULL,
+                created_at REAL NOT NULL,
+                PRIMARY KEY (
+                    project_slug, agent_id, skill_path,
+                    provider_thread_id, turn_id
+                )
+            );
+            CREATE INDEX IF NOT EXISTS idx_agent_skill_usage_stats
+                ON agent_skill_usage(project_slug, agent_id, skill_path, created_at);
             CREATE TABLE IF NOT EXISTS dispatch_results (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 project_slug TEXT NOT NULL,
@@ -163,6 +187,25 @@ def init_db() -> None:
             );
             CREATE INDEX IF NOT EXISTS idx_dissent_open
                 ON dissent_flags(project_slug, status);
+            CREATE TABLE IF NOT EXISTS escalations (
+                escalation_id TEXT PRIMARY KEY,
+                project_slug TEXT NOT NULL,
+                owner_agent TEXT NOT NULL,
+                type TEXT NOT NULL,
+                target TEXT,
+                reason TEXT,
+                evidence TEXT,
+                status TEXT NOT NULL DEFAULT 'open'
+                    CHECK(status IN ('open','resolved','superseded')),
+                opened_session TEXT,
+                resolved_session TEXT,
+                resolved_by TEXT,
+                resolution_reason TEXT,
+                created_at REAL NOT NULL,
+                resolved_at REAL
+            );
+            CREATE INDEX IF NOT EXISTS idx_escalations_open
+                ON escalations(project_slug, owner_agent, status, created_at);
             CREATE TABLE IF NOT EXISTS halt_log (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 project_slug TEXT NOT NULL,
@@ -216,6 +259,13 @@ def init_db() -> None:
                 PRIMARY KEY (project_slug, agent_id, day)
             );
             """
+        )
+        # Establish a durable, honest zero point. We intentionally do not scan
+        # historical transcripts because older Codex runs did not emit a
+        # reliable skill-invocation signal.
+        c.execute(
+            "INSERT OR IGNORE INTO settings(key, value) VALUES (?, ?)",
+            ("skill_usage_tracking_started_at", str(time.time())),
         )
         # backward-compat: add grok_model column if older db
         _ensure_column(c, "agent_overrides", "grok_model", "TEXT")
@@ -281,6 +331,30 @@ def new_session(project_slug: str, agent_id: str) -> dict:
         "claude_session_id": None, "created_at": now, "updated_at": now,
         "last_status": None,
     }
+
+
+def reset_agent_runtime(project_slug: str, agent_id: str) -> bool:
+    """Detach the latest UI session from its provider thread without deleting chat.
+
+    Capability changes must start a fresh Codex thread because an already-created
+    thread may retain its old skill/tool surface.  Keeping the AgentUI session row
+    preserves the visible conversation while clearing only provider runtime state.
+    """
+    now = time.time()
+    with _conn() as c:
+        row = c.execute(
+            "SELECT id FROM sessions WHERE project_slug=? AND agent_id=? "
+            "ORDER BY updated_at DESC LIMIT 1",
+            (project_slug, agent_id),
+        ).fetchone()
+        if not row:
+            return False
+        c.execute(
+            "UPDATE sessions SET claude_session_id=NULL, cli_adapter=NULL, "
+            "last_status=NULL, init_meta=NULL, updated_at=? WHERE id=?",
+            (now, row["id"]),
+        )
+        return True
 
 
 def list_sessions(project_slug: str, agent_id: str) -> list[dict]:
@@ -602,6 +676,201 @@ def set_agent_adapter(project_slug: str, agent_id: str, adapter: str, model_id: 
                 f"UPDATE agent_overrides SET {col}=? WHERE project_slug=? AND agent_id=?",
                 (model_id, project_slug, agent_id),
             )
+
+
+def get_agent_capability_policy(project_slug: str, agent_id: str) -> dict:
+    with _conn() as c:
+        row = c.execute(
+            "SELECT policy, revision, updated_at FROM agent_capability_policies "
+            "WHERE project_slug=? AND agent_id=?",
+            (project_slug, agent_id),
+        ).fetchone()
+    if not row:
+        return {
+            "plugins": {}, "skills": {}, "mcp_servers": {},
+            "revision": 0, "updated_at": None,
+        }
+    try:
+        policy = json.loads(row["policy"])
+    except (TypeError, ValueError):
+        policy = {}
+    if not isinstance(policy, dict):
+        policy = {}
+    return {
+        "plugins": policy.get("plugins") if isinstance(policy.get("plugins"), dict) else {},
+        "skills": policy.get("skills") if isinstance(policy.get("skills"), dict) else {},
+        "mcp_servers": (
+            policy.get("mcp_servers")
+            if isinstance(policy.get("mcp_servers"), dict)
+            else {}
+        ),
+        "revision": int(row["revision"] or 0),
+        "updated_at": row["updated_at"],
+    }
+
+
+def set_agent_capability_policy(project_slug: str, agent_id: str, policy: dict) -> dict:
+    payload = json.dumps({
+        "plugins": policy.get("plugins") if isinstance(policy.get("plugins"), dict) else {},
+        "skills": policy.get("skills") if isinstance(policy.get("skills"), dict) else {},
+        "mcp_servers": (
+            policy.get("mcp_servers")
+            if isinstance(policy.get("mcp_servers"), dict)
+            else {}
+        ),
+    }, sort_keys=True)
+    now = time.time()
+    with _conn() as c:
+        c.execute(
+            "INSERT INTO agent_capability_policies"
+            "(project_slug, agent_id, policy, revision, updated_at) "
+            "VALUES (?, ?, ?, 1, ?) "
+            "ON CONFLICT(project_slug, agent_id) DO UPDATE SET "
+            "policy=excluded.policy, "
+            "revision=agent_capability_policies.revision + 1, "
+            "updated_at=excluded.updated_at",
+            (project_slug, agent_id, payload, now),
+        )
+    return get_agent_capability_policy(project_slug, agent_id)
+
+
+def record_agent_skill_use(
+    project_slug: str,
+    agent_id: str,
+    *,
+    skill_path: str,
+    skill_name: str,
+    provider_thread_id: str,
+    turn_id: str,
+    source: str,
+) -> dict:
+    """Record at most one use of a skill per agent turn and return its totals."""
+    if not all((skill_path, skill_name, provider_thread_id, turn_id)):
+        raise ValueError("skill usage requires path, name, provider thread, and turn")
+    now = time.time()
+    with _conn() as c:
+        cur = c.execute(
+            "INSERT OR IGNORE INTO agent_skill_usage"
+            "(project_slug,agent_id,skill_path,skill_name,provider_thread_id,turn_id,source,created_at) "
+            "VALUES (?,?,?,?,?,?,?,?)",
+            (
+                project_slug, agent_id, skill_path, skill_name,
+                provider_thread_id, turn_id, source or "unknown", now,
+            ),
+        )
+        row = c.execute(
+            "SELECT COUNT(*) AS usage_count, MIN(created_at) AS first_used_at, "
+            "MAX(created_at) AS last_used_at FROM agent_skill_usage "
+            "WHERE project_slug=? AND agent_id=? AND skill_path=?",
+            (project_slug, agent_id, skill_path),
+        ).fetchone()
+    return {
+        "recorded": cur.rowcount == 1,
+        "usage_count": int(row["usage_count"] or 0),
+        "first_used_at": row["first_used_at"],
+        "last_used_at": row["last_used_at"],
+    }
+
+
+def get_agent_skill_usage(project_slug: str, agent_id: str) -> dict[str, dict]:
+    with _conn() as c:
+        rows = c.execute(
+            "SELECT skill_path, COUNT(*) AS usage_count, "
+            "MIN(created_at) AS first_used_at, MAX(created_at) AS last_used_at "
+            "FROM agent_skill_usage WHERE project_slug=? AND agent_id=? "
+            "GROUP BY skill_path",
+            (project_slug, agent_id),
+        ).fetchall()
+    return {
+        row["skill_path"]: {
+            "usage_count": int(row["usage_count"] or 0),
+            "first_used_at": row["first_used_at"],
+            "last_used_at": row["last_used_at"],
+        }
+        for row in rows
+    }
+
+
+def purge_deleted_skill_usage(skill_paths: list[str]) -> int:
+    """Remove usage rows together with a globally deleted inventory skill."""
+    paths = sorted({path for path in skill_paths if path})
+    if not paths:
+        return 0
+    placeholders = ",".join("?" for _ in paths)
+    with _conn() as c:
+        cur = c.execute(
+            f"DELETE FROM agent_skill_usage WHERE skill_path IN ({placeholders})",
+            paths,
+        )
+        return max(0, cur.rowcount)
+
+
+def skill_usage_tracking_started_at() -> float | None:
+    raw = get_setting("skill_usage_tracking_started_at", "")
+    try:
+        return float(raw)
+    except (TypeError, ValueError):
+        return None
+
+
+def purge_deleted_capability_policy(
+    *, kind: str, skill_paths: list[str] | None = None, mcp_server: str | None = None
+) -> int:
+    """Remove stale per-agent overrides after a global inventory deletion."""
+    paths = {path for path in (skill_paths or []) if path}
+    changed = 0
+    now = time.time()
+    with _conn() as c:
+        rows = c.execute(
+            "SELECT project_slug, agent_id, policy FROM agent_capability_policies"
+        ).fetchall()
+        for row in rows:
+            try:
+                policy = json.loads(row["policy"])
+            except (TypeError, ValueError):
+                policy = {}
+            if not isinstance(policy, dict):
+                policy = {}
+            skills = policy.get("skills") if isinstance(policy.get("skills"), dict) else {}
+            servers = (
+                policy.get("mcp_servers")
+                if isinstance(policy.get("mcp_servers"), dict)
+                else {}
+            )
+            before = (len(skills), len(servers))
+            if kind == "skill":
+                skills = {key: value for key, value in skills.items() if key not in paths}
+            elif kind == "mcp_server" and mcp_server:
+                servers = dict(servers)
+                servers.pop(mcp_server, None)
+            after = (len(skills), len(servers))
+            if before == after:
+                continue
+            payload = json.dumps({
+                "plugins": policy.get("plugins") if isinstance(policy.get("plugins"), dict) else {},
+                "skills": skills,
+                "mcp_servers": servers,
+            }, sort_keys=True)
+            c.execute(
+                "UPDATE agent_capability_policies SET policy=?, revision=revision+1, "
+                "updated_at=? WHERE project_slug=? AND agent_id=?",
+                (payload, now, row["project_slug"], row["agent_id"]),
+            )
+            changed += 1
+    return changed
+
+
+def list_latest_codex_runtimes() -> list[dict]:
+    """Return active provider bindings that need detaching after global changes."""
+    with _conn() as c:
+        rows = c.execute(
+            "SELECT s.project_slug, s.agent_id, s.claude_session_id "
+            "FROM sessions s WHERE s.cli_adapter='codex' "
+            "AND s.claude_session_id IS NOT NULL "
+            "AND s.updated_at=(SELECT MAX(latest.updated_at) FROM sessions latest "
+            "WHERE latest.project_slug=s.project_slug AND latest.agent_id=s.agent_id)"
+        ).fetchall()
+    return [dict(row) for row in rows]
 
 
 def list_agent_overrides(project_slug: str) -> dict[str, dict]:
@@ -1003,6 +1272,76 @@ def resolve_dissent(project_slug: str, against: str, verdict: str,
             (verdict, resolved_by, resolution_reason, time.time(), project_slug, against),
         )
         return cur.rowcount
+
+
+# ---------------------------------------------------------------------------
+# Escalation lifecycle — unlike the old sticky overview footer, this is durable
+# control-plane state with explicit IDs and resolution provenance.
+# ---------------------------------------------------------------------------
+
+def open_escalation(project_slug: str, owner_agent: str, esc_type: str,
+                    target: str = "", reason: str = "", evidence: str = "",
+                    opened_session: str | None = None) -> dict:
+    """Create an open escalation, deduplicating an identical still-open row."""
+    with _conn() as c:
+        existing = c.execute(
+            "SELECT * FROM escalations WHERE project_slug=? AND owner_agent=? "
+            "AND type=? AND COALESCE(target,'')=? AND COALESCE(reason,'')=? "
+            "AND status='open' ORDER BY created_at DESC LIMIT 1",
+            (project_slug, owner_agent, esc_type, target or "", reason or ""),
+        ).fetchone()
+        if existing:
+            return dict(existing)
+        escalation_id = "esc-" + uuid.uuid4().hex[:12]
+        now = time.time()
+        c.execute(
+            "INSERT INTO escalations(escalation_id,project_slug,owner_agent,type,target,"
+            "reason,evidence,status,opened_session,created_at) "
+            "VALUES (?,?,?,?,?,?,?,'open',?,?)",
+            (escalation_id, project_slug, owner_agent, esc_type, target or "",
+             reason or "", evidence or "", opened_session, now),
+        )
+        row = c.execute(
+            "SELECT * FROM escalations WHERE escalation_id=?", (escalation_id,)
+        ).fetchone()
+    return dict(row)
+
+
+def get_open_escalations(project_slug: str, owner_agent: str | None = None) -> list[dict]:
+    query = "SELECT * FROM escalations WHERE project_slug=? AND status='open'"
+    params: list = [project_slug]
+    if owner_agent:
+        query += " AND owner_agent=?"
+        params.append(owner_agent)
+    query += " ORDER BY created_at ASC"
+    with _conn() as c:
+        rows = c.execute(query, params).fetchall()
+    return [dict(row) for row in rows]
+
+
+def resolve_escalations(project_slug: str, escalation_ids: list[str],
+                        resolved_by: str, resolution_reason: str = "",
+                        resolved_session: str | None = None) -> tuple[list[str], list[str]]:
+    """Resolve explicit open IDs. Returns (resolved_ids, missing_or_closed_ids)."""
+    resolved: list[str] = []
+    rejected: list[str] = []
+    now = time.time()
+    with _conn() as c:
+        for escalation_id in escalation_ids:
+            row = c.execute(
+                "SELECT status FROM escalations WHERE project_slug=? AND escalation_id=?",
+                (project_slug, escalation_id),
+            ).fetchone()
+            if not row or row["status"] != "open":
+                rejected.append(escalation_id)
+                continue
+            c.execute(
+                "UPDATE escalations SET status='resolved',resolved_session=?,resolved_by=?,"
+                "resolution_reason=?,resolved_at=? WHERE escalation_id=?",
+                (resolved_session, resolved_by, resolution_reason, now, escalation_id),
+            )
+            resolved.append(escalation_id)
+    return resolved, rejected
 
 
 def add_halt_log(project_slug: str, agent_id: str, reason: str = "", evidence: str = "",

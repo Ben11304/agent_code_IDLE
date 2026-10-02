@@ -1,30 +1,33 @@
 from __future__ import annotations
 
 import asyncio
-import fcntl
+import fnmatch
+import glob as globlib
 import hashlib
 import json
 import os
-import pty
 import re
-import signal
-import struct
-import termios
 import time
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
 
-from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect, Body
+from fastapi import FastAPI, HTTPException, Body
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse, FileResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
-from . import db, projects, tokens, progress_store, agent_log, fixed_cost
+from . import capabilities, db, projects, tokens, progress_store, agent_log, fixed_cost, notion_settings
+from . import terminal_service
 from . import telegram_bot as tg
-from .adapters import get_stream
+from .adapters import _codex_sdk_settings, get_stream
+from .langsmith_tracing import trace_agent_turn, trace_dispatch, trace_orchestration
+from notion_report.config import SYSTEM_AGENT_ID, SYSTEM_PROJECT_SLUG
+# Project-owned contracts carry structural requirements, native-table contracts,
+# and reviewer-facing scientific guidance; backend reload refreshes the loader.
+from notion_report.schema import ReportSchemaError, load_report_schema
 
 TREE_EXCLUDE = {
     ".git", ".venv", "venv", "env", "__pycache__", "node_modules",
@@ -33,6 +36,31 @@ TREE_EXCLUDE = {
 }
 
 FRONTEND_DIR = Path(__file__).resolve().parent.parent / "frontend"
+# The user-provided asset lives at the repository root (`agent_code_IDLE/logo`),
+# one level above `app/`.  Keep the API URL stable so the graph never needs to
+# know the on-disk layout.
+NOTION_LOGO_PATH = FRONTEND_DIR.parent.parent / "logo" / "Notion_app_logo.png"
+NOTION_REPORT_CONFIG_PATH = FRONTEND_DIR.parent.parent / "notion_report" / "destinations.json"
+
+_NOTION_AGENT_INSTRUCTIONS = """
+
+## AgentUI Notion contract — control-plane enforced
+- Use only the `agentui_notion_report` MCP tools. Never search for, suggest,
+  install, or ask the user to connect a separate Notion plugin from an AgentUI turn.
+- Project and agent identity are injected by the control plane. Never infer or
+  supply a project slug or agent id to a Notion tool.
+- "All Notion" means the complete subtree below this project's bound parent,
+  not the user's whole workspace. Use `list_notion_project_tree`, then
+  `read_notion_project_page` for each relevant page.
+- For broad rewrites, complete a read-only inventory/audit first. Use
+  `sync_notion_managed_report` with `dry_run=true` to show the plan, and write
+  only after user authorization. Never overwrite manual content outside the
+  AgentUI-managed section.
+- Report success only after `read_back_verified=true`. If a project has no binding,
+  the connector auto-creates its subtree below the verified AgentUI System Hub.
+  If that hub is absent, request the one System Hub setup action; never request a
+  separate plugin or credential setup for each project/agent.
+"""
 
 app = FastAPI(title="AgentUI")
 app.add_middleware(
@@ -41,6 +69,14 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+
+@app.get("/api/ui-assets/notion-logo")
+def api_notion_logo():
+    """Serve the user-provided Notion logo used by graph telemetry badges."""
+    if not NOTION_LOGO_PATH.is_file():
+        raise HTTPException(404, "Notion logo not found")
+    return FileResponse(NOTION_LOGO_PATH, media_type="image/png")
 
 db.init_db()
 # Snapshot the sessions the previous process left mid-turn BEFORE the reaper flips
@@ -70,6 +106,39 @@ _SCHED_ATTR_RE = re.compile(r'([\w-]+)="([^"]*)"')
 _SCHED_INTERVAL_FLOOR_S = 300      # 5 min — bound subscription-quota burn
 _SCHED_UNTIL_CEILING = 48          # hard ceiling for until-loops without <schedule_stop>
 _SCHED_ZOMBIE_DAYS = 7
+
+# This contract is intentionally injected into EVERY primary agent turn. A
+# scheduler submission is already asynchronous; the recurring production bug was
+# the model starting a foreground `while squeue ...; sleep ...` tool immediately
+# afterwards. That shell keeps the provider CLI alive, which in turn keeps the
+# AgentUI run active and trips the one-active-run-per-agent 409 guard. Keep this
+# compact and unconditional: a request that merely says "run the experiment" can
+# still cause the model to submit a batch job and decide to wait for it.
+_SLURM_HANDOFF_INSTRUCTIONS = (
+    "\n\n## SLURM handoff — batch jobs must never occupy an AgentUI turn\n"
+    "`sbatch` is asynchronous. As soon as it succeeds, capture the cluster and job ID, "
+    "report them, and release the current turn. The SLURM job continues independently "
+    "after the turn, browser, terminal, or AgentUI closes.\n"
+    "- NEVER wait for a submitted job inside a tool call: no `while`/`until`/`for` polling "
+    "with `squeue` or `sacct`, no `watch`, no `tail -f`/`tail -F`, no sleep-and-check loop, "
+    "and no foreground wait for job completion. Do not hide such a poller behind `nohup`, "
+    "`&`, tmux, or another detached shell.\n"
+    "- A one-shot `squeue`/`sacct` query is allowed when checking the status NOW. Return "
+    "after that single snapshot.\n"
+    "- If ongoing monitoring was requested and the AgentUI scheduling contract is present, "
+    "emit a real `<schedule>` goal loop whose individual turns perform one status snapshot. "
+    "If scheduling is unavailable, say that plainly; the user can inspect Process running or "
+    "ask for status later. Never keep this turn open as the monitoring mechanism.\n"
+)
+
+_OFFLINE_EVALUATION_INSTRUCTIONS = (
+    "\n\n## Offline evaluation safety boundary\n"
+    "This turn is running in a disposable evaluation workspace. Do not access "
+    "network services, Notion, SSH, SLURM (`sbatch`, `srun`, `scancel`), or paths "
+    "outside the current project clone. Do not create background jobs or schedules. "
+    "Perform only the requested evaluation behavior and keep every file write inside "
+    "the disposable clone.\n"
+)
 
 _SCHEDULE_INSTRUCTIONS = (
     "\n\n## ⏰ Recurring / deferred work — emit <schedule>, NEVER narrate a loop (control-plane parsed)\n"
@@ -115,6 +184,7 @@ _SCHEDULE_INSTRUCTIONS = (
     # cost of a miss (user re-asks) is far below the cost of a false fire (answer destroyed).
 _TRACK_INTENT_RE = re.compile(
     r"(track this|track it|track the|keep me posted|keep an eye|"
+    r"monitor\s+(this|it|the|a|my|job|jobs|run|queue|training|experiment)\b|"
     r"(run|check|report|update|ping|poll)\s+(me\s+)?periodically|"
     r"recurring\s+(run|check|task|job|report|schedule|turn|reminder)|"
     r"(set|create|add|make|start)\s+(up\s+)?(a\s+)?(schedule|cron)\b|cron\s+job|"
@@ -129,6 +199,17 @@ _TRACK_INTENT_RE = re.compile(
     r"m[ỗo]i\s+\d+\s*(ph[úu]t|gi[ờo]|p|h|m)\b|"
     r"cho\s+đ[ếe]n\s+khi\s+xong|t[ựu]\s+ch[ạa]y|until\s+(it'?s\s+)?(done|finished|complete|over))",
     re.IGNORECASE)
+
+# A submission request should receive the scheduler syntax even when it does not
+# literally contain "monitor". The handoff contract above still forbids waiting;
+# this merely gives the agent the correct control-plane alternative if the task
+# naturally needs a later completion check.
+_SLURM_SUBMIT_INTENT_RE = re.compile(
+    r"(\bsbatch\b|\bsubmit(?:ting)?\s+(?:a\s+|the\s+)?(?:slurm\s+|batch\s+)?job\b|"
+    r"\bsubmit(?:ting)?\s+(?:the\s+)?(?:run|training|experiment)\b|"
+    r"(?:ch[ạa]y|g[ửu]i|submit)\s+(?:m[ộo]t\s+)?job\b)",
+    re.IGNORECASE,
+)
 
 _SCHEDULE_NUDGE = (
     "[CONTROL-PLANE SCHEDULE CHECK] Your previous response described tracking / monitoring / a recurring "
@@ -156,7 +237,7 @@ def _looks_like_tracking_intent(text: str) -> bool:
 def _should_include_schedule_instructions(slug: str, agent_id: str, message: str) -> bool:
     """Include the heavy schedule instructions (~524 tokens) only when relevant.
     Include when:
-    - User message shows tracking/recurring/monitoring intent
+    - User message shows tracking/recurring/monitoring or SLURM-submit intent
     - This is a scheduled fire (wrapped prompt)
     - The agent currently has at least one active schedule (may need <schedule_stop>)
     Never include when the scheduler is globally disabled — nothing can fire, so
@@ -166,6 +247,8 @@ def _should_include_schedule_instructions(slug: str, agent_id: str, message: str
         return False
     msg = (message or "").lower()
     if _looks_like_tracking_intent(message or ""):
+        return True
+    if _SLURM_SUBMIT_INTENT_RE.search(message or ""):
         return True
     if "scheduled check" in msg or "schedule_stop" in msg or "automatic recurring" in msg:
         return True
@@ -265,6 +348,18 @@ def api_project(slug: str):
     if not p:
         raise HTTPException(404, "project not found")
     out = dict(p)
+    # Reload the project-owned contract on every project fetch. This lets an
+    # authorized SCHEMA NOTE become visible without restarting AgentUI.
+    try:
+        loaded_report_schema = load_report_schema(
+            p["root"], p.get("notion_report"))
+    except ReportSchemaError as exc:
+        loaded_report_schema = {"valid": False, "error": str(exc)}
+    if loaded_report_schema:
+        out["report_schema"] = {
+            key: value for key, value in loaded_report_schema.items()
+            if key != "path_abs"
+        }
     statuses = {}
     overrides = db.list_agent_overrides(slug)
     for a in out["agents"]:
@@ -290,6 +385,28 @@ def api_project(slug: str):
             a["model"] = ov["model"]  # adapter override wins over project.yaml
         if "effort" in ov:
             a["effort"] = ov["effort"]
+    # The destination registry is the routing source of truth. Mirror its URL
+    # into the project payload so the graph's Notion badge opens the exact bound
+    # (or auto-provisioned) project page instead of a stale YAML/default link.
+    root_agent = next(
+        (item for item in out["agents"] if not (item.get("parents") or [])),
+        None,
+    )
+    if root_agent:
+        try:
+            notion = notion_settings.get_notion_settings(
+                NOTION_REPORT_CONFIG_PATH, slug, root_agent["id"])
+        except ValueError:
+            notion = {}
+        notion_url = str(notion.get("notion_url") or "").strip()
+        if notion.get("configured") and notion_url:
+            root_agent["notion_url"] = notion_url
+            resources = dict(out.get("resources") or {})
+            current = resources.get("notion")
+            notion_resource = dict(current) if isinstance(current, dict) else {}
+            notion_resource["url"] = notion_url
+            resources["notion"] = notion_resource
+            out["resources"] = resources
     out["statuses"] = statuses
     out["positions"] = db.get_node_positions(slug)
     out["schedules"] = [_schedule_public(t) for t in db.list_scheduled_tasks(slug)]
@@ -300,6 +417,267 @@ def api_project(slug: str):
         for a in out["agents"]:
             a["telegram_bot"] = conn["bot"] if a["id"] == conn["agent_id"] else None
     return out
+
+
+_PROJECT_PAPER_LIMIT = 500
+_MODEL_EVIDENCE_LIMIT = 20
+
+
+def _string_list(value) -> list[str]:
+    if isinstance(value, str):
+        return [value]
+    if isinstance(value, list):
+        return [str(v) for v in value if isinstance(v, (str, Path)) and str(v).strip()]
+    return []
+
+
+def _resource_path_allowed(path: Path) -> bool:
+    """Resource-panel files must remain inside the configured workspace tree.
+
+    This mirrors the file viewer's boundary so every item returned by this API
+    is safe to open with `/api/workspace/file` or `/api/workspace/raw`.
+    """
+    workspace = projects.get_workspace_root()
+    if not workspace:
+        return False
+    try:
+        path.resolve().relative_to(workspace.resolve())
+        return True
+    except (OSError, ValueError):
+        return False
+
+
+def _workspace_resource_item(path: Path) -> dict | None:
+    workspace = projects.get_workspace_root()
+    try:
+        resolved = path.resolve()
+        rel = resolved.relative_to(workspace.resolve()) if workspace else None
+    except (OSError, ValueError):
+        return None
+    if rel is None or not resolved.is_file():
+        return None
+    return {
+        "id": hashlib.sha1(str(resolved).encode("utf-8")).hexdigest()[:16],
+        "name": resolved.stem.replace("_", " ").replace("-", " "),
+        "filename": resolved.name,
+        "abs_path": str(resolved),
+        "rel_path": str(rel),
+        "availability": "local",
+    }
+
+
+_PAPER_CATALOG_ENTRY_RE = re.compile(r"^\s*-\s+\*\*([^*]+)\*\*\s+[—-]\s+(.+?)\s*$")
+_PAPER_URL_RE = re.compile(r"https?://[^\s)>]+")
+
+
+def _paper_match_key(value: str) -> str:
+    return re.sub(r"[^a-z0-9]+", "", str(value or "").lower())
+
+
+def _catalog_papers(project: dict, catalog_paths) -> list[dict]:
+    """Read the canonical Markdown catalog without pretending metadata is a PDF.
+
+    Catalog rows use ``- **ShortID** — citation``.  The stable ShortID also lets
+    telemetry associate a DOI/arXiv/web access with the corresponding panel row.
+    """
+    project_root = Path(project["root"]).resolve()
+    workspace = projects.get_workspace_root()
+    out: list[dict] = []
+    seen: set[str] = set()
+    for raw in _string_list(catalog_paths):
+        catalog = Path(raw).expanduser()
+        if not catalog.is_absolute():
+            catalog = project_root / catalog
+        try:
+            catalog = catalog.resolve()
+        except OSError:
+            continue
+        if not catalog.is_file() or not _resource_path_allowed(catalog):
+            continue
+        try:
+            lines = catalog.read_text(encoding="utf-8").splitlines()
+            source_rel = str(catalog.relative_to(workspace.resolve())) if workspace else ""
+        except (OSError, UnicodeError, ValueError):
+            continue
+        for line_no, line in enumerate(lines, 1):
+            match = _PAPER_CATALOG_ENTRY_RE.match(line)
+            if not match:
+                continue
+            key, citation = match.group(1).strip(), match.group(2).strip()
+            normalized = _paper_match_key(key)
+            if not normalized or normalized in seen:
+                continue
+            seen.add(normalized)
+            quoted_title = re.search(r'["“](.+?)["”]', citation)
+            urls = [u.rstrip(".,;") for u in _PAPER_URL_RE.findall(citation)]
+            aliases = [key, *urls]
+            aliases += re.findall(r"\b10\.\d{4,9}/[-._;()/:A-Z0-9]+", citation, re.IGNORECASE)
+            aliases += re.findall(r"\barXiv\s*\d{4}\.\d{4,5}(?:v\d+)?\b", citation, re.IGNORECASE)
+            out.append({
+                "id": hashlib.sha1(f'{project.get("slug", "")}:{normalized}'.encode("utf-8")).hexdigest()[:16],
+                "key": key,
+                "name": quoted_title.group(1) if quoted_title else key,
+                "citation": citation,
+                "filename": "",
+                "abs_path": "",
+                "rel_path": "",
+                "source_abs_path": str(catalog),
+                "source_rel_path": source_rel,
+                "source_line": line_no,
+                "url": urls[0] if urls else "",
+                "aliases": list(dict.fromkeys(aliases)),
+                "availability": "metadata",
+            })
+            if len(out) >= _PROJECT_PAPER_LIMIT:
+                return out
+    return out
+
+
+def _configured_papers(project: dict) -> list[dict]:
+    resources = project.get("resources") or {}
+    paper_cfg = resources.get("papers") or {}
+    roots = _string_list(paper_cfg.get("roots") if isinstance(paper_cfg, dict) else paper_cfg)
+    extensions = _string_list(paper_cfg.get("extensions", ["pdf"]) if isinstance(paper_cfg, dict) else ["pdf"])
+    suffixes = {"." + ext.lower().lstrip(".") for ext in extensions} or {".pdf"}
+    project_root = Path(project["root"]).resolve()
+    local_files: dict[str, dict] = {}
+    for raw in roots:
+        root = Path(raw).expanduser()
+        if not root.is_absolute():
+            root = project_root / root
+        try:
+            root = root.resolve()
+        except OSError:
+            continue
+        if not _resource_path_allowed(root):
+            continue
+        candidates = [root] if root.is_file() else root.rglob("*") if root.is_dir() else []
+        for path in candidates:
+            if len(local_files) >= _PROJECT_PAPER_LIMIT:
+                break
+            if not path.is_file() or path.suffix.lower() not in suffixes:
+                continue
+            item = _workspace_resource_item(path)
+            if item:
+                local_files[item["abs_path"]] = item
+
+    catalogs = paper_cfg.get("catalogs", []) if isinstance(paper_cfg, dict) else []
+    catalog_items = _catalog_papers(project, catalogs)
+    unmatched = dict(local_files)
+    # A local filename starts with (or contains) its catalog ShortID, e.g.
+    # ``Suresh2022_ShapeMap3D_ICRA.pdf``. Prefer the longest match.
+    for paper in catalog_items:
+        key = _paper_match_key(paper.get("key", ""))
+        matches = [
+            (path, item) for path, item in unmatched.items()
+            if key and key in _paper_match_key(item.get("filename", ""))
+        ]
+        if not matches:
+            continue
+        path, local = max(matches, key=lambda pair: len(_paper_match_key(pair[1]["filename"])))
+        paper.update({
+            "filename": local["filename"],
+            "abs_path": local["abs_path"],
+            "rel_path": local["rel_path"],
+            "availability": "local",
+            "aliases": list(dict.fromkeys([*(paper.get("aliases") or []), local["filename"], local["rel_path"], local["abs_path"]])),
+        })
+        unmatched.pop(path, None)
+
+    # PDFs without a catalog row remain visible so dropping a new file into the
+    # collection never makes it disappear from the UI.
+    for item in unmatched.values():
+        item["aliases"] = [item["filename"], item["rel_path"], item["abs_path"]]
+        catalog_items.append(item)
+    return sorted(catalog_items, key=lambda p: ((p.get("key") or p["name"]).lower(), p.get("filename", "").lower()))
+
+
+def _resource_glob(project_root: Path, patterns) -> list[Path]:
+    found: dict[str, Path] = {}
+    for raw in _string_list(patterns):
+        pattern = Path(raw).expanduser()
+        full = pattern if pattern.is_absolute() else project_root / pattern
+        # `glob` supports absolute recursive patterns, unlike Path.glob.
+        for match in globlib.glob(str(full), recursive=True):
+            try:
+                path = Path(match).resolve()
+            except OSError:
+                continue
+            if path.is_file() and _resource_path_allowed(path):
+                found[str(path)] = path
+                if len(found) >= _MODEL_EVIDENCE_LIMIT:
+                    break
+    return list(found.values())
+
+
+def _job_matches_model(job_name: str, patterns) -> bool:
+    name = str(job_name or "").lower()
+    for raw in _string_list(patterns):
+        pattern = raw.lower()
+        matched = (fnmatch.fnmatch(name, pattern)
+                   if any(c in pattern for c in "*?[") else pattern in name)
+        if matched:
+            return True
+    return False
+
+
+def _configured_models(project: dict, jobs: list[dict]) -> list[dict]:
+    resources = project.get("resources") or {}
+    configs = resources.get("models") or []
+    if not isinstance(configs, list):
+        return []
+    root = Path(project["root"]).resolve()
+    out = []
+    for index, cfg in enumerate(configs):
+        if not isinstance(cfg, dict):
+            continue
+        architecture = _resource_glob(root, cfg.get("architecture"))
+        checkpoints = _resource_glob(root, cfg.get("checkpoints"))
+        results = _resource_glob(root, cfg.get("results"))
+        active_jobs = [j for j in jobs if _job_matches_model(j.get("name", ""), cfg.get("job_patterns"))]
+        if active_jobs:
+            status, detail = "training", f"{len(active_jobs)} active SLURM job(s)"
+        elif checkpoints and results:
+            status, detail = "ready", f"{len(checkpoints)} checkpoint(s) + {len(results)} result file(s)"
+        else:
+            status = "declared"
+            missing = []
+            if not checkpoints:
+                missing.append("checkpoint")
+            if not results:
+                missing.append("result")
+            detail = "missing " + " + ".join(missing) if missing else "architecture declared"
+        out.append({
+            "id": str(cfg.get("id") or f"model-{index + 1}"),
+            "name": str(cfg.get("name") or cfg.get("id") or f"Model {index + 1}"),
+            "status": status,
+            "detail": detail,
+            "architecture_count": len(architecture),
+            "checkpoint_count": len(checkpoints),
+            "result_count": len(results),
+            "active_jobs": [{"id": j.get("id"), "name": j.get("name"), "state": j.get("state")}
+                            for j in active_jobs],
+        })
+    return out
+
+
+@app.get("/api/projects/{slug}/resources")
+async def api_project_resources(slug: str):
+    """Read-only project inventory for the graph's Papers / Models monitor."""
+    project = projects.get_project(slug)
+    if not project:
+        raise HTTPException(404, "project not found")
+    resources = project.get("resources") or {}
+    if not resources:
+        return {"enabled": False, "papers": [], "models": []}
+    jobs_data = await _cluster_jobs_snapshot() if resources.get("models") else {"clusters": {}}
+    jobs = [job for cluster in (jobs_data.get("clusters") or {}).values() for job in cluster]
+    return {
+        "enabled": True,
+        "papers": _configured_papers(project),
+        "models": _configured_models(project, jobs),
+        "jobs_error": jobs_data.get("error"),
+    }
 
 
 class NodePositions(BaseModel):
@@ -552,6 +930,12 @@ _STALE_MEMORY_GAP_S = 6 * 3600
 # the agent read the live rollup every turn but never mirrored it back).
 _STALE_BODY_ABS_S = 14 * 24 * 3600
 _STALE_BODY_GRACE_S = 60  # ignore sub-minute mtime skew between sibling files
+_OVERVIEW_BODY_RE = re.compile(
+    r"<!-- OVERVIEW:BODY -->(.*?)<!-- /OVERVIEW:BODY -->", re.DOTALL)
+_MEMORY_RECONCILED_RE = re.compile(
+    r"\[MEMORY_RECONCILED\](?P<body>[\s\S]*?)\[/MEMORY_RECONCILED\]",
+    re.IGNORECASE,
+)
 
 # status (raw session state) → coarse job status for the parent rollup. We only
 # emit what we can actually observe; we do NOT fabricate "done"/"blocked".
@@ -766,6 +1150,10 @@ class AgentSettings(BaseModel):
     effort: Optional[str] = None
 
 
+class NotionSettings(BaseModel):
+    notion_url: str
+
+
 _AGENT_ID_RE = re.compile(r"^[A-Z][A-Z0-9_]*$")
 
 
@@ -857,7 +1245,7 @@ def _bootstrap_prompt(slug: str, body: "NewAgent", parent_id: str) -> str:
         "  read ONLY slim things: the shared rules it needs (`../shared/{research_integrity,"
         "scope_decisions}.md` + others on-demand), this file, its own `./overview.md`, and the "
         "  tiny `./inputs/manifest.md` (pinned versions). A PARENT reads `./state/children_status.json` "
-        "  instead of each child's overview. Then an 'On-demand only (NOT at boot)' note: open the "
+        "  and every direct child's slim `overview.md` before routing. Then an 'On-demand only (NOT at boot)' note: open the "
         "  full `./inputs/<PRODUCER>.md` blob + the artifacts it points to ONLY when consuming a "
         "  specific artifact — never for routing. **Do NOT read `./state/progress.md` at boot** — "
         "  the control-plane auto-injects the recent slice (`progress.json`, ~2 days) into the "
@@ -1107,9 +1495,89 @@ def api_set_agent_settings(slug: str, agent_id: str, body: AgentSettings):
     return {"ok": True}
 
 
+@app.get("/api/projects/{slug}/agents/{agent_id}/notion-settings")
+def api_get_notion_settings(slug: str, agent_id: str):
+    found = projects.get_agent(slug, agent_id)
+    if not found:
+        raise HTTPException(404, "agent not found")
+    is_root_agent = not (found[1].get("parents") or [])
+    try:
+        return notion_settings.get_notion_settings(
+            NOTION_REPORT_CONFIG_PATH,
+            slug,
+            agent_id,
+            editable=is_root_agent,
+        )
+    except ValueError as exc:
+        raise HTTPException(400, str(exc)) from exc
+
+
+@app.post("/api/projects/{slug}/agents/{agent_id}/notion-settings")
+def api_set_notion_settings(slug: str, agent_id: str, body: NotionSettings):
+    found = projects.get_agent(slug, agent_id)
+    if not found:
+        raise HTTPException(404, "agent not found")
+    is_root_agent = not (found[1].get("parents") or [])
+    try:
+        return notion_settings.bind_notion_settings(
+            NOTION_REPORT_CONFIG_PATH,
+            slug,
+            agent_id,
+            body.notion_url,
+            editable=is_root_agent,
+        )
+    except ValueError as exc:
+        raise HTTPException(400, str(exc)) from exc
+    except RuntimeError as exc:
+        raise HTTPException(502, str(exc)) from exc
+
+
+@app.get("/api/notion-system-settings")
+def api_get_notion_system_settings():
+    """Return the one workspace hub used to provision project subtrees."""
+    try:
+        return notion_settings.get_notion_settings(
+            NOTION_REPORT_CONFIG_PATH,
+            SYSTEM_PROJECT_SLUG,
+            SYSTEM_AGENT_ID,
+            editable=True,
+        )
+    except ValueError as exc:
+        raise HTTPException(400, str(exc)) from exc
+
+
+@app.post("/api/notion-system-settings")
+def api_set_notion_system_settings(body: NotionSettings):
+    """Verify and bind the System Hub; this is the only global setup action."""
+    try:
+        return notion_settings.bind_notion_settings(
+            NOTION_REPORT_CONFIG_PATH,
+            SYSTEM_PROJECT_SLUG,
+            SYSTEM_AGENT_ID,
+            body.notion_url,
+            editable=True,
+        )
+    except ValueError as exc:
+        raise HTTPException(400, str(exc)) from exc
+    except RuntimeError as exc:
+        raise HTTPException(502, str(exc)) from exc
+
+
 class AdapterSwitch(BaseModel):
     adapter: str   # claude | grok | deepseek | glm
     model: Optional[str] = None  # specific model id for the new adapter (optional)
+
+
+class CapabilityToggle(BaseModel):
+    kind: str  # plugin | skill | mcp_server | mcp_tool
+    target: str
+    enabled: bool
+    server: Optional[str] = None
+
+
+class CapabilityDelete(BaseModel):
+    kind: str  # skill | mcp_server
+    target: str
 
 
 # Default model per adapter when the caller omits `model`.
@@ -1144,6 +1612,244 @@ def api_set_agent_adapter(slug: str, agent_id: str, body: AdapterSwitch):
     return {"ok": True, "adapter": body.adapter,
             "model": body.model or _ADAPTER_DEFAULT_MODEL[body.adapter],
             "session_rotated": rotated, "project": api_project(slug)}
+
+
+def _agent_runtime_env(project: dict, slug: str, agent_id: str) -> dict[str, str]:
+    """Build the non-secret identity/config environment shared by Codex + inventory."""
+    runtime_env = {
+        "AGENTUI_PROJECT_SLUG": slug,
+        "AGENTUI_AGENT_ID": agent_id,
+        "AGENTUI_PROJECT_NAME": str(project.get("name") or slug),
+        "AGENTUI_PROJECT_ROOT_AGENT_ID": next(
+            (str(item.get("id")) for item in project.get("agents", [])
+             if item.get("id") and not (item.get("parents") or [])),
+            agent_id,
+        ),
+        "NOTION_REPORT_CONFIG": str(NOTION_REPORT_CONFIG_PATH),
+    }
+    try:
+        loaded_report_schema = load_report_schema(
+            project["root"], project.get("notion_report"))
+    except ReportSchemaError:
+        loaded_report_schema = None
+    if loaded_report_schema:
+        runtime_env["AGENTUI_PROJECT_ROOT"] = str(project["root"])
+        runtime_env["AGENTUI_REPORT_SCHEMA_FILE"] = str(
+            loaded_report_schema["path_abs"])
+    try:
+        notion_destination = notion_settings.get_notion_settings(
+            NOTION_REPORT_CONFIG_PATH, slug, agent_id)
+        token_env_name = str(notion_destination.get("token_env") or "").strip()
+        if token_env_name:
+            runtime_env["AGENTUI_NOTION_TOKEN_ENV"] = token_env_name
+    except ValueError:
+        pass
+    return runtime_env
+
+
+async def _agent_capability_payload(
+    slug: str, agent_id: str, *, force: bool = False
+) -> dict:
+    found = projects.get_agent(slug, agent_id)
+    if not found:
+        raise HTTPException(404, "agent not found")
+    project, agent = found
+    override = db.get_agent_override(slug, agent_id) or {}
+    adapter = override.get("model") or agent.get("model", "claude")
+    cwd = projects.resolve_cwd(project["root"], agent.get("cwd", "."))
+    runtime_env = _agent_runtime_env(project, slug, agent_id)
+    # Inventory is always the inherited baseline. Applying the saved policy here
+    # would hide disabled tools and make it impossible to turn them back on.
+    config, _, _, _ = _codex_sdk_settings(runtime_env)
+    config.cwd = cwd
+    try:
+        catalog = await capabilities.discover_catalog(
+            config=config,
+            cwd=cwd,
+            cache_key=f"{slug}:{agent_id}:{cwd}",
+            force=force,
+        )
+    except Exception as exc:
+        raise HTTPException(502, f"Codex capability inventory failed: {exc}") from exc
+    policy = db.get_agent_capability_policy(slug, agent_id)
+    effective = capabilities.effective_catalog(catalog, policy)
+    skill_usage = db.get_agent_skill_usage(slug, agent_id)
+    for skill in effective.get("skills", []):
+        usage = skill_usage.get(skill["path"], {})
+        skill["usage_count"] = int(usage.get("usage_count") or 0)
+        skill["first_used_at"] = usage.get("first_used_at")
+        skill["last_used_at"] = usage.get("last_used_at")
+    override_count = len(policy.get("plugins") or {}) + len(policy.get("skills") or {})
+    for entry in (policy.get("mcp_servers") or {}).values():
+        if not isinstance(entry, dict):
+            continue
+        override_count += int(isinstance(entry.get("enabled"), bool))
+        override_count += len(entry.get("tools") or {})
+    return {
+        "project_slug": slug,
+        "agent_id": agent_id,
+        "agent_role": agent.get("role") or "",
+        "adapter": adapter,
+        "applies_now": adapter == "codex",
+        "revision": policy.get("revision", 0),
+        "override_count": override_count,
+        "updated_at": policy.get("updated_at"),
+        "plugins": effective.get("plugins", []),
+        "skills": effective.get("skills", []),
+        "mcp_servers": effective.get("mcp_servers", []),
+        "errors": effective.get("errors", []),
+        "inventory_source": effective.get("source"),
+        "inventory_path": effective.get("inventory_path"),
+        "inventory_delete_enabled": True,
+        "skill_usage_tracking_started_at": db.skill_usage_tracking_started_at(),
+        "discovered_at": effective.get("discovered_at"),
+    }
+
+
+@app.get("/api/projects/{slug}/agents/{agent_id}/capabilities")
+async def api_agent_capabilities(slug: str, agent_id: str, refresh: bool = False):
+    return await _agent_capability_payload(slug, agent_id, force=refresh)
+
+
+@app.post("/api/projects/{slug}/agents/{agent_id}/capabilities/toggle")
+async def api_toggle_agent_capability(
+    slug: str, agent_id: str, body: CapabilityToggle
+):
+    if _active_run(slug, agent_id):
+        raise HTTPException(409, "agent is running; stop or wait before changing capabilities")
+    payload = await _agent_capability_payload(slug, agent_id)
+    catalog = {
+        "plugins": payload["plugins"],
+        "skills": payload["skills"],
+        "mcp_servers": payload["mcp_servers"],
+    }
+    current = db.get_agent_capability_policy(slug, agent_id)
+    try:
+        updated = capabilities.update_policy(
+            current,
+            catalog,
+            kind=body.kind,
+            target=body.target,
+            enabled=body.enabled,
+            server_name=body.server,
+        )
+    except ValueError as exc:
+        raise HTTPException(400, str(exc)) from exc
+    db.set_agent_capability_policy(slug, agent_id, updated)
+
+    runtime_reset = False
+    if payload["adapter"] == "codex":
+        # Book the completed SDK turn before detaching its provider thread. UI
+        # messages stay in place; the next send receives the normal cold-start recap.
+        _book_current_session_tokens(slug, agent_id)
+        runtime_reset = db.reset_agent_runtime(slug, agent_id)
+    result = await _agent_capability_payload(slug, agent_id)
+    result.update({"ok": True, "runtime_reset": runtime_reset})
+    return result
+
+
+@app.post("/api/projects/{slug}/agents/{agent_id}/capabilities/reset")
+async def api_reset_agent_capabilities(slug: str, agent_id: str):
+    if _active_run(slug, agent_id):
+        raise HTTPException(409, "agent is running; stop or wait before changing capabilities")
+    payload = await _agent_capability_payload(slug, agent_id)
+    had_overrides = bool(payload.get("override_count"))
+    if had_overrides:
+        db.set_agent_capability_policy(
+            slug, agent_id, {"plugins": {}, "skills": {}, "mcp_servers": {}}
+        )
+
+    runtime_reset = False
+    if had_overrides and payload["adapter"] == "codex":
+        _book_current_session_tokens(slug, agent_id)
+        runtime_reset = db.reset_agent_runtime(slug, agent_id)
+    result = await _agent_capability_payload(slug, agent_id)
+    result.update({"ok": True, "runtime_reset": runtime_reset})
+    return result
+
+
+@app.post("/api/projects/{slug}/agents/{agent_id}/capabilities/delete")
+async def api_delete_inventory_capability(
+    slug: str, agent_id: str, body: CapabilityDelete
+):
+    """Delete one capability from Idle's global inventory for every agent."""
+    payload = await _agent_capability_payload(slug, agent_id)
+    if any(not run.done for run in _RUNS.values()) or db.list_running_sessions():
+        raise HTTPException(
+            409, "an agent is running; wait or stop all runs before deleting inventory"
+        )
+
+    skill = None
+    server = None
+    if body.kind == "skill":
+        skill = next(
+            (item for item in payload["skills"] if item["id"] == body.target), None
+        )
+        if not skill:
+            raise HTTPException(404, "skill not found in Agent Idle inventory")
+    elif body.kind == "mcp_server":
+        server = next(
+            (item for item in payload["mcp_servers"] if item["id"] == body.target),
+            None,
+        )
+        if not server:
+            raise HTTPException(404, "MCP server not found in Agent Idle inventory")
+        if not server.get("controllable", False):
+            raise HTTPException(
+                400, "runtime-managed MCP cannot be deleted from Idle inventory"
+            )
+    else:
+        raise HTTPException(400, "only skills and MCP servers can be deleted")
+
+    try:
+        removed = capabilities.delete_inventory_capability(
+            kind=body.kind, target=body.target
+        )
+    except ValueError as exc:
+        raise HTTPException(400, str(exc)) from exc
+
+    if body.kind == "skill":
+        deleted_skill_paths = [
+            value for value in (body.target, removed.get("source_path"))
+            if isinstance(value, str)
+        ]
+        db.purge_deleted_capability_policy(
+            kind="skill",
+            skill_paths=deleted_skill_paths,
+        )
+        db.purge_deleted_skill_usage(deleted_skill_paths)
+    else:
+        db.purge_deleted_capability_policy(
+            kind="mcp_server", mcp_server=str(removed["name"])
+        )
+
+    reset_count = 0
+    reset_errors: list[str] = []
+    for runtime in db.list_latest_codex_runtimes():
+        try:
+            _book_current_session_tokens(runtime["project_slug"], runtime["agent_id"])
+        except Exception as exc:
+            reset_errors.append(
+                f"token booking failed for {runtime['project_slug']}/{runtime['agent_id']}: {exc}"
+            )
+        try:
+            reset_count += int(db.reset_agent_runtime(
+                runtime["project_slug"], runtime["agent_id"]
+            ))
+        except Exception as exc:
+            reset_errors.append(
+                f"runtime reset failed for {runtime['project_slug']}/{runtime['agent_id']}: {exc}"
+            )
+
+    result = await _agent_capability_payload(slug, agent_id, force=True)
+    result.update({
+        "ok": True,
+        "deleted": removed,
+        "global_inventory_change": True,
+        "runtime_reset_count": reset_count,
+        "runtime_reset_errors": reset_errors,
+    })
+    return result
 
 
 @app.get("/api/skills")
@@ -1384,6 +2090,12 @@ def _dispatch_instructions(children: list[str]) -> str:
         "answering questions about their domain, running their pipelines, or producing artifacts. "
         "Reading source files yourself is a violation of your role.** Self-justifying excuses NOT accepted: "
         '"simpler", "faster", "just a quick read", "information query" — these mean DISPATCH anyway.\n\n'
+        "### Direct-read exception — slim routing state\n"
+        "`overview.md` and `state/children_status.json` are control-plane routing state, not worker source files. "
+        "You MUST personally read the routing-state files required by your main-body PRE-FLIGHT or routing workflow "
+        "before deciding or dispatching; do NOT dispatch a worker merely to read its own overview for you. "
+        "This exception is read-only for another agent's overview and applies only to these exact slim-state files; "
+        "code, data, configs, manifests, artifacts, and all other worker-domain files still require dispatch.\n\n"
         "Format (verbatim, one tag per worker, exact ID):\n\n"
         '<dispatch agent="WORKER_ID">Concise task statement.</dispatch>\n\n'
         "## How to write the task inside the tag — read carefully\n"
@@ -1425,6 +2137,33 @@ def _read_capped(p: Path, max_chars: int) -> str:
     if len(txt) > max_chars:
         txt = txt[:max_chars].rstrip() + "\n[… truncated — read the full file if needed]"
     return txt
+
+
+def _read_overview_projection(p: Path, max_body_chars: int = 6000) -> str:
+    """Read an overview without ever cutting its machine footer in half.
+
+    Legacy callers capped the whole file by character count.  A slightly long
+    BODY therefore hid ``open_escalation`` and provenance from the parent.  Cap
+    only the agent-authored BODY and always preserve complete HEADER/FOOTER.
+    """
+    try:
+        txt = p.read_text(encoding="utf-8", errors="replace").strip()
+    except OSError:
+        return ""
+    match = _OVERVIEW_BODY_RE.search(txt)
+    if not match:
+        return _read_capped(p, max_body_chars)
+    body = match.group(1).strip()
+    if len(body) <= max_body_chars:
+        return txt
+    clipped = body[:max_body_chars].rstrip()
+    replacement = (
+        "<!-- OVERVIEW:BODY -->\n"
+        + clipped
+        + "\n[… BODY truncated in prompt; open the overview for the complete summary]\n"
+        + "<!-- /OVERVIEW:BODY -->"
+    )
+    return txt[:match.start()] + replacement + txt[match.end():]
 
 
 def _progress_excerpt(p: Path, max_sections: int = 2, max_chars: int = 2600) -> str:
@@ -1490,7 +2229,7 @@ def _session_preamble(project_root: str, agent: dict, cwd_abs: str) -> str:
     # placeholder (body_incomplete) — the migration safety net, so behaviour is
     # unchanged for any agent that has no overview yet.
     ov = adir / "overview.md"
-    ov_text = _read_capped(ov, 1600) if ov.is_file() else ""
+    ov_text = _read_overview_projection(ov, 4000) if ov.is_file() else ""
     ov_usable = bool(ov_text) and "body_incomplete: true" not in ov_text.lower()
     if ov_text:
         parts.append(f"### Overview (slim self-snapshot, `overview.md`)\n{ov_text}")
@@ -1509,6 +2248,49 @@ def _session_preamble(project_root: str, agent: dict, cwd_abs: str) -> str:
         "[CONTROL-PLANE COLD-START] New CLI session (the previous session could not be resumed). "
         "Below is your persistent state — read it before acting:\n\n"
         + "\n\n".join(parts)
+    )
+
+
+def _children_overview_context(project: dict, parent_id: str) -> tuple[str, list[dict]]:
+    """Load every direct child's slim overview for the parent's current turn.
+
+    This is an actual prompt enrichment, not just UI theatre: the parent model
+    receives the current text before it routes or decides. The access records
+    are emitted separately so the owning child nodes pulse yellow.
+    """
+    agents = {a["id"]: a for a in project.get("agents", [])}
+    sections: list[str] = []
+    accesses: list[dict] = []
+    project_root = project["root"]
+    for child_id in _get_children(project, parent_id):
+        child = agents.get(child_id)
+        if not child:
+            continue
+        child_cwd = projects.resolve_cwd(project_root, child.get("cwd", "."))
+        overview = _agent_dir(project_root, child, child_cwd) / "overview.md"
+        text = _read_overview_projection(overview, 6000) if overview.is_file() else ""
+        if not text:
+            continue
+        stale = _check_overview_staleness(project_root, project, child_id)
+        if stale:
+            text = (
+                "⚠ CONTROL-PLANE: this overview is not attested to the current manifest: "
+                + stale + ". Treat it as routing-only and ask the owner to reconcile before acceptance.\n\n"
+                + text
+            )
+        try:
+            rel_path = str(overview.resolve().relative_to(Path(project_root).resolve()))
+        except (OSError, ValueError):
+            rel_path = str(overview)
+        sections.append(f"### {child_id} (`{rel_path}`)\n{text}")
+        accesses.append({"owner": child_id, "path": str(overview), "rel_path": rel_path})
+    if not sections:
+        return "", []
+    return (
+        "[CONTROL-PLANE CHILD-OVERVIEW PRE-FLIGHT] Current direct-worker snapshots. "
+        "You have read these before routing or deciding this turn:\n\n"
+        + "\n\n".join(sections),
+        accesses,
     )
 
 
@@ -1574,6 +2356,405 @@ async def _register_schedule(slug: str, agent_id: str, attrs: dict, body: str,
     return t
 
 
+def _memory_reconciliation_config(project: dict) -> dict:
+    """Return the opt-in reconciliation policy for one project.
+
+    Projects without ``memory.reconciliation.enabled`` retain the legacy
+    single-turn behaviour.  This makes the GelSight rollout isolated and
+    reversible while the policy is being evaluated.
+    """
+    memory = project.get("memory") or {}
+    cfg = memory.get("reconciliation") or {}
+    return cfg if isinstance(cfg, dict) and cfg.get("enabled") is True else {}
+
+
+def _sha256_file(path: Path) -> Optional[str]:
+    try:
+        return hashlib.sha256(path.read_bytes()).hexdigest()
+    except OSError:
+        return None
+
+
+def _memory_snapshot(agent_dir: Path) -> dict:
+    """Content snapshot used to validate a reconciliation receipt for the whole turn."""
+    overview = agent_dir / "overview.md"
+    try:
+        overview_text = overview.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        overview_text = ""
+    return {
+        "progress": _sha256_file(agent_dir / "state" / "progress.md"),
+        "manifest": _sha256_file(agent_dir / "outputs" / "manifest.md"),
+        "overview": hashlib.sha256(_overview_body(overview).encode("utf-8")).hexdigest(),
+        "overview_text": overview_text,
+    }
+
+
+def _receipt_list(value: Optional[str]) -> list[str]:
+    raw = (value or "").strip()
+    if not raw or raw.lower() in {"none", "n/a", "unchanged"}:
+        return []
+    return [part.strip() for part in re.split(r"\s*[,|]\s*", raw) if part.strip()]
+
+
+def _memory_ref_exists(path: Path, ref: Optional[str]) -> bool:
+    """Best-effort validation that a receipt pointer names text in its owner file."""
+    value = (ref or "").strip()
+    if not value or value.lower() in {"none", "n/a"}:
+        return False
+    # Accept ``path#Heading`` / ``#Heading`` / a dated heading fragment.
+    needle = value.rsplit("#", 1)[-1].replace("-", " ").strip().lower()
+    if not needle:
+        return False
+    try:
+        hay = path.read_text(encoding="utf-8", errors="replace").replace("-", " ").lower()
+    except OSError:
+        return False
+    return needle in hay
+
+
+def _memory_semantic_lint(agent_dir: Path, cfg: dict) -> list[str]:
+    """Non-destructive hygiene checks; warnings never truncate owner content."""
+    warnings: list[str] = []
+    body = _overview_body(agent_dir / "overview.md")
+    advisory_words = int(cfg.get("overview_advisory_words") or 240)
+    words = len(re.findall(r"\b\w+[\w'-]*\b", body, re.UNICODE))
+    if words > advisory_words:
+        warnings.append(
+            f"overview BODY is {words} words (advisory {advisory_words}); rewrite semantically, never truncate"
+        )
+    manifest_path = agent_dir / "outputs" / "manifest.md"
+    try:
+        manifest = manifest_path.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        manifest = ""
+    paragraphs = [re.sub(r"\s+", " ", p).strip().lower()
+                  for p in re.split(r"\n\s*\n", manifest)]
+    seen: set[str] = set()
+    duplicates = 0
+    for paragraph in paragraphs:
+        if len(paragraph) < 80 or paragraph.startswith("|"):
+            continue
+        if paragraph in seen:
+            duplicates += 1
+        seen.add(paragraph)
+    if duplicates:
+        warnings.append(f"manifest contains {duplicates} repeated paragraph(s)")
+    chronology = len(re.findall(r"(?m)^##\s+20\d{2}-\d{2}-\d{2}\b", manifest))
+    if chronology >= 2:
+        warnings.append(
+            f"manifest contains {chronology} dated top-level sections; chronology belongs in progress"
+        )
+    return warnings
+
+
+def _overview_body(path: Path) -> str:
+    try:
+        text = path.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return ""
+    match = _OVERVIEW_BODY_RE.search(text)
+    return match.group(1).strip() if match else ""
+
+
+def _memory_reconciliation_prompt(project: dict, agent: dict, agent_dir: Path,
+                                  final_text: str, turn_before: dict) -> str:
+    cfg = _memory_reconciliation_config(project)
+    protocol = Path(project["root"]) / str(
+        cfg.get("protocol_file") or "shared/memory_protocol.md")
+    outcome = final_text.strip()
+    if len(outcome) > 2400:
+        outcome = outcome[:2400].rstrip() + "\n[… primary response excerpt truncated]"
+    before_phase = _memory_snapshot(agent_dir)
+    observed = {
+        key: "updated" if before_phase.get(key) != turn_before.get(key) else "unchanged"
+        for key in ("progress", "manifest", "overview")
+    }
+    open_escalations = db.get_open_escalations(project["slug"], agent["id"])
+    escalation_lines = [
+        f"- {row['escalation_id']}: {row['type']}→{row.get('target') or '?'} — {row.get('reason') or ''}"
+        for row in open_escalations
+    ] or ["- none"]
+    return (
+        "[CONTROL-PLANE MEMORY_RECONCILIATION — INTERNAL FINALIZATION]\n"
+        "The primary task has finished. Do not redo it, dispatch another agent, "
+        "schedule work, browse, train, or change project artifacts. You are still the "
+        "same owner agent; reconcile only your own persistent memory.\n\n"
+        f"Read the semantic contract at `{protocol}` and inspect these owner files:\n"
+        f"- recent delta: `{agent_dir / 'state' / 'progress.md'}`\n"
+        f"- current technical source of truth: `{agent_dir / 'outputs' / 'manifest.md'}`\n"
+        f"- parent-facing summary: `{agent_dir / 'overview.md'}`\n\n"
+        "Perform the reconciliation in this exact semantic order:\n"
+        "1. Ensure progress contains the meaningful delta from the completed task; do not duplicate an entry already written.\n"
+        "2. Reconcile manifest in place if the current technical truth changed. Organize by subject, never append turn history.\n"
+        "3. Derive OVERVIEW:BODY only from the finalized manifest. Keep only the compact facts that affect parent routing, acceptance, blocking, or stopping. Do not introduce a technical claim absent from the manifest.\n"
+        "4. Do not edit OVERVIEW:HEADER or OVERVIEW:FOOTER; the control plane owns provenance and runtime fields.\n"
+        "A file may remain unchanged when its semantic content did not change. Never truncate information mechanically.\n\n"
+        "Control-plane observation from the start of the PRIMARY turn to this phase:\n"
+        f"- progress: {observed['progress']}\n"
+        f"- manifest: {observed['manifest']}\n"
+        f"- overview BODY: {observed['overview']}\n"
+        "Your receipt must describe the final whole-turn hashes, including edits already made during the primary task.\n\n"
+        "Currently open escalation IDs owned by you:\n"
+        + "\n".join(escalation_lines) + "\n"
+        "Resolve an ID only when this completed task actually removed that blocker.\n\n"
+        "Primary response for orientation only:\n"
+        f"{outcome or '(no textual outcome)'}\n\n"
+        "Finish with exactly this audit block. `durable_delta` is technical, coordination, or none. "
+        "Pointers must name real headings/entries; use `none` only when allowed:\n"
+        "[MEMORY_RECONCILED]\n"
+        "status: ok\n"
+        "durable_delta: <technical|coordination|none>\n"
+        "progress: <updated|unchanged>\n"
+        "progress_ref: <dated heading fragment or none>\n"
+        "manifest: <updated|unchanged>\n"
+        "manifest_ref: <manifest section or none>\n"
+        "overview: <updated|unchanged>\n"
+        "overview_manifest_refs: <manifest section(s), separated by |, or none>\n"
+        "overview_reason: <why parent routing changed or remained unchanged>\n"
+        "resolved_escalations: <explicit esc-ID(s) or none>\n"
+        "[/MEMORY_RECONCILED]"
+    )
+
+
+async def _record_skill_usage_event(
+    *, project_slug: str, agent_id: str, session_id: str, event: dict, emit
+) -> None:
+    """Persist one verified skill use and surface the exact aggregate to the UI."""
+    try:
+        stats = db.record_agent_skill_use(
+            project_slug,
+            agent_id,
+            skill_path=str(event.get("path") or ""),
+            skill_name=str(event.get("skill") or ""),
+            provider_thread_id=str(event.get("thread_id") or ""),
+            turn_id=str(event.get("turn_id") or ""),
+            source=str(event.get("source") or "unknown"),
+        )
+    except (TypeError, ValueError):
+        return
+    if not stats["recorded"]:
+        return
+    try:
+        db.add_cli_event(
+            session_id,
+            "skill",
+            str(event.get("skill") or "skill"),
+            str(event.get("path") or ""),
+            "ok",
+            event_key=f"{event.get('thread_id')}:{event.get('turn_id')}:{event.get('path')}",
+        )
+    except Exception:
+        pass
+    await emit({
+        "type": "skill_use",
+        "agent": agent_id,
+        "skill": event.get("skill"),
+        "path": event.get("path"),
+        "source": event.get("source"),
+        **stats,
+    })
+
+
+async def _run_memory_reconciliation(
+    *, project: dict, agent: dict, agent_dir: Path, final_text: str,
+    turn_before: dict,
+    stream_fn, model: str, override: dict, effort: Optional[str],
+    resume_session_id: Optional[str], cwd: str, runtime_env: dict,
+    emit, session_id: str,
+    capability_policy: Optional[dict] = None,
+) -> dict:
+    """Run the owner agent's private, non-dispatching memory-finalization turn.
+
+    The model performs semantic reconciliation; this function only orchestrates
+    and validates the acknowledgement.  Its prose is intentionally not copied
+    into the user's chat, while tool activity remains visible/auditable.
+    """
+    prompt = _memory_reconciliation_prompt(
+        project, agent, agent_dir, final_text, turn_before)
+    memory_system = (
+        "You are in an internal MEMORY_RECONCILIATION phase initiated by AgentUI. "
+        "Follow the supplied memory protocol. Work only inside your own agent directory. "
+        "Do not dispatch, schedule, or continue the primary task."
+    )
+    if model == "claude":
+        agen = stream_fn(
+            message=prompt, system_prompt=memory_system, cwd=cwd,
+            model=override.get("claude_model") or agent.get("claude_model") or "claude-sonnet-4-6",
+            effort=effort, resume_session_id=resume_session_id,
+            extra_env=runtime_env,
+        )
+    elif model == "grok":
+        agen = stream_fn(
+            message=prompt, system_prompt=memory_system, cwd=cwd,
+            model=override.get("grok_model") or agent.get("grok_model") or "grok-build",
+            effort=effort, resume_session_id=resume_session_id,
+        )
+    elif model == "deepseek":
+        agen = stream_fn(
+            message=prompt, system_prompt=memory_system, cwd=cwd,
+            model=override.get("deepseek_model") or agent.get("deepseek_model") or "deepseek-v4-flash",
+            effort=effort, resume_session_id=resume_session_id,
+            runtime_env=runtime_env,
+        )
+    elif model == "glm":
+        agen = stream_fn(
+            message=prompt, system_prompt=memory_system, cwd=cwd,
+            model=override.get("glm_model") or agent.get("glm_model") or "glm-4.6",
+            effort=effort, resume_session_id=resume_session_id,
+            runtime_env=runtime_env,
+        )
+    elif model == "codex":
+        codex_effort = effort if effort in (
+            None, "default", "low", "medium", "high", "xhigh") else None
+        agen = stream_fn(
+            message=prompt, system_prompt=memory_system, cwd=cwd,
+            model=override.get("codex_model") or agent.get("codex_model") or "gpt-5.6-terra",
+            effort=codex_effort, resume_session_id=resume_session_id,
+            extra_env=runtime_env,
+            capability_policy=capability_policy,
+        )
+    else:
+        agen = stream_fn(message=prompt, system_prompt=memory_system, cwd=cwd)
+
+    await emit({"type": "status", "agent": agent["id"],
+                "status": "reconciling_memory"})
+    db.add_cli_event(session_id, "memory", "reconciliation", "started", "…")
+    assembled: list[str] = []
+    error = ""
+    new_sid = resume_session_id
+    async for evt in agen:
+        etype = evt.get("type")
+        if etype == "delta":
+            assembled.append(evt.get("text") or "")
+        elif etype == "tool_use":
+            tool_name = evt.get("tool") or "?"
+            tool_input = evt.get("input") or {}
+            try:
+                target = agent_log._target(tool_name, tool_input)
+                db.add_cli_event(session_id, "memory_tool", tool_name, target, "…")
+            except Exception:
+                pass
+            await emit({"type": "tool_use", "agent": agent["id"],
+                        "tool": tool_name, "input": tool_input,
+                        "phase": "memory_reconciliation"})
+        elif etype == "skill_use":
+            await _record_skill_usage_event(
+                project_slug=project["slug"],
+                agent_id=agent["id"],
+                session_id=session_id,
+                event=evt,
+                emit=emit,
+            )
+        elif etype == "meta":
+            data = evt.get("data") or {}
+            if data.get("claude_session_id"):
+                new_sid = data["claude_session_id"]
+                db.set_cli_session_id(session_id, new_sid, data.get("cli_adapter") or model)
+        elif etype == "error":
+            error = evt.get("message") or "memory adapter error"
+            break
+
+    text = "".join(assembled)
+    marker = _MEMORY_RECONCILED_RE.search(text)
+    fields = _kv(marker.group("body")) if marker else {}
+    valid_values = {"updated", "unchanged"}
+    errors: list[str] = []
+    if error:
+        errors.append(error)
+    if fields.get("status", "").lower() != "ok":
+        errors.append("receipt status is not ok")
+    delta_kind = fields.get("durable_delta", "").lower()
+    if delta_kind not in {"technical", "coordination", "none"}:
+        errors.append("durable_delta must be technical, coordination, or none")
+
+    after = _memory_snapshot(agent_dir)
+    actual = {
+        key: "updated" if after.get(key) != turn_before.get(key) else "unchanged"
+        for key in ("progress", "manifest", "overview")
+    }
+    for key in ("progress", "manifest", "overview"):
+        declared = fields.get(key, "").lower()
+        if declared not in valid_values:
+            errors.append(f"{key} must be updated or unchanged")
+        elif declared != actual[key]:
+            errors.append(f"{key} receipt says {declared}, hash says {actual[key]}")
+
+    progress_path = agent_dir / "state" / "progress.md"
+    manifest_path = agent_dir / "outputs" / "manifest.md"
+    if actual["progress"] == "updated" and not _memory_ref_exists(
+            progress_path, fields.get("progress_ref")):
+        errors.append("updated progress requires a real progress_ref")
+    if actual["manifest"] == "updated" and not _memory_ref_exists(
+            manifest_path, fields.get("manifest_ref")):
+        errors.append("updated manifest requires a real manifest_ref")
+    if delta_kind in {"technical", "coordination"} and actual["manifest"] == "unchanged":
+        if not _memory_ref_exists(manifest_path, fields.get("manifest_ref")):
+            errors.append("durable delta with unchanged manifest requires an existing manifest_ref")
+    if delta_kind == "none" and any(value == "updated" for value in actual.values()):
+        errors.append("durable_delta none contradicts changed memory hashes")
+    # Long technical/chat synthesis may legitimately be derived from existing
+    # knowledge, but it must name where that durable knowledge already lives.
+    if delta_kind == "none" and len(final_text.strip()) > 800:
+        if not _memory_ref_exists(manifest_path, fields.get("manifest_ref")):
+            errors.append("long unchanged synthesis requires an existing manifest_ref")
+
+    if actual["overview"] == "updated":
+        refs = _receipt_list(fields.get("overview_manifest_refs"))
+        if not refs:
+            errors.append("updated overview requires overview_manifest_refs")
+        else:
+            missing_refs = [ref for ref in refs if not _memory_ref_exists(manifest_path, ref)]
+            if missing_refs:
+                errors.append("overview references missing manifest section(s): "
+                              + ", ".join(missing_refs))
+    if not (fields.get("overview_reason") or "").strip():
+        errors.append("overview_reason is required")
+
+    requested_resolutions = _receipt_list(fields.get("resolved_escalations"))
+    open_ids = {
+        row["escalation_id"]
+        for row in db.get_open_escalations(project["slug"], agent["id"])
+    }
+    invalid_resolutions = [esc_id for esc_id in requested_resolutions if esc_id not in open_ids]
+    if invalid_resolutions:
+        errors.append("resolved_escalations not open/owned: " + ", ".join(invalid_resolutions))
+    if not manifest_path.is_file():
+        errors.append("owner manifest is missing")
+    if len(_overview_body(agent_dir / "overview.md")) < 40:
+        errors.append("overview BODY is missing or incomplete")
+
+    warnings = _memory_semantic_lint(
+        agent_dir, _memory_reconciliation_config(project))
+    ok = not errors
+    status = "ok" if ok else "error"
+    detail = "reconciled" if ok else "; ".join(errors or [
+        "missing/invalid MEMORY_RECONCILED audit block"])
+    db.add_cli_event(session_id, "memory", "reconciliation", detail[:240], status)
+    await emit({"type": "meta", "agent": agent["id"], "data": {
+        "memory_reconciliation": {
+            "status": status,
+            "progress": fields.get("progress"),
+            "manifest": fields.get("manifest"),
+            "overview": fields.get("overview"),
+            "durable_delta": fields.get("durable_delta"),
+            "warnings": warnings,
+            "message": None if ok else detail[:240],
+        }
+    }})
+    return {
+        "ok": ok,
+        "text": text,
+        "session_id": new_sid,
+        "error": detail if not ok else "",
+        "warnings": warnings,
+        "fields": fields,
+        "actual": actual,
+        "resolved_escalations": requested_resolutions if ok else [],
+    }
+
+
+@trace_agent_turn
 async def _run_agent(
     slug: str,
     agent_id: str,
@@ -1596,6 +2777,7 @@ async def _run_agent(
         await emit({"type": "error", "agent": agent_id, "message": f"agent {agent_id} not found"})
         return ""
     project, agent = found
+    user_message = message
 
     sess = db.get_or_create_active_session(slug, agent_id)
     # Record the ORIGINAL user/synth message in the messages table (for UI
@@ -1652,10 +2834,19 @@ async def _run_agent(
     # A full-but-stale body is invisible to body_incomplete, so surface it here.
     body_stale = _check_overview_staleness(project["root"], project, agent_id)
     if body_stale:
-        message = (
-            "[CONTROL-PLANE STALE-BODY] Your overview.md BODY is stale: "
-            + body_stale + ".\n\n" + message
-        )
+        if _memory_reconciliation_config(project):
+            message = (
+                "[CONTROL-PLANE MEMORY NOTICE] Your overview provenance is stale: "
+                + body_stale + ". Complete the user's primary task first; the mandatory "
+                "internal MEMORY_RECONCILIATION phase will reconcile manifest and derive "
+                "overview afterward. Do not replace the primary task with a memory-only response.\n\n"
+                + message
+            )
+        else:
+            message = (
+                "[CONTROL-PLANE STALE-BODY] Your overview.md BODY is stale: "
+                + body_stale + ".\n\n" + message
+            )
     # ----- END OVERVIEW BODY STALENESS -----
 
     # ----- OPEN-DISSENT GATE (spec §15.2 forcing function) -----
@@ -1680,6 +2871,9 @@ async def _run_agent(
     # ----- END VERIFY-DELTA HINT -----
 
     system_prompt = projects.resolve_system_prompt(project["root"], agent.get("system_prompt_file", ""))
+    system_prompt = (system_prompt or "") + _NOTION_AGENT_INSTRUCTIONS + _SLURM_HANDOFF_INSTRUCTIONS
+    if os.environ.get("AGENTUI_EVALUATION_MODE", "").lower() in {"1", "true"}:
+        system_prompt += _OFFLINE_EVALUATION_INSTRUCTIONS
     cwd = projects.resolve_cwd(project["root"], agent.get("cwd", "."))
     children = _get_children(project, agent_id)
 
@@ -1690,11 +2884,21 @@ async def _run_agent(
         system_prompt = (system_prompt or "") + _SCHEDULE_INSTRUCTIONS
 
     _adir = _agent_dir(project["root"], agent, cwd)
+    # Whole-turn baseline: the owner may update memory during the primary task
+    # before the dedicated reconciliation phase starts.  Validate the receipt
+    # against this snapshot, not merely against the start of finalization.
+    turn_memory_before = _memory_snapshot(_adir)
 
     override = db.get_agent_override(slug, agent_id) or {}
+    capability_policy = db.get_agent_capability_policy(slug, agent_id)
     model = override.get("model") or agent.get("model", "claude")
+    requested_skills = (
+        capabilities.explicit_skill_inputs(user_message, capability_policy)
+        if model == "codex" else []
+    )
     stream_fn = get_stream(model)
     effort = override.get("effort") if "effort" in override else agent.get("effort")
+    notion_runtime_env = _agent_runtime_env(project, slug, agent_id)
 
     # Resume guard. Only continue a prior CLI session if its last turn ended
     # cleanly. Sessions left in "running" (orphan from a uvicorn restart, swept
@@ -1717,6 +2921,26 @@ async def _run_agent(
             message = preamble + "\n\n---\n\n" + message
     # ----- END COLD-START PREAMBLE -----
 
+    # ----- CHILD-OVERVIEW PRE-FLIGHT -----
+    # Unlike the cold-start recap, this runs on EVERY parent turn, including a
+    # resumed CLI session. That guarantees routing uses the children's current
+    # slim state rather than an old conversation snapshot or only the derived
+    # children_status rollup.
+    child_overviews, overview_accesses = _children_overview_context(project, agent_id)
+    if child_overviews:
+        message = child_overviews + "\n\n---\n\n" + message
+        for access in overview_accesses:
+            await emit({
+                "type": "resource_access",
+                "agent": agent_id,
+                "owner": access["owner"],
+                "kind": "overview",
+                "operation": "reading",
+                "tool": "control-plane pre-flight",
+                "path": access["path"],
+            })
+    # ----- END CHILD-OVERVIEW PRE-FLIGHT -----
+
     if model == "claude":
         agen = stream_fn(
             message=message,
@@ -1725,6 +2949,7 @@ async def _run_agent(
             model=override.get("claude_model") or agent.get("claude_model") or "claude-sonnet-4-6",
             effort=effort,
             resume_session_id=resume_sid,
+            extra_env=notion_runtime_env,
         )
     elif model == "grok":
         gopts = grok_options or {}
@@ -1749,6 +2974,7 @@ async def _run_agent(
             model=override.get("deepseek_model") or agent.get("deepseek_model") or "deepseek-v4-flash",
             effort=effort,
             resume_session_id=resume_sid,
+            runtime_env=notion_runtime_env,
         )
     elif model == "glm":
         # Same harness as claude/deepseek; adapter injects GLM's Anthropic
@@ -1760,6 +2986,7 @@ async def _run_agent(
             model=override.get("glm_model") or agent.get("glm_model") or "glm-4.6",
             effort=effort,
             resume_session_id=resume_sid,
+            runtime_env=notion_runtime_env,
         )
     elif model == "codex":
         codex_effort = effort if effort in (None, "default", "low", "medium", "high", "xhigh") else None
@@ -1770,6 +2997,9 @@ async def _run_agent(
             model=override.get("codex_model") or agent.get("codex_model") or "gpt-5.6-terra",
             effort=codex_effort,
             resume_session_id=resume_sid,
+            extra_env=notion_runtime_env,
+            capability_policy=capability_policy,
+            requested_skills=requested_skills,
         )
     else:
         agen = stream_fn(message=message, system_prompt=system_prompt, cwd=cwd)
@@ -1782,6 +3012,7 @@ async def _run_agent(
     final_status = "ok"
     last_usage: dict = {}          # real token usage of this turn (for context_log)
     claude_sid: Optional[str] = None   # CLI session id — keys the transcript token scan
+    reconciliation_result: dict = {}
     new_chain = chain + (agent_id,)
 
     try:
@@ -1884,6 +3115,14 @@ async def _run_agent(
                         pass
                 await emit({"type": "tool_use", "agent": agent_id,
                             "tool": tool_name, "input": tool_input})
+            elif etype == "skill_use":
+                await _record_skill_usage_event(
+                    project_slug=slug,
+                    agent_id=agent_id,
+                    session_id=sess["id"],
+                    event=evt,
+                    emit=emit,
+                )
             elif etype == "done":
                 pass  # finalize below
             elif etype == "error":
@@ -1895,6 +3134,56 @@ async def _run_agent(
         raise
     finally:
         final_text = "".join(assembled)
+        # GelSight pilot: after the primary answer, invoke the SAME owner agent in
+        # a narrow internal phase to reconcile progress → manifest → overview.
+        # Other projects are unaffected unless they explicitly opt in via
+        # .agentui/project.yaml. A memory failure never erases a valid task answer;
+        # it remains visible as an auditable stale-provenance warning next turn.
+        if final_status == "ok" and final_text and _memory_reconciliation_config(project):
+            try:
+                reconciliation_result = await _run_memory_reconciliation(
+                    project=project,
+                    agent=agent,
+                    agent_dir=_adir,
+                    final_text=final_text,
+                    turn_before=turn_memory_before,
+                    stream_fn=stream_fn,
+                    model=model,
+                    override=override,
+                    effort=effort,
+                    resume_session_id=claude_sid or resume_sid,
+                    cwd=cwd,
+                    runtime_env=notion_runtime_env,
+                    capability_policy=capability_policy,
+                    emit=emit,
+                    session_id=sess["id"],
+                )
+                if reconciliation_result.get("session_id"):
+                    claude_sid = reconciliation_result["session_id"]
+            except asyncio.CancelledError:
+                final_status = "cancelled"
+                raise
+            except Exception as exc:
+                reconciliation_result = {"ok": False, "error": str(exc)[:240]}
+                db.add_cli_event(sess["id"], "memory", "reconciliation",
+                                 str(exc)[:240], "error")
+                await emit({"type": "meta", "agent": agent_id, "data": {
+                    "memory_reconciliation": {
+                        "status": "error", "message": str(exc)[:240]
+                    }
+                }})
+            if not reconciliation_result.get("ok"):
+                # Publish gate: keep progress/manifest edits for audit and review,
+                # but never expose an unverified overview BODY as current truth.
+                # Restore the exact pre-turn overview (including its old provenance);
+                # structured finalization below marks it needs_review.
+                previous_overview = turn_memory_before.get("overview_text") or ""
+                if previous_overview:
+                    try:
+                        (_adir / "overview.md").write_text(
+                            previous_overview, encoding="utf-8")
+                    except OSError:
+                        pass
         if final_text:
             db.add_message(sess["id"], "assistant", final_text)
         db.update_session_status(sess["id"], final_status)
@@ -1977,17 +3266,64 @@ async def _run_agent(
             # verified + at which producer version, so next pass can skip unchanged.
             for _prod, _ver in _parse_verified(parsed["result"]["verified"]).items():
                 db.set_verify_watermark(slug, agent_id, _prod, _ver)
-        if parsed["result"] or parsed["escalate"]:
-            adir = _agent_dir(project["root"], agent, cwd)
+        adir = _agent_dir(project["root"], agent, cwd)
+        memory_enabled = bool(_memory_reconciliation_config(project))
+
+        # Escalations are durable state, not sticky prose in overview.md.  The
+        # control plane assigns an ID, routes that same record, and later clears
+        # the projection only when an explicit ID is resolved.
+        if parsed["escalate"]:
+            opened = db.open_escalation(
+                slug, agent_id, parsed["escalate"].get("type") or "BLOCKED",
+                parsed["escalate"].get("target") or "",
+                parsed["escalate"].get("reason") or "",
+                parsed["escalate"].get("evidence") or "",
+                sess["id"],
+            )
+            parsed["escalate"]["id"] = opened["escalation_id"]
+            routed = _handle_escalate(parsed["escalate"], slug, project, agent_id)
+            await emit({"type": "meta", "agent": agent_id,
+                        "data": {"escalate": parsed["escalate"], "routed_to": routed}})
+
+        result_resolutions = _receipt_list(
+            (parsed.get("result") or {}).get("resolves"))
+        receipt_resolutions = reconciliation_result.get("resolved_escalations") or []
+        requested_resolutions = list(dict.fromkeys(
+            result_resolutions + receipt_resolutions))
+        if requested_resolutions:
+            resolution_reason = (
+                (parsed.get("result") or {}).get("outcome")
+                or (reconciliation_result.get("fields") or {}).get("overview_reason")
+                or "explicit end-of-turn resolution"
+            )
+            resolved_ids, rejected_ids = db.resolve_escalations(
+                slug, requested_resolutions, agent_id, resolution_reason, sess["id"])
+            await emit({"type": "meta", "agent": agent_id, "data": {
+                "escalations_resolved": resolved_ids,
+                "escalations_rejected": rejected_ids,
+            }})
+
+        # Legacy projects retain their original stamping behaviour.  An opted-in
+        # project publishes a new manifest hash only after a valid receipt; an
+        # invalid receipt keeps the restored old overview and marks it needs_review.
+        if parsed["result"] or parsed["escalate"] or memory_enabled:
+            reconciled = bool(reconciliation_result.get("ok"))
             version = _read_manifest_version(adir / "outputs" / "manifest.md")
-            _stamp_overview(adir, version, parsed["escalate"])
-            if parsed["escalate"]:
-                # Route to the parent's ledger so the orchestrator picks it up next
-                # turn (§6.6). Auto-resolution per type (DATA pull / SUBTASK / TOOL) is
-                # deliberately left to BOSS/human — see _handle_escalate docstring.
-                routed = _handle_escalate(parsed["escalate"], slug, project, agent_id)
-                await emit({"type": "meta", "agent": agent_id,
-                            "data": {"escalate": parsed["escalate"], "routed_to": routed}})
+            manifest_sha = (
+                _sha256_file(adir / "outputs" / "manifest.md") if reconciled else None
+            )
+            _stamp_overview(
+                adir,
+                version if (reconciled or not memory_enabled) else None,
+                parsed["escalate"],
+                project_slug=slug if memory_enabled else None,
+                agent_id=agent_id if memory_enabled else None,
+                memory_status=("verified" if reconciled else "needs_review")
+                if memory_enabled else None,
+                source_manifest_sha256=manifest_sha,
+                derived_at=(datetime.now(timezone.utc).isoformat(timespec="seconds")
+                            if manifest_sha else None),
+            )
         # Agency mechanisms (spec §15.1/§15.2): soft-trigger (model emits) + hard-enforce here.
         if parsed["halt"]:
             routed = _handle_halt(parsed["halt"], slug, project, agent_id)
@@ -2145,11 +3481,27 @@ def _read_manifest_version(out_manifest: Path) -> Optional[str]:
     return None
 
 
-def _stamp_overview(agent_dir: Path, version: Optional[str], escalate: Optional[dict]) -> None:
+def _stamp_overview(
+    agent_dir: Path,
+    version: Optional[str],
+    escalate: Optional[dict],
+    *,
+    project_slug: Optional[str] = None,
+    agent_id: Optional[str] = None,
+    memory_status: Optional[str] = None,
+    source_manifest_sha256: Optional[str] = None,
+    derived_at: Optional[str] = None,
+) -> None:
     """Overwrite the MACHINE fields of overview.md (agent owns the BODY, we own
-    the header echo). manifest_version ← real version; last_updated ← today;
-    body_incomplete ← heuristic (placeholder / near-empty BODY); open_escalation
-    ← escalate summary when present. No-op when the agent has no overview yet."""
+    the header/footer). ``source_manifest_sha256`` is stamped only after the
+    owner model has completed semantic reconciliation; it is therefore a
+    provenance assertion, not merely a hash observed by the backend.
+
+    manifest_version ← real version; last_updated ← today; body_incomplete ←
+    heuristic. Opted-in projects project open escalation rows from the DB and
+    always clear stale footer text when no rows remain. No-op when the agent has
+    no overview yet.
+    """
     ov = agent_dir / "overview.md"
     if not ov.is_file():
         return
@@ -2165,17 +3517,44 @@ def _stamp_overview(agent_dir: Path, version: Optional[str], escalate: Optional[
 
     def _set(key: str, val: str) -> None:
         nonlocal txt
-        txt = re.sub(rf"(?m)^({re.escape(key)}:).*$",
-                     lambda m: f"{m.group(1)} {val}", txt, count=1)
+        pattern = rf"(?m)^({re.escape(key)}:).*$"
+        if re.search(pattern, txt):
+            txt = re.sub(pattern, lambda m: f"{m.group(1)} {val}", txt, count=1)
+            return
+        # New provenance fields live in the machine-owned footer.  Existing
+        # overviews migrate in place without requiring an agent-authored rewrite.
+        footer_close = "<!-- /OVERVIEW:FOOTER -->"
+        if footer_close in txt:
+            txt = txt.replace(footer_close, f"{key}: {val}\n{footer_close}", 1)
 
     if version:
         _set("manifest_version", version)
     _set("body_incomplete", "true" if incomplete else "false")
     _set("last_updated", today)
-    if escalate:
+    if project_slug and agent_id:
+        open_rows = db.get_open_escalations(project_slug, agent_id)
+        escalation_ids = [row["escalation_id"] for row in open_rows]
+        if open_rows:
+            summaries = [
+                f"{row['escalation_id']} {row.get('type') or '?'}→"
+                f"{row.get('target') or '?'}: {row.get('reason') or ''}"
+                for row in open_rows
+            ]
+            _set("open_escalation", " | ".join(summaries)[:480])
+            _set("open_escalation_ids", ",".join(escalation_ids))
+        else:
+            _set("open_escalation", "none")
+            _set("open_escalation_ids", "none")
+    elif escalate:
         summary = (f"{escalate.get('type', '?')}→{escalate.get('target', '?')}: "
                    f"{escalate.get('reason', '')}")[:120]
         _set("open_escalation", summary)
+    if memory_status:
+        _set("memory_status", memory_status)
+    if source_manifest_sha256:
+        _set("source_manifest_sha256", source_manifest_sha256)
+    if derived_at:
+        _set("derived_at", derived_at)
 
     try:
         ov.write_text(txt, encoding="utf-8")
@@ -2191,6 +3570,19 @@ def _read_overview_flag(agent_dir: Path) -> Optional[bool]:
             m = re.match(r"\s*body_incomplete:\s*(true|false)", line, re.IGNORECASE)
             if m:
                 return m.group(1).lower() == "true"
+    except OSError:
+        return None
+    return None
+
+
+def _read_overview_field(agent_dir: Path, key: str) -> Optional[str]:
+    """Read one machine field from overview HEADER/FOOTER."""
+    ov = agent_dir / "overview.md"
+    try:
+        for line in ov.read_text(encoding="utf-8", errors="replace").splitlines():
+            match = re.match(rf"\s*{re.escape(key)}:\s*(.*?)\s*$", line, re.IGNORECASE)
+            if match:
+                return match.group(1).strip() or None
     except OSError:
         return None
     return None
@@ -2254,6 +3646,34 @@ def _check_overview_staleness(project_root: str, project: dict, agent_id: str) -
     # Skip if BODY is already flagged incomplete — that is surfaced separately.
     if _read_overview_flag(adir) is True:
         return None
+
+
+    # New policy: overview is a compact projection of the owner's own manifest.
+    # Compare the attested source hash, not filesystem mtimes.  A matching hash
+    # remains fresh indefinitely; a manifest rewrite becomes stale immediately.
+    # This also removes the migration bug where writing manifest one minute after
+    # overview forced the next task to abandon its real work and rewrite memory.
+    if _memory_reconciliation_config(project):
+        memory_status = _read_overview_field(adir, "memory_status")
+        if memory_status != "verified":
+            return (
+                "overview memory_status is "
+                f"{memory_status or 'missing'}; last reconciliation needs review"
+            )
+        manifest = adir / "outputs" / "manifest.md"
+        current_sha = _sha256_file(manifest)
+        recorded_sha = _read_overview_field(adir, "source_manifest_sha256")
+        if not current_sha:
+            return "owner manifest is missing or unreadable; provenance cannot be verified"
+        if not recorded_sha:
+            return "overview has no source_manifest_sha256 provenance yet"
+        if recorded_sha != current_sha:
+            return (
+                "overview summarizes an older manifest "
+                f"(source {recorded_sha[:12]}…, current {current_sha[:12]}…)"
+            )
+        return None
+
     try:
         ov_mtime = ov.stat().st_mtime
     except OSError:
@@ -2436,6 +3856,7 @@ def _parse_goal(task: str) -> Optional[dict]:
 # ----- END STRUCTURED OUTPUT -----
 
 
+@trace_dispatch
 async def _dispatched_run(slug, source_id, target_id, task, emit, tracker, chain):
     """Run a worker dispatched by source_id. Capture its final text and write
     it to the dispatch_results ledger so source_id can see the output on its
@@ -2445,6 +3866,9 @@ async def _dispatched_run(slug, source_id, target_id, task, emit, tracker, chain
     error_msg = None
     result_text = ""
     manifest_before = _manifest_snapshot(slug, target_id)
+    manifest_after = None
+    manifest_changed = None
+    goal_claimed = None
     try:
         # Auto-compact the WORKER before it runs its dispatched task. Without this,
         # a worker only ever reaches _run_agent via dispatch (never _start_run), so
@@ -2493,18 +3917,20 @@ async def _dispatched_run(slug, source_id, target_id, task, emit, tracker, chain
     # flag (not a block) — answer-only dispatches legitimately don't bump it.
     # The note rides inside the ledger text so the orchestrator model reacts.
     if status == "ok" and manifest_before is not None:
-        after = _manifest_snapshot(slug, target_id)
-        if after and after["mtime"] == manifest_before["mtime"]:
+        manifest_after = _manifest_snapshot(slug, target_id)
+        if manifest_after:
+            manifest_changed = manifest_after["mtime"] != manifest_before["mtime"]
+        if manifest_after and not manifest_changed:
             result_text = (result_text or "") + (
                 f"\n\n[control-plane verify] outputs/manifest.md of {target_id} did NOT change "
-                f"during this dispatch (still version {after.get('version') or '?'}). If the task "
+                f"during this dispatch (still version {manifest_after.get('version') or '?'}). If the task "
                 "created/modified a downstream artifact → the result is NOT yet published per contract; "
                 "require the worker to bump the manifest before consuming."
             )
-        elif after:
+        elif manifest_after:
             result_text = (result_text or "") + (
                 f"\n\n[control-plane verify] outputs/manifest.md was updated "
-                f"(version {manifest_before.get('version') or '?'} → {after.get('version') or '?'})."
+                f"(version {manifest_before.get('version') or '?'} → {manifest_after.get('version') or '?'})."
             )
 
     # Goal-gate (spec §6.8/§14.4): an Outcome dispatch carries a goal contract. The
@@ -2515,10 +3941,10 @@ async def _dispatched_run(slug, source_id, target_id, task, emit, tracker, chain
     if status == "ok":
         goal = _parse_goal(task)
         if goal:
-            claimed = (_parse_structured(result_text or "").get("result") or {}).get("goal_status")
+            goal_claimed = (_parse_structured(result_text or "").get("result") or {}).get("goal_status")
             acc = goal.get("acceptance_by", "control_plane")
             note = (f"\n\n[control-plane goal-gate] acceptance_by={acc}. Worker self-reported "
-                    f"goal_status={claimed or 'none'} — a CLAIM, not acceptance. Do NOT accept on "
+                    f"goal_status={goal_claimed or 'none'} — a CLAIM, not acceptance. Do NOT accept on "
                     "self-report")
             if acc and acc.lower().replace("-", "_") != "control_plane":
                 note += f"; route to {acc} to verify before consuming."
@@ -2543,6 +3969,15 @@ async def _dispatched_run(slug, source_id, target_id, task, emit, tracker, chain
         "status": status,
         "message": error_msg,
     })
+    return {
+        "status": status,
+        "result": result_text,
+        "error": error_msg,
+        "manifest_before": manifest_before,
+        "manifest_after": manifest_after,
+        "manifest_changed": manifest_changed,
+        "goal_claimed": goal_claimed,
+    }
 
 
 # Above this share of the context window, the next user turn triggers an
@@ -2805,7 +4240,9 @@ def _start_run(slug: str, agent_id: str, message: str, *,
     _RUNS[run.id] = run
     emit = run.publish
 
-    async def driver():
+    @trace_orchestration
+    async def driver(*, project_slug: str, root_agent_id: str,
+                     user_message: str, run_origin: str):
         # Multi-round continuation: after each wave of dispatches lands in the
         # ledger, the orchestrator gets another turn to react — synthesise, or
         # chain follow-up dispatches — inside the SAME run, up to
@@ -2815,12 +4252,18 @@ def _start_run(slug: str, agent_id: str, message: str, *,
         all_tasks: list = []
         cur: list = []
         saw_sched = False   # did any turn this run emit a <schedule>/<schedule_stop> tag?
+        rounds = 0
+        root_turn_count = 0
+        final_response = ""
+        caught_error = None
+        cancelled = False
         try:
             await _auto_compact_if_needed(slug, agent_id, emit)
             txt = await _run_agent(slug, agent_id, message, emit, cur,
                                    grok_options=grok_options)
+            root_turn_count += 1
+            final_response = txt or ""
             saw_sched = saw_sched or _has_schedule_tag(txt)
-            rounds = 0
             while cur and rounds < _MAX_CONT_ROUNDS:
                 await asyncio.gather(*cur, return_exceptions=True)
                 all_tasks.extend(cur)
@@ -2847,6 +4290,8 @@ def _start_run(slug: str, agent_id: str, message: str, *,
                 )
                 cur = []
                 txt = await _run_agent(slug, agent_id, synth, emit, cur)
+                root_turn_count += 1
+                final_response = txt or ""
                 saw_sched = saw_sched or _has_schedule_tag(txt)
             if cur:
                 await asyncio.gather(*cur, return_exceptions=True)
@@ -2862,11 +4307,14 @@ def _start_run(slug: str, agent_id: str, message: str, *,
                     and _scheduler_enabled()
                     and _looks_like_tracking_intent(message)):
                 ncur: list = []
-                await _run_agent(slug, agent_id, _SCHEDULE_NUDGE, emit, ncur)
+                txt = await _run_agent(slug, agent_id, _SCHEDULE_NUDGE, emit, ncur)
+                root_turn_count += 1
+                final_response = txt or ""
                 if ncur:
                     await asyncio.gather(*ncur, return_exceptions=True)
                     all_tasks.extend(ncur)
         except asyncio.CancelledError:
+            cancelled = True
             pending = [t for t in all_tasks + cur if not t.done()]
             for t in pending:
                 t.cancel()
@@ -2878,11 +4326,76 @@ def _start_run(slug: str, agent_id: str, message: str, *,
             except Exception:
                 pass
         except Exception as e:
+            caught_error = str(e)
             await emit({"type": "error", "agent": agent_id, "message": str(e)})
         finally:
             run.finish()
 
-    run.task = asyncio.create_task(driver())
+        dispatches = [
+            {
+                "source": event.get("source"),
+                "target": event.get("target"),
+                "task": event.get("task", ""),
+            }
+            for event in run.events
+            if event.get("type") == "dispatch_started"
+        ]
+        rejected_dispatches = [
+            {
+                "source": event.get("source"),
+                "target": event.get("target"),
+                "reason": event.get("reason", ""),
+            }
+            for event in run.events
+            if event.get("type") == "dispatch_rejected"
+        ]
+        dispatch_failures = [
+            {
+                "source": event.get("source"),
+                "target": event.get("target"),
+                "status": event.get("status"),
+                "message": event.get("message"),
+            }
+            for event in run.events
+            if (event.get("type") == "dispatch_complete"
+                and event.get("status") not in (None, "ok"))
+        ]
+        errors = [
+            {
+                "agent": event.get("agent"),
+                "message": event.get("message", ""),
+            }
+            for event in run.events
+            if event.get("type") == "error"
+        ]
+        if cancelled:
+            status = "cancelled"
+        elif caught_error or any(error.get("agent") == agent_id for error in errors):
+            status = "error"
+        elif dispatch_failures or rejected_dispatches:
+            status = "partial"
+        else:
+            status = "ok"
+        return {
+            "status": status,
+            "final_response": final_response,
+            "trajectory": [item["target"] for item in dispatches],
+            "dispatches": dispatches,
+            "dispatch_count": len(dispatches),
+            "rejected_dispatches": rejected_dispatches,
+            "dispatch_failures": dispatch_failures,
+            "continuation_rounds": rounds,
+            "root_turn_count": root_turn_count,
+            "errors": errors,
+            "error": caught_error,
+        }
+
+    run.task = asyncio.create_task(driver(
+        project_slug=slug,
+        root_agent_id=agent_id,
+        user_message=message,
+        run_origin=origin,
+    ))
     return run
 
 
@@ -3611,8 +5124,7 @@ def _sse(payload: dict) -> str:
 _CLUSTER_NAMES = ["ascend", "cardinal", "pitzer"]
 
 
-@app.get("/api/cluster/jobs")
-async def api_cluster_jobs():
+async def _cluster_jobs_snapshot():
     """SLURM queue across all federated clusters via `squeue --clusters=all`.
     Returns {clusters: {name: [job,...]}, error?}. Read-only."""
     user = os.environ.get("USER") or os.environ.get("LOGNAME") or ""
@@ -3661,23 +5173,77 @@ async def api_cluster_jobs():
     return {"clusters": clusters}
 
 
+@app.get("/api/cluster/jobs")
+async def api_cluster_jobs():
+    return await _cluster_jobs_snapshot()
+
+
 @app.get("/api/usage")
-async def api_usage():
-    """Best-effort Claude subscription usage. Reads the existing OAuth bearer from
-    ~/.claude/.credentials.json (subscription auth, NOT an ANTHROPIC_API_KEY) and pulls
-    the anthropic-ratelimit-unified-* headers off a cheap authenticated GET. Returns
-    {available, five_hour:{pct,reset_at}, weekly:{pct,reset_at}} or {available:false}.
-    The token is never logged or returned."""
-    def _fetch():
+async def api_usage(provider: str = "claude"):
+    """Best-effort Claude or Codex subscription usage from the corresponding
+    CLI's saved OAuth session. Credentials stay server-side and are never logged
+    or returned; the response contains only normalized limit windows."""
+    provider = (provider or "claude").strip().lower()
+    if provider not in {"claude", "codex"}:
+        raise HTTPException(400, "provider must be claude or codex")
+
+    def _fetch_codex():
+        """Read the same ChatGPT-backed limit snapshot used by Codex. The saved
+        CLI OAuth token/account id stay server-side and are never returned."""
+        import urllib.request
+        auth = Path.home() / ".codex" / "auth.json"
+        try:
+            tokens_data = (json.loads(auth.read_text()).get("tokens") or {})
+            access = tokens_data.get("access_token")
+            account = tokens_data.get("account_id")
+        except Exception:
+            return {"available": False, "provider": "codex", "reason": "no Codex credentials"}
+        if not access or not account:
+            return {"available": False, "provider": "codex", "reason": "Codex not logged in"}
+        req = urllib.request.Request(
+            "https://chatgpt.com/backend-api/wham/usage",
+            headers={"Authorization": f"Bearer {access}", "ChatGPT-Account-Id": account,
+                     "User-Agent": "AgentUI-usage/1.0"},
+        )
+        try:
+            with urllib.request.urlopen(req, timeout=10) as resp:
+                body = json.loads(resp.read().decode("utf-8", errors="replace"))
+        except Exception as e:
+            return {"available": False, "provider": "codex", "reason": str(e)[:120]}
+
+        def _window(d):
+            if not isinstance(d, dict):
+                return None
+            return {"pct": d.get("used_percent"), "reset_at": d.get("reset_at"),
+                    "duration_seconds": d.get("limit_window_seconds")}
+
+        rl = body.get("rate_limit") or {}
+        periods = []
+        for name, raw in (("primary", rl.get("primary_window")),
+                          ("secondary", rl.get("secondary_window"))):
+            window = _window(raw)
+            if not window:
+                continue
+            seconds = int(window.get("duration_seconds") or 0)
+            label = "weekly" if seconds >= 6 * 86400 else (
+                f"{round(seconds / 3600)} hrs" if seconds else name)
+            window["label"] = label
+            periods.append(window)
+        return {"available": bool(periods), "provider": "codex",
+                "plan": body.get("plan_type"), "periods": periods,
+                "limit_reached": bool(rl.get("limit_reached")),
+                "credits": body.get("credits")}
+
+    def _fetch_claude():
         import urllib.request
         import urllib.error
         cred = Path.home() / ".claude" / ".credentials.json"
         try:
             tok = (json.loads(cred.read_text()).get("claudeAiOauth") or {}).get("accessToken")
         except Exception:
-            return {"available": False, "reason": "no credentials"}
+            return {"available": False, "provider": "claude", "reason": "no credentials"}
         if not tok:
-            return {"available": False, "reason": "no token"}
+            return {"available": False, "provider": "claude", "reason": "no token"}
         req = urllib.request.Request(
             "https://api.anthropic.com/api/oauth/usage",
             headers={
@@ -3692,7 +5258,7 @@ async def api_usage():
             with urllib.request.urlopen(req, timeout=10) as resp:
                 body = json.loads(resp.read().decode("utf-8", errors="replace"))
         except Exception as e:
-            return {"available": False, "reason": str(e)[:120]}
+            return {"available": False, "provider": "claude", "reason": str(e)[:120]}
 
         def _period(block):
             d = body.get(block)
@@ -3712,143 +5278,17 @@ async def api_usage():
 
         five, week = _period("five_hour"), _period("seven_day")
         if five is None and week is None:
-            return {"available": False, "reason": "no usage fields"}
-        return {"available": True, "five_hour": five, "weekly": week}
+            return {"available": False, "provider": "claude", "reason": "no usage fields"}
+        periods = []
+        if five: periods.append({**five, "label": "5 hrs"})
+        if week: periods.append({**week, "label": "weekly"})
+        return {"available": True, "provider": "claude", "periods": periods,
+                "five_hour": five, "weekly": week}
 
-    return await asyncio.to_thread(_fetch)
-
-
-# ---------------------------------------------------------------------------
-# Terminal dock — real PTY shells over WebSocket (xterm.js front-end).
-# Isolated subsystem: its own process registry, never touches agent sessions.
-# Safeguards: per-server cap, kill-on-disconnect, idle reap, kill-all on
-# shutdown. Server binds 127.0.0.1 only (run.sh), so shells are local-only.
-# ---------------------------------------------------------------------------
-
-_MAX_TERMINALS = 6
-_TERM_IDLE_S = 1800  # reap a shell with no I/O for 30 min
-_terminals: dict[str, dict] = {}  # id -> {pid, fd, last_io}
+    return await asyncio.to_thread(_fetch_codex if provider == "codex" else _fetch_claude)
 
 
-def _term_kill(tid: str):
-    t = _terminals.pop(tid, None)
-    if not t:
-        return
-    try:
-        os.kill(t["pid"], signal.SIGHUP)
-    except Exception:
-        pass
-    try:
-        os.kill(t["pid"], signal.SIGKILL)
-    except Exception:
-        pass
-    try:
-        os.close(t["fd"])
-    except Exception:
-        pass
-    try:
-        os.waitpid(t["pid"], os.WNOHANG)
-    except Exception:
-        pass
-
-
-@app.websocket("/api/terminal/ws")
-async def api_terminal_ws(ws: WebSocket):
-    """One PTY-backed `bash` login shell per connection. Frontend protocol (JSON text):
-    {"t":"i","d":"<keystrokes>"} input, {"t":"r","cols":C,"rows":R} resize.
-    Server streams raw shell bytes back as binary frames."""
-    await ws.accept()
-    if len(_terminals) >= _MAX_TERMINALS:
-        await ws.send_text("\r\n[terminal limit reached — close another terminal first]\r\n")
-        await ws.close()
-        return
-
-    tid = uuid.uuid4().hex[:8]
-    pid, fd = pty.fork()
-    if pid == 0:
-        # Child: become the shell. (pty.fork already set up the controlling tty.)
-        os.environ["TERM"] = "xterm-256color"
-        # Give the user a clean login shell — don't leak AgentUI's own venv
-        # (VIRTUAL_ENV + its PATH prefix + its PS1) into their terminal, otherwise
-        # the prompt shows just "(.venv) " with no cwd instead of their normal one.
-        venv = os.environ.pop("VIRTUAL_ENV", None)
-        os.environ.pop("VIRTUAL_ENV_PROMPT", None)
-        os.environ.pop("PS1", None)
-        if venv:
-            kept = [p for p in os.environ.get("PATH", "").split(":")
-                    if p and not p.startswith(venv)]
-            os.environ["PATH"] = ":".join(kept)
-        os.chdir(os.path.expanduser("~"))
-        try:
-            os.execvp("bash", ["bash", "-l", "-i"])
-        except Exception:
-            os.execvp("sh", ["sh", "-i"])
-        os._exit(127)
-
-    _terminals[tid] = {"pid": pid, "fd": fd, "last_io": time.time()}
-    loop = asyncio.get_event_loop()
-
-    async def pump_out():
-        while True:
-            try:
-                data = await loop.run_in_executor(None, os.read, fd, 65536)
-            except OSError:
-                break
-            if not data:
-                break
-            _terminals.get(tid, {}).update(last_io=time.time())
-            try:
-                await ws.send_bytes(data)
-            except Exception:
-                break
-        try:
-            await ws.close()
-        except Exception:
-            pass
-
-    out_task = asyncio.create_task(pump_out())
-    try:
-        while True:
-            raw = await ws.receive_text()
-            try:
-                msg = json.loads(raw)
-            except Exception:
-                continue
-            t = msg.get("t")
-            if t == "i":
-                try:
-                    os.write(fd, (msg.get("d") or "").encode("utf-8"))
-                    _terminals.get(tid, {}).update(last_io=time.time())
-                except OSError:
-                    break
-            elif t == "r":
-                try:
-                    cols = int(msg.get("cols") or 80)
-                    rows = int(msg.get("rows") or 24)
-                    fcntl.ioctl(fd, termios.TIOCSWINSZ, struct.pack("HHHH", rows, cols, 0, 0))
-                except Exception:
-                    pass
-    except WebSocketDisconnect:
-        pass
-    except Exception:
-        pass
-    finally:
-        out_task.cancel()
-        _term_kill(tid)
-
-
-async def _terminal_reaper():
-    while True:
-        await asyncio.sleep(120)
-        now = time.time()
-        for tid, t in list(_terminals.items()):
-            if now - t.get("last_io", now) > _TERM_IDLE_S:
-                _term_kill(tid)
-
-
-@app.on_event("startup")
-async def _start_terminal_reaper():
-    asyncio.create_task(_terminal_reaper())
+terminal_service.register_terminal_routes(app)
 
 
 @app.on_event("startup")
@@ -3866,9 +5306,7 @@ async def _start_scheduler():
 
 
 @app.on_event("shutdown")
-async def _kill_all_terminals():
-    for tid in list(_terminals.keys()):
-        _term_kill(tid)
+async def _stop_control_channels():
     if tg.is_enabled():
         await tg.stop_telegram()
 

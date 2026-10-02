@@ -1,57 +1,75 @@
-# agent_code_IDLE
+# agent_code_IDLE — AgentUI
 
-Localhost UI control plane for multi-agent workflows. Wraps authenticated CLIs (`claude`, `aas`, `codex`) — no API key needed.
+Localhost control plane for multi-agent workflows. Each project declares agents
+and their parent/child graph in `.agentui/project.yaml`; AgentUI runs their turns,
+streams activity, and persists chat and dispatch results in SQLite.
 
-Each project declares a graph of agents in `.agentui/project.yaml`. Orchestrator agents can auto-dispatch tasks to workers via XML tags parsed live from the stream; the user verifies dispatch happens by watching the graph light up. Floating windows let you chat with multiple agents simultaneously, VSCode-style.
+Documentation checked against the working tree on **2026-09-07**. This describes
+available code, not a claim that every integration is configured or running.
+See [documentation audit](docs/documentation-audit.md) for evidence and limitations.
 
-## Quick start (local)
+## Run
+
+From this repository:
 
 ```bash
 cd app
 ./run.sh
-# → http://127.0.0.1:5174
+# http://127.0.0.1:5174
 ```
 
-Requires `claude` CLI authenticated (subscription), optionally `aas` for Grok nodes, or `codex login` for Codex nodes. Verify Codex automation with `codex exec --json "reply with ok"`.
+Requires Python 3.10+ and the selected provider runtime/authentication. The launcher
+uses Python 3.12 with `uv` when creating a new environment if `uv` is available;
+otherwise it uses `python3`. It installs [backend requirements](app/backend/requirements.txt).
+`tmux` is required for the persistent terminal feature. Remote access uses an SSH
+tunnel; see [DEPLOY.md](DEPLOY.md).
 
-## Deploy on a remote server
+| Adapter (`model`) | Transport | Credentials | Default model in this checkout |
+|---|---|---|---|
+| `claude` | `claude -p`, PTY streaming | Authenticated Claude CLI | `claude-sonnet-4-6` |
+| `codex` | `openai-codex` Python SDK | Saved Codex login | `gpt-5.6-terra` |
+| `grok` | `aas` CLI | Configured `aas` runtime | `grok-build` |
+| `deepseek` | Claude harness with per-process endpoint override | `DEEPSEEK_API_KEY` | `deepseek-v4-flash` |
+| `glm` | Claude harness with per-process endpoint override | `~/.config/glm/env` or `GLM_API_KEY` | `glm-4.6` |
 
-See [DEPLOY.md](DEPLOY.md) — SSH tunnel + systemd service.
+Model names above are application defaults, not a provider availability list.
+Claude/Codex reuse local login; DeepSeek/GLM require provider keys. Optional Notion
+and Telegram integrations also require credentials.
 
 ## Features
 
-- **Graph of agents** with live status (idle / running pulse / ok / error)
-- **Floating windows**, draggable, resizable, hidable. Open multiple agents at once.
-- **Auto-dispatch + result feedback**: orchestrator emits `<dispatch agent="X">task</dispatch>`, backend parses live, fires worker, animates edge + worker node. After workers finish, a **dispatch ledger** + bounded auto-continuation feeds the worker outputs back into the orchestrator's next prompt as `<dispatch_result>` blocks, so the orchestrator can synthesise / chain / report inside the same SSE response (no more "still waiting" hallucinations). Design rationale in [docs/agentui-dispatch-spec.md](docs/agentui-dispatch-spec.md).
-- **Add agent through UI**: `+ agent` button opens a form. Default flow asks the first parent (e.g. BOSS) to **write the bootstrap files** based on its project context (streamed live, then previewed). Fallback to generic template if no parent or for speed. Backend atomically creates `<ID>/AGENT.md`, `inputs/manifest.md`, `outputs/manifest.md`, `state/progress.md`, `context/code_map.md` and appends to `project.yaml` (ruamel.yaml preserves comments).
-- **Mix Claude, Grok, DeepSeek, GLM, and Codex agents** in one graph. Codex final messages arrive atomically while status and tool activity still stream.
-- **Slash commands** in chat input (`/help`, `/clear`, `/model`, `/effort`, `/focus`, `/dispatch`, `/stop`, `/status`)
-- **Workspace-wide folder tree** in the sidebar (project roots get a diamond marker); ⌥⌘C copy-path shortcut; click any file to open in a floating viewer (markdown render, code mono, PDF + images via browser, binary fallback with download)
-- **Markdown rendering** of agent output (marked + DOMPurify); dispatch tags become collapsed cards
-- **Streaming via PTY** so Claude CLI doesn't block-buffer; tokens arrive in real time
-- **Stop button** + Esc to cancel mid-stream, cascade-cancels all in-flight dispatched workers
-- **Per-agent overrides** (model + effort) persisted in SQLite, applied next turn
-- **Resilience**: `--resume` only on `last_status == "ok"`; SSE heartbeat keeps Opus thinking sessions alive; startup reaper recovers orphan `running` sessions after restart
+- SVG agent graph with persisted node positions, pan/zoom, floating chats and file viewers.
+- Real `<dispatch agent="WORKER">task</dispatch>` execution, a durable result ledger,
+  and up to three root continuations to synthesize or chain worker results.
+- Detached runs: closing the browser stops watching; the backend keeps working.
+  Explicit Stop cancels the run and its tracked workers. Backend restart interrupts agent runs.
+- Project and agent creation with file preview, generic templates or parent-generated bootstrap.
+- Five provider adapters, per-agent model/effort overrides, session resume and compaction.
+- Scheduler: interval, one-shot and goal loops, with a persistent global on/off toggle.
+  SLURM submission returns the job ID and releases the turn; monitoring uses scheduled snapshots.
+- Durable agent memory: slim overviews, manifest version checks, progress excerpts, optional
+  owner reconciliation with receipt/hash validation, and optional progress archival.
+- Persistent tmux terminals, nested splits, restored browser layouts, reopen and explicit Kill.
+- Dashboard and workspace Capabilities drawer: local inventory of plugins, skills and MCP tools;
+  isolated Codex policy toggles, prospective skill-use counts, and explicit global deletion.
+- Project Papers/Models monitor, scoped Notion reporting, optional Telegram control,
+  token/context telemetry, and offline evaluation harnesses.
 
-**User customizations recorded in CLAUDE.md** (so future agents know how to intervene):
-- The entire Plan/todo-panel system (multi-step `<plan>` protocol + side panels on the graph) has been **completely removed**.
-- A global **Scheduler on/off toggle** (Apple-style switch) was added in the 🕒 Schedules dropdown. When off, no new schedules fire or can be created. See CLAUDE.md "Active user custom modifications" for details and how to re-enable / extend.
+The graph reports control-plane events. It does not certify artifact correctness.
+Drift, dissent and goal acceptance include prompt-level guidance; see the
+[implementation handbook](BUILD_HANDBOOK.md) for the actual enforcement boundaries.
+The former graph Plan/todo feature is removed.
 
-## Add a project
+## Documentation
 
-1. Create `.agentui/project.yaml` in the project root.
-2. Append the absolute path to `app/registry.yaml`.
-3. Reload uvicorn; project appears in the sidebar.
-
-## Add an agent (no shell, no manual yaml)
-
-In the project graph window, click `+ agent`. Fill in id / role / adapter / parents. Default mode asks the first parent to generate the bootstrap files (folder + AGENT.md + manifests + state + code map) based on its knowledge of the project; the modal streams the parent's output live. Review the file preview, then click `✓ Tạo agent` — the backend writes everything atomically and rolls back on any failure.
-
-See [CLAUDE.md](CLAUDE.md) for the full architecture, dispatch protocol, SSE event reference, slash command list, and known limitations.
-
-## Stack
-
-- Backend: FastAPI + SQLite, PTY-wrapped `claude -p` plus pipe-based `codex exec --json`
-- Frontend: vanilla JS + SVG graph, marked.js for markdown, DOMPurify for sanitization
-- Dispatch: `<dispatch agent="WORKER_ID">task</dispatch>` parsed live in the SSE stream
-- Models: Claude opus 4.8 / 4.7, sonnet 4.6, haiku 4.5; Grok via `aas`
+- [Application usage and configuration](app/README.md)
+- [Maintainer guide and runtime invariants](CLAUDE.md)
+- [Deployment and backup](DEPLOY.md)
+- [Implementation handbook](BUILD_HANDBOOK.md) and [current checklist](BUILD_HANDBOOK_checklist.md)
+- [Architecture rationale](system_architech.md)
+- [Proposed Memory, Knowledge and Tools architecture](docs/agent-layers-design.md)
+- [Dispatch lifecycle](docs/agentui-dispatch-spec.md) and [scheduler](docs/scheduler-spec.md)
+- [Agent folder reference](TEMPLATE_AGENT/README.md)
+- [Capability inventory](app/capability_inventory/README.md)
+- [Notion reporting](notion_report/README.md), [evaluation](app/backend/evaluation_data/README.md)
+- [PDF extractor](pdf_extractor/README.md) and [presentation assets](pitch-deck/README.md)

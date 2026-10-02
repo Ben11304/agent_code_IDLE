@@ -1,612 +1,600 @@
-# BUILD HANDBOOK — Slim-Overview Orchestration
+# BUILD HANDBOOK — Implementation hiện tại
 
-> Tầng **hiện thực** của `system_architech.md` (design spec). Đọc spec trước để hiểu *what/why*;
-> file này là *how-exact*: schema máy-kiểm, text paste-ready, code control-plane theo line thật,
-> và **1 worked trace** chạy end-to-end.
-> Control-plane thật: `Hoang/agent_code_IDLE/app/backend/` (FastAPI + asyncio + SQLite, adapter `claude -p`).
+Đối chiếu working tree ngày **2026-09-07**. File này mô tả code hiện có trong
+`app/backend/`; [system_architech.md](system_architech.md) giữ rationale và thiết kế
+mục tiêu. Các đoạn pseudocode cũ theo bản “2508 dòng” đã được thay bằng tên hàm,
+hành vi thực tế và giới hạn. Xem [checklist](BUILD_HANDBOOK_checklist.md) và
+[audit](docs/documentation-audit.md) để biết phạm vi xác minh.
 
----
+## 0. Bản đồ implementation
 
-## 0. ⚠️ Trạng thái THẬT của control-plane (đọc trước khi build)
-
-**Code đích: `VietHuy/agent_code_IDLE` (bản 2508 dòng).** ⚠️ ĐỪNG nhầm với `Hoang/agent_code_IDLE`
-(bản 783 dòng, rút gọn/đã diverge — line number KHÁC hẳn). Mọi line dưới đây theo bản 2508.
-
-**Tin tốt: backbone đã CÓ SẴN.** Bản này không phải "viết mới từ đầu" — phần lớn guarantee cơ học
-trong spec §5.4 đã tồn tại, ta chỉ **augment** vài chỗ.
-
-| Tính năng | Code thật (2508 dòng) | Việc của handbook |
+| Cơ chế | Nguồn | Hiện trạng |
 |---|---|---|
-| Cold-start preamble | ✅ **CÓ** `_session_preamble` (main.py:1195-1243), inject ở 1389-1398; đọc `state/progress.md` + `state/children_status.json` + `inputs/manifest.md` | **AUGMENT**: thêm đọc `overview.md` |
-| Ledger `<dispatch_result>` | ✅ **CÓ** `_format_results_as_context` (172-208) + table `dispatch_results` (db.py:55-67) + enrich (1338-1349) + consume (1524-1525) | **REUSE** nguyên |
-| `children_status.json` sinh | ✅ **CÓ** `_write_children_rollups` (432-499), auto-derived (read-only, "do NOT hand-edit") | **AUGMENT**: thêm field `manifest_version`/`overview_path`/`body_incomplete` |
-| Manifest-bump verify | ✅ **CÓ một phần** (1615-1631): sau dispatch, check `outputs/manifest.md` có bump không → append cờ `[control-plane verify]` | **EXTEND** thành version-pin drift đầy đủ |
-| Post-turn finalize | ✅ **CÓ** (1517-1530) + stream-loop parse `<dispatch>`/`<schedule>` (1433-1495) | **AUGMENT**: thêm parse `[RESULT]`/`[ESCALATE]` |
-| Auto-compact 80%, continuation 3-round, scheduler, detached runs | ✅ CÓ | không đụng |
-| **overview.md slim** | ❌ **CHƯA có** | **BUILD MỚI** |
-| **`[RESULT]`/`[ESCALATE]` parse** | ❌ **CHƯA có** | **BUILD MỚI** |
-| **Version-pin enforcement** | ❌ sync.sh có template (projects.py) nhưng **CHƯA BAO GIỜ được gọi từ code** | **BUILD MỚI** |
+| Detached run / continuation | `main._start_run`, `_Run`, `_dispatched_run` | Có; tối đa 3 root continuations |
+| Ledger feedback | `_format_results_as_context`, `db.dispatch_results` | Có; prompt enrichment và consume sau `ok` |
+| Slim preamble | `_session_preamble` | Có; own overview + recent progress + input head |
+| Parent pre-flight | `_children_overview_context` | Có; every-turn đọc overview mọi direct child |
+| Rollup | `_write_children_rollups` | Có; ID-keyed `children`, sinh qua stats/rollup |
+| Structured blocks | `_parse_structured`, `_run_agent` | Có; optional, một corrective retry |
+| Version pins | `_check_version_pins` | Best-effort Python parser + prompt warning; không gọi sync.sh/hard-return |
+| Overview stamp | `_stamp_overview` | Version/date/placeholder heuristic; không validate đầy đủ role schema |
+| Escalations | `db.open_escalation`, `_handle_escalate` | DB lifecycle + ledger parent đầu tiên; không auto-resolve DATA/TOOL/SUBTASK |
+| HALT / DISSENT | `_handle_halt`, `_handle_dissent`, `_handle_dissent_resolve` | Có DB và feedback; dissent là prompt guidance |
+| Verification watermark | `_verify_delta`, `_verify_delta_hint` | So version và inject skip hint; không chặn tool re-audit |
+| Goal acceptance | `_parse_goal`, `_dispatched_run` | Ghi nhận claim, nhắc external acceptance; không tự đo metric/budget |
+| Memory reconciliation | `_run_memory_reconciliation` | Opt-in; receipt/hash/pointer validation và provenance publish gate |
+| Progress rotation | `progress_store`, `_progress_rotate_tick` | Opt-in global; giữ hai ngày hoạt động gần nhất |
 
-> **Đính chính 2 lần trước của tôi:** (1) report gốc nói các tính năng "đã có" — **đúng cho bản 2508**,
-> không phải bịa. (2) Tôi từng nói chúng "không có" — đó là vì tôi map **nhầm bản Hoang 783 dòng**.
-> Spec §8 ("tái dùng children_status.json + cold-start") **chính xác** với bản 2508; chỉ cần augment field.
+Có code không đồng nghĩa đã deploy/đã qua live acceptance. Ranh giới hard check,
+prompt guidance và target design cần được giữ rõ khi mở rộng hệ thống.
 
-**Kiến trúc nền:** FastAPI `/api/projects/{slug}/agents/{id}/chat` (1908-1930) → `_start_run`
-(1818-1905) → `_run_agent` (1308-1530) → `claude_stream` (adapters.py:30-173) chạy `claude -p
---output-format stream-json --include-partial-messages --permission-mode bypassPermissions
---model <m> [--effort <e>] [--resume <sid>] --append-system-prompt <sys> <message>`, `cwd`=thư mục agent.
-Ta chỉ **cộng/augment lớp data-flow**, không sửa kiến trúc PTY/streaming.
+## 1. Layout và nguồn sự thật
 
----
-
-## 1. File layout mỗi agent (sau khi build)
-
-```
+```text
 <AGENT>/
-├── AGENT.md            # + khối Phase 0-4 paste-ready (§5)
-├── overview.md         # NEW: slim snapshot (header máy + body agent)   ← parent đọc
-├── inputs/
-│   ├── manifest.md     # roll-up version (đã có)
-│   └── <PRODUCER>.md   # manifest producer (đã có)
-├── outputs/
-│   └── manifest.md     # contract của agent (đã có) ← LUẬT
+├── AGENT.md
+├── overview.md
+├── inputs/manifest.md
+├── inputs/<PRODUCER>.md       # copy khi sync cụ thể
+├── outputs/manifest.md
+├── context/code_map.md
 └── state/
-    └── progress.md     # append-only history (đã có)
-
-BOSS/
-├── overview.md                  # NEW: rollup cấp dự án (§3.7 spec)
-├── state/children_status.json   # AUGMENT: control-plane đã auto-sinh; thêm 3 field (§3)
-└── context/team_role.md         # = team_map.md mở rộng (đã có ở AEC/VLM)
+    ├── progress.md           # dated Markdown, hoặc JSON sau explicit migration
+    ├── children_status.json  # derived cho parent có children
+    └── archive/<AGENT>_progress.json
 ```
 
-`overview.md` đặt ở **root thư mục agent** (ngang `AGENT.md`) để `_build_cold_start_preamble` đọc 1 path cố định.
+`projects._AGENT_TEMPLATE_FILES` render sáu file từ `app/backend/templates/agent/`.
+`TEMPLATE_AGENT/` là bản tham khảo để copy tay, không được loader đọc trực tiếp.
+`_agent_dir` resolve qua cwd/system prompt/agent ID; không mặc định mọi project có
+layout `<root>/<ID>` nếu cấu hình tùy chỉnh.
 
----
+Manifest là contract/version và evidence pointers. Với memory reconciliation,
+manifest còn chứa current technical truth theo chủ đề; overview là projection từ
+manifest, progress là lịch sử delta. Chi tiết receipt ở §12.
 
-## 2. Schema A — `overview.md`
-
-### 2.1 Format chuẩn (3 phần, marker cố định để parser cắt)
+## 2. Overview: format và kiểm tra thật
 
 ```markdown
 <!-- OVERVIEW:HEADER -->
-# OVERVIEW • <AGENT> • <ISO8601>
-status: <green|yellow|blocked>
-manifest_version: <semver>        # echo từ outputs/manifest.md — MÁY ghi
-ready_for_parent: <yes|no|partial>
-body_incomplete: <true|false>     # MÁY set; true = body chưa do agent viết
+# OVERVIEW • WORKER • 2026-09-07
+status: yellow
+manifest_version: 0.1.0
+ready_for_parent: no
+body_incomplete: true
 <!-- /OVERVIEW:HEADER -->
-
 <!-- OVERVIEW:BODY -->
-## Bức tranh tổng thể
-- <dimension-label>: <value>      # agent viết, bullet, ≤200 từ, dimension theo role (§2.3)
-...
+- (chờ first task) — owner tổng hợp trạng thái thật tại đây.
 <!-- /OVERVIEW:BODY -->
-
 <!-- OVERVIEW:FOOTER -->
-last_artifact: <abs-path>
-manifest_ref: <path>#<section>
-open_escalation: <none | id + 1 dòng>
-last_updated: <ISO8601>           # MÁY ghi
+last_artifact: none
+manifest_ref: ./outputs/manifest.md
+open_escalation: none
+last_updated: 2026-09-07
 <!-- /OVERVIEW:FOOTER -->
 ```
 
-### 2.2 Quyền ghi từng field (machine vs agent)
+Owner viết BODY và trạng thái do mình đánh giá. `_stamp_overview` đóng dấu version
+thực, ngày và `body_incomplete`: BODY chứa `(chờ` hoặc ngắn hơn 40 ký tự → incomplete.
+Nó không kiểm tra enum status/readiness, đủ nhãn theo role, path `last_artifact`,
+hoặc hard-limit 200 từ. Nhãn role và độ dài gọn là hướng dẫn tác giả.
 
-| Field | Ai ghi | Validate |
-|---|---|---|
-| `status` | agent đề xuất, máy **chấp nhận nếu** ∈{green,yellow,blocked} | enum |
-| `manifest_version` | **MÁY** (đọc `outputs/manifest.md`) — agent KHÔNG sửa | = version thật |
-| `ready_for_parent` | agent | enum {yes,no,partial} |
-| `body_incomplete` | **MÁY** (true khi body còn placeholder) | bool |
-| BODY | **agent** (synthesis) | ≤200 từ + có đủ dimension role |
-| `last_artifact`, `manifest_ref` | agent | path tồn tại |
-| `last_updated` | **MÁY** | ISO8601 |
+Project opt-in reconciliation thêm `memory_status`, `source_manifest_sha256`,
+`derived_at`, escalation IDs; semantic lint có word-budget warning. Hash/receipt
+xác minh provenance cơ học, không tự chứng minh mọi claim khoa học.
 
-### 2.3 Dimension BẮT BUỘC theo role (thiếu → máy set `body_incomplete=true`)
+Prompt projection có thể cắt BODY: own 4.000 ký tự, child 6.000; HEADER/FOOTER vẫn
+đầy đủ khi marker hợp lệ. File trên đĩa không bị cắt bởi việc đọc projection.
 
-| Role | Label bắt buộc |
-|---|---|
-| DATA/DATASET | `version` · `schema` · `size` · `quality` · `method` |
-| MODEL/VLM | `adapter@ver` · `benchmark` · `pending` |
-| SYNTH/CRAFTER | `draft@ver` · `coverage` · `merged_from` · `needs` |
-| VERIFIER/AUDIT | `drift` · `violations` · `pass_rate` · `recommendation` |
-| BOSS (cấp dự án) | **ANCHOR** (ổn định): `scope` · `lifecycle` · `funnel/headline` · `frozen` · **ROLLUP** (động): `bottleneck` · `next_milestone` · `risk` · `pending` — hướng C, spec §3.7 |
+## 3. `children_status.json` hiện tại
 
-> ⚠️ BOSS overview budget ~350–400 từ (cao hơn con vì đọc 1×/pass + human, không bị nhân N). **KHÔNG mirror
-> per-child status** (children_status lo) → chống stale. ANCHOR re-write hiếm, ROLLUP refresh mỗi pass. 📋 chốt mitigate sau.
-
-### 2.4 Validation rule (control-plane chạy)
-- Header có đủ 5 field, enum hợp lệ → nếu không: **retry 1 lần**, vẫn fail → flag + fallback manifest.
-- BODY ≤ 200 từ (đếm word giữa marker BODY) → vượt: cảnh báo (không block).
-- BODY chứa đủ label role → thiếu: set `body_incomplete=true`.
-- `manifest_version` phải == version trong `outputs/manifest.md` → lệch: máy ghi đè bằng version thật.
-
----
-
-## 3. Schema B — `children_status.json`
-
-Control-plane **đã auto-sinh** file này tại `<BOSS>/state/children_status.json` (hàm `_write_children_rollups`,
-gọi trên `/stats`). Ta chỉ **augment** thêm 3 field cuối (`manifest_version`, `overview_path`, `body_incomplete`).
-Schema sau khi augment:
+`_write_children_rollups` nhận stats và sinh cấu trúc **object keyed by ID**:
 
 ```json
 {
-  "$schema": "children_status/v1",
+  "generated_at": "2026-09-07T12:00:00Z",
+  "generated_by": "agentui control-plane (DERIVED, read-only — do NOT hand-edit)",
   "parent": "BOSS",
-  "generated_at": 1719500000.0,
-  "children": [
-    {
-      "id": "CRAFTER",
-      "status_color": "yellow",          // idle|running|ok|error|blocked
-      "manifest_version": "0.7.14",       // đọc từ <child>/outputs/manifest.md
-      "overview_path": "../CRAFTER/overview.md",
-      "body_incomplete": false,
-      "context_pct": 45.2,                // ước lượng từ message tokens / window
-      "message_count": 12,
-      "last_activity": 1719499000.0,
-      "memory_headline": "manuscript v0.4, chờ raw_records 42",
-      "open_escalation": null             // hoặc {"id":"E-12","type":"DATA","target":"CURATOR"}
+  "digest": "example-digest",
+  "children": {
+    "WORKER": {
+      "status": "idle",
+      "context_pct": null,
+      "context_tokens": null,
+      "message_count": 0,
+      "last_activity": null,
+      "last_activity_iso": null,
+      "memory_mtime": null,
+      "memory_updated_iso": null,
+      "memory_headline": null,
+      "memory_hash": null,
+      "stale_memory": false,
+      "manifest_version": "0.1.0",
+      "overview_path": "../WORKER/overview.md",
+      "body_incomplete": true
     }
-  ]
+  }
 }
 ```
 
-**Field type (cho validator):**
-`id`:str, `status_color`:enum, `manifest_version`:str|null, `overview_path`:str,
-`body_incomplete`:bool, `context_pct`:float, `message_count`:int, `last_activity`:float|null,
-`memory_headline`:str, `open_escalation`:null|object.
+Đây là ví dụ minh họa shape, không phải snapshot production. Không có `$schema`,
+`status_color` hoặc `open_escalation` trong từng child row hiện tại. Các status được
+map qua `_JOB_STATUS`. `overview_path` đang được tạo theo `../<ID>/overview.md`;
+đường dẫn này có thể không phản ánh cwd tùy chỉnh. Parent pre-flight thực tế dùng
+`_agent_dir` để đọc file. Digest tránh rewrite khi chỉ thời gian thay đổi.
 
-> BOSS đọc file này để **routing** (ai green/blocked, ai có escalation mở). Chi tiết → mở `overview_path`.
-> Chỉ mở `outputs/manifest.md` của child khi **thật sự consume artifact**.
+## 4. Grammar được parser hỗ trợ
 
----
-
-## 4. Grammar — `[RESULT]` & `[ESCALATE]`
-
-Agent **emit ở cuối turn**. Control-plane parse bằng regex (§6.3). Định dạng cố định, có tag đóng:
-
-### 4.1 `[RESULT]` (mọi child, cuối turn)
-```
+```text
 [RESULT]
-summary: <1-2 câu, delta của turn này>
-artifacts: <path1>, <path2>
-new_pointers: <none | label → path>
-status: <green|yellow|blocked>
-ready_for: <agent_name | back_to_boss>
+summary: Delta của lượt này
+artifacts: outputs/result.json
+status: green
+ready_for: back_to_boss
+goal_status: partial
+goal_evidence: Evidence pointer
+proposal: Nhờ verifier kiểm tra
+verified: PRODUCER@0.1.0
+resolves: esc-0123456789ab
 [/RESULT]
 ```
 
-### 4.2 `[ESCALATE]` (khi cần — thay cho việc tự đi tiếp)
-```
-[ESCALATE]
-type: <DATA|BOSS_DECISION|HUMAN|SUBTASK|TOOL|BLOCKED>
-target: <agent | human | tool_name>
-payload: <text hoặc {json}>
-reason: <1 dòng>
-priority: <high|medium|low>
-[/ESCALATE]
-```
+Các field là quy ước theo task, không phải tất cả đều bắt buộc trong parser.
+Parser lấy block đầu tiên mỗi loại và đọc key/value trên một dòng; không phải
+trình parse YAML lồng nhau. Không emit block nào vẫn hợp lệ.
 
-**Regex (Python, dùng nguyên):**
-```python
-RESULT_RE   = re.compile(r'\[RESULT\](?P<body>.*?)\[/RESULT\]', re.DOTALL | re.IGNORECASE)
-ESCALATE_RE = re.compile(r'\[ESCALATE\](?P<body>.*?)\[/ESCALATE\]', re.DOTALL | re.IGNORECASE)
-KV_RE       = re.compile(r'^\s*(?P<k>\w+)\s*:\s*(?P<v>.+?)\s*$', re.MULTILINE)
-ESC_TYPES   = {"DATA","BOSS_DECISION","HUMAN","SUBTASK","TOOL","BLOCKED"}
-```
-Malformed = có `[RESULT]` nhưng thiếu `[/RESULT]`, hoặc `type` ∉ `ESC_TYPES` → retry 1 lần.
-
-### 4.3 Phân biệt SUBTASK vs TOOL (quy tắc 1 dòng)
-> Target **có manifest/overview** (là agent trong hệ)? → **SUBTASK** (đi qua boundary).
-> Không (web/script/API external)? → **TOOL** (control-plane chạy, append output thô).
-
-**Ví dụ:**
-- `type: SUBTASK, target: VERIFIER` → nhờ VERIFIER audit một artifact (agent có manifest).
-- `type: TOOL, target: web_search` → tra cứu ngoài (không phải agent, không manifest).
-
-### 4.4 Dispatch payload — Outcome / Pointer + `goal` block (spec §14)
-
-BOSS dispatch qua `<dispatch agent="X">…</dispatch>` (cơ chế đã có). **Nội dung** payload phải là
-**Outcome** hoặc **Pointer**, KHÔNG tự-soạn detail (spec §14.1-14.2):
-
-```
-<dispatch agent="CRAFTER">
-mode: outcome | pointer
-goal:                         # bắt buộc nếu mode=outcome
-  type: threshold | directional | judgment
-  predicate: "coverage ≥ 75% AND drift-audit pass"   # threshold
-  baseline_value: 0.71        # BẮT BUỘC nếu type=directional (chụp lúc dispatch)
-  metric_pinned: "val_acc on Kaggle-v6 holdout"      # BẮT BUỘC nếu directional
-  acceptance_by: control_plane | VERIFIER            # KHÔNG bao giờ = child
-budget: { turns: 4, tokens: 60000 }                  # bắt buộc; càng mềm càng quan trọng
-pointer:                      # thay cho goal nếu mode=pointer
-  artifact: "<path>/bench_3arch.py@0.5.2"
-scope_ref: "AGENT.md#scope"   # goal KHÔNG override boundary
-</dispatch>
-```
-
-`[RESULT]` (§4.1) thêm field khi đáp một goal:
-```
-goal_status: met | partial | missed       # child báo; acceptance_by sẽ VERIFY lại
-goal_evidence: "val_acc 0.71→0.78 (+0.07)"
-proposal: "route tiếp VERIFIER" | "escalate v0.5"   # Propose&Commit (spec §15)
-```
-
-`[CONTINUE_SELF]` (self-advance, spec §15 — capped):
-```
-[CONTINUE_SELF]
-reason: "chưa đạt goal, còn budget, đang tiến (0.74→0.76)"
-[/CONTINUE_SELF]
-```
-→ control-plane resume child KHÔNG qua BOSS, **nhưng** chỉ khi: còn budget + đang tiến (không plateau)
-+ chưa chạm hard cap N. Chạm cap/plateau → STOP + escalate (spec §14.4).
-
-### 4.5 `[HALT]` — Evaluative Self-Halt (spec §15.1 — Mức 2) ⚠️ SPEC ONLY, CHƯA IMPLEMENT
-
-Worker **tự dừng task giữa chừng** khi phán tiếp tục là vô ích (saturated/dead-end/false-premise),
-**report KHÔNG chờ ratify**; BOSS overturn sau. Khác `[ESCALATE]` (xin data/hành động) và
-`[CONTINUE_SELF]` (chạy tiếp) — đây là **dừng-sớm-có-chủ-đích kèm phán xét**.
-
-```
-[HALT]
-reason: saturated | dead_end | false_premise | diminishing_returns
-evidence: <ĐỊNH LƯỢNG + cụ thể — BẮT BUỘC; vd "NS1–NS9 (9×20=180), 1 net-new (R040), 0 từ NS5–NS9; arXiv/PwC/OpenReview cạn vs corpus 0.15">
-did: <đã hoàn tất gì trước khi halt>
-recommendation: <BOSS nên làm gì: "freeze corpus @26" | "redirect gap X" | "stop, premise sai">
-confidence: high | medium | low
-[/HALT]
-```
-
-**Control-plane (dự kiến khi build — CHƯA code):**
-- Worker turn kết thúc self-halted (KHÔNG auto-resume). Record `[HALT]` vào ledger BOSS (như escalate) → BOSS thấy turn sau.
-- **Validation guardrail (anti-self-cert):** `evidence` rỗng/vacuous → **malformed** → retry 1 lần đòi evidence (hoặc hạ xuống `[RESULT].proposal` soft). Worker được quyền dừng-effort-mình, KHÔNG được chốt kết-luận-dự-án.
-- BOSS turn kế: đọc HALT+evidence → **ratify** (nhận recommendation) hoặc **overturn** (re-dispatch "continue, halt sai vì…").
-- Thêm `halt_log` cho audit halt-rate (agent kêu bão hoà quá thường → flag).
-
-> ⚠️ **Trạng thái: SPEC ONLY — chưa implement** (user 2026-06-27: chốt mitigate sau).
-> Khi build: mở rộng `_parse_structured` (§6.4) + `_HALT_RE` + evidence-required check; route như
-> `_handle_escalate` (§6.6) nhưng **KHÔNG auto-resume**; bảng `halt_log` (db.py) như `context_log`.
-
-### 4.6 `[DISSENT]` — Forced-acknowledge Dissent (spec §15.2) ⚠️ SPEC ONLY, CHƯA IMPLEMENT
-
-Worker **phản đối một HƯỚNG/quyết định** (không phải task của nó) → raise blocking-flag + evidence →
-BOSS **không được im lặng proceed**. Khác `[HALT]` (dừng effort mình) và `[ESCALATE] BOSS_DECISION`
-(xin BOSS quyết, non-blocking). Chỉ cho strategy-sai; **integrity-sai → refuse + `[ESCALATE] HUMAN`**.
-
-```
-[DISSENT]
-against: <direction/artifact/decision — vd "freeze tier scheme @current" | "taxonomy X của SYNTHESIZER">
-reason: <vì sao sai (strategy/method)>
-evidence: <ĐỊNH LƯỢNG/cụ thể — BẮT BUỘC>
-proposed_correction: <hướng đúng nên là gì>
-severity: blocking | strong | advisory
-[/DISSENT]
-```
-
-**Control-plane (dự kiến — CHƯA code):**
-- Ghi **BLOCKING-FLAG (open)** gắn `against`. BOSS dispatch chạm hướng đó → control-plane chèn "OPEN DISSENT phải xử" vào context BOSS.
-- BOSS resolve bằng `[DISSENT_RESOLVE] against: … verdict: ratify|overrule reason: …` → **log** (accountability: ratify sai về sau truy được).
-- `severity=blocking` + integrity-grade → **auto-loop VERIFIER/human**; `advisory` → surface, không gate.
-- `evidence` rỗng → invalid → retry. Worker **KHÔNG veto** (ratify/overrule ở BOSS/VERIFIER/human).
-
-> ⚠️ **SPEC ONLY.** Khi build: `_DISSENT_RE` + bảng `dissent_flags` (open/resolved) + gate trong BOSS
-> dispatch path + `[DISSENT_RESOLVE]` parse + dissent-rate monitor.
-
----
-
-## 5. Khối paste-ready cho `AGENT.md`
-
-### 5.1 Child agent — dán vào cuối `AGENT.md` (mọi child)
-
-```markdown
-## WORKFLOW BẮT BUỘC (5 phase — executor)
-
-**Phase 0 · PRE-FLIGHT**
-- Chạy `sync.sh <NAME>` + `sync.sh check <NAME>` (control-plane đã verify version-pin; mismatch → STOP).
-- Đọc: `inputs/manifest.md` + `overview.md` của producer liên quan + Key Pointers BOSS gửi.
-
-**Phase 1 · RECEIVE & CLARIFY**
-- Thiếu data/điều kiện → emit `[ESCALATE]` ngay (đúng grammar §4.2). KHÔNG đoán.
-
-**Phase 2 · PLAN & DECLARE** (declare-before-implement)
-- Khai rõ: "sẽ implement <ABC/artifact> v<X.Y.Z> tại <path>". Không khai = không tạo (chống orphan).
-- ABC chưa đủ biểu đạt → `[ESCALATE] type:BOSS_DECISION` tới producer, KHÔNG tự patch.
-
-**Phase 3 · EXECUTE**
-- Làm việc chính. Mỗi artifact tạo ra → ghi path. Bump version trong `outputs/manifest.md` theo bump-rule.
-
-**Phase 4 · REFLECT & SNAPSHOT** (cuối turn, BẮT BUỘC)
-- Ghi đè BODY của `overview.md`: bức tranh TỔNG THỂ hiện tại (KHÔNG phải nhật ký), ≤200 từ,
-  bullet, đủ dimension theo role (xem bảng §2.3). KHÔNG sửa field MÁY (version/last_updated).
-- Emit `[RESULT]` block (grammar §4.1) — control-plane sẽ append vào `state/progress.md` + đóng dấu header.
-```
-
-### 5.2 BOSS — dán vào `BOSS/AGENT.md` (PRE-FLIGHT + 4-phase)
-
-```markdown
-## PRE-FLIGHT (orchestrator)
-- Đọc `children_status.json` (rollup) + `context/team_role.md` → CHỌN agent.
-- Đọc `overview.md` của agent được chọn + `BOSS/overview.md` (toàn cảnh dự án).
-- KHÔNG đọc full manifest team nào trừ khi sắp bàn giao 1 artifact cụ thể.
-
-## LOOP 4-PHASE
-**1 · PLAN & DISPATCH** — chọn route, soạn message + Key Pointers, dispatch.
-**2 · RECEIVE & ENRICH** — (control-plane tự append `<dispatch_result from=...>`).
-**3 · ANALYZE & DECIDE** — phân tích response; quyết:
-   CONTINUE_CHAIN(next) | FINALIZE(user) | ESCALATE(request thêm). (judgment — viết tự do, không ép tag cứng).
-**4 · EXECUTE** — continue→dispatch tiếp · finalize→trả user + ghi đè BODY `BOSS/overview.md`.
-```
-
-> Lưu ý: BOSS **không** bị ép format `[BOSS_ANALYSIS]/[DECISION]` cứng (tránh determinism giả + tốn token).
-> Phần judgment để model tự do; control-plane chỉ parse `[RESULT]`/`[ESCALATE]` nếu có.
-
----
-
-## 6. Thay đổi control-plane (bản 2508 dòng — REUSE/AUGMENT/NEW)
-
-Tất cả ở `VietHuy/agent_code_IDLE/app/backend/`. Nhãn: **REUSE** = đã có, dùng nguyên ·
-**AUGMENT** = sửa hàm có sẵn · **NEW** = viết mới. Line theo bản 2508.
-
-### 6.1 [REUSE] Ledger `<dispatch_result>` — KHÔNG đụng
-Đã đủ: `dispatch_results` table (db.py:55-67), `record_dispatch_result`, `get_unconsumed_results`,
-`_format_results_as_context` (main.py:172-208, trunc 8000 char), enrich ở 1338-1349, consume ở 1524-1525.
-→ BOSS đã thấy kết quả con. **Không build lại** (handbook bản trước sai chỗ này).
-
-### 6.2 [AUGMENT] Inject `overview.md` vào `_session_preamble` (main.py:1195-1243)
-Hàm đã đọc `state/progress.md` + `state/children_status.json` + `inputs/manifest.md`. **Thêm** đọc
-`overview.md` (ưu tiên hơn excerpt manifest), và fallback nếu chưa có:
-```python
-# trong _session_preamble, cạnh chỗ đọc inputs/manifest.md (~1231-1235):
-ov = adir / "overview.md"                                   # NEW
-if ov.exists():
-    parts.append("### Overview (slim, current)\n" + ov.read_text(encoding="utf-8"))
-else:
-    parts.append("### (fallback) Input contract head\n" + _read_capped(man, 600))  # §10 spec fallback
-```
-> ⚠️ Caveat thật: `_session_preamble` chỉ chạy khi **không resume được** (1394: `resume_sid is None and
-> not seed_text`). Turn resume KHÔNG re-inject. Với routing freshness của BOSS, children_status mới
-> đã đi kèm preamble khi cold-start; nếu muốn BOSS đọc overview con **mỗi** turn, thêm 1 block slim ở
-> nhánh every-turn cạnh ledger (1338) — **optional**, cân nhắc token.
-
-### 6.3 [AUGMENT] children_status rollup (main.py:`_write_children_rollups` 432-499)
-Hàm đã sinh `status/context_pct/message_count/last_activity/memory_headline/stale_memory` (per-child
-450-468). **Thêm 3 field** spec §3:
-```python
-# trong vòng per-child (~450-468), thêm:
-children[cid]["manifest_version"] = _read_manifest_version(project_root, cid)        # NEW
-children[cid]["overview_path"]    = f"../{cid}/overview.md"                            # NEW
-children[cid]["body_incomplete"]  = _read_overview_flag(project_root, cid, "body_incomplete")  # NEW
-```
-`_read_manifest_version`: regex `## Version\n(\S+)` trong `<cid>/outputs/manifest.md`.
-`_read_overview_flag`: đọc field trong block HEADER của `<cid>/overview.md`.
-→ REUSE nguyên cơ chế ghi file + calling site (579 trên `/stats`); chỉ cộng field.
-
-### 6.4 [NEW] Parse `[RESULT]`/`[ESCALATE]` + stamp overview + retry
-Stream-loop đã parse `<dispatch>`/`<schedule>` (1433-1495); finalize ở 1517-1530. **Thêm** ở
-finalize, sau `db.update_session_status` (1523):
-```python
-if final_text and final_status == "ok":
-    res = _parse_structured(final_text)                    # NEW §4 regex
-    if res["malformed"] and retry_count == 0:              # retry ĐÚNG 1 lần
-        return await _run_agent(slug, agent_id,
-            "[CONTROL-PLANE] Output sai format: "+res["error"]+". Emit lại [RESULT]/[ESCALATE] đúng.",
-            emit, tracker, chain, grok_options, retry_count=1)
-    if res["result"]:
-        _stamp_overview_header(project["root"], agent_id)  # NEW: ghi manifest_version/last_updated/body_incomplete
-        # progress.md: agent tự append ở Phase 4, hoặc control-plane append res["result"] (chọn 1, đừng double)
-    if res["escalate"]:
-        await _handle_escalate(res["escalate"], slug, agent_id, project, emit, tracker)  # §6.6
-```
-Thêm param `retry_count: int = 0` vào chữ ký `_run_agent` (1308-1316).
-`_stamp_overview_header`: đọc `outputs/manifest.md` version → ghi đè field MÁY trong HEADER overview;
-đếm word BODY + check dimension role (§2.3) → set `body_incomplete`.
-
-### 6.5 [NEW/EXTEND] Version-pin enforcement
-sync.sh được **sinh** bởi `projects.generate_sync_sh` nhưng **chưa bao giờ gọi từ code**. Đồng thời
-đã có manifest-bump verify một phần ở **1615-1631** (sau dispatch, check `outputs/manifest.md` bump).
-→ **Mở rộng**: trong `_run_agent` trước khi gọi adapter (~1389), check drift inputs-pin:
-```python
-drift = _check_version_pins(project["root"], agent_id)     # NEW: chạy `sync.sh check <agent>` (§7)
-if drift:
-    return f"[CONTROL-PLANE BLOCK] stale pin: {drift}. Run sync.sh."
-```
-
-### 6.6 [NEW] `_handle_escalate` (theo type — §4 / spec §7)
-```python
-async def _handle_escalate(esc, slug, agent_id, project, emit, tracker):
-    t = esc["type"]
-    if t == "DATA":          # auto pull + STAMP version (vá an toàn spec §7) — KHÔNG cần BOSS
-        ver  = _read_manifest_version(project["root"], esc["target"])
-        data = _pull_section(project["root"], esc["target"], esc["payload"])
-        _append_progress(project["root"], agent_id, f"consumed {esc['target']}@{ver} {esc['payload']}")
-        # append data+tag vào message child rồi resume (tái dùng cơ chế dispatch/continuation sẵn có)
-    elif t == "SUBTASK":     # target là agent (có manifest) → REUSE _dispatched_run
-        ...
-    elif t == "TOOL":        # external (không manifest) → chạy tool, append output thô
-        ...
-    else:                    # BOSS_DECISION|HUMAN|BLOCKED → REUSE ledger: record_dispatch_result lên BOSS / pause+notify
-        db.record_dispatch_result(project_slug=slug, source_agent=agent_id,
-            target_agent="BOSS", task=f"ESCALATE:{t}", result_text=json.dumps(esc), status="ok")
-```
-> Chú ý: nhánh BOSS_DECISION/HUMAN **tái dùng** chính ledger `dispatch_results` đã có (§6.1) để đẩy lên
-> BOSS — không cần table escalation riêng.
-
-### 6.7 Bảng tổng hợp edit (bản 2508)
-
-| Việc | Nhãn | File:line | Hàm |
-|---|---|---|---|
-| Ledger dispatch_result | REUSE | main.py:172-208,1338-1349 / db.py:55-67 | có sẵn |
-| Inject overview vào preamble | AUGMENT | main.py:`_session_preamble` 1195-1243 (~1231) | + đọc overview.md |
-| children_status + 3 field | AUGMENT | main.py:`_write_children_rollups` 432-499 (~450-468) | `_read_manifest_version`,`_read_overview_flag` |
-| Parse [RESULT]/[ESCALATE]+stamp+retry | NEW | main.py finalize ~1523 | `_parse_structured`,`_stamp_overview_header` |
-| Version-pin drift | NEW/EXTEND | main.py ~1389 (+ verify 1615-1631) | `_check_version_pins` |
-| Escalate router | NEW | post-turn | `_handle_escalate` (reuse `_dispatched_run`,ledger) |
-| retry_count param | NEW | main.py:1308-1316 | sửa chữ ký `_run_agent` |
-
-### 6.8 [EXTEND] Acceptance gate + stopping rule (goal contract — spec §14)
-Hook manifest-bump verify đã có ở **1615-1631** (sau dispatch, check `outputs/manifest.md` bump).
-**Mở rộng** thành acceptance gate cho goal:
-```python
-# sau khi worker dispatch xong (~1615-1631), nếu dispatch có goal:
-if goal:
-    ok = _check_acceptance(goal, project["root"], target)        # NEW
-    # threshold: metric >= predicate ; directional: metric > goal["baseline_value"] ; judgment: route VERIFIER
-    if not ok:
-        if _plateau(target) or _budget_exhausted(target, goal["budget"]):  # NEW: stopping rule §14.4
-            await _emit_escalate_partial(target, goal, emit)     # STOP · escalate partial — KHÔNG retry vô hạn
-        # else: còn budget & đang tiến → continuation round (REUSE 3-round cap 1843-1871) xử lý
-```
-- `_check_acceptance`: **không bao giờ** tin `goal_status` child tự khai; tự đọc metric/đẩy VERIFIER.
-- `_plateau`: so metric N round gần nhất, Δ < ε → true. `_budget_exhausted`: đếm turn/token đã dùng vs `goal.budget`.
-- **REUSE** continuation-round cap (1843-1871) + scheduler (`<schedule until=goal>`/`<schedule_stop>`) làm
-  khung lặp-có-điểm-dừng; chỉ thêm plateau-detector + escalate-partial.
-
-### 6.9 [AUGMENT] BOSS Summary-only + Exception (spec §15)
-- Trong `_format_results_as_context` (172-208, đã trunc 8000 char): thêm dòng digest đầu mỗi block
-  (`summary/status/goal_status`) để BOSS đọc nhanh — **surface cơ học, KHÔNG synthesize**.
-- BOSS chỉ deep-analyze khi `status=blocked` hoặc `goal_status=missed` hoặc `open_escalation≠null`.
-- **Chống silent drift**: thêm full-scan định kỳ — mỗi N turn, một pass đọc đủ overview tất cả child
-  (hoặc 1 critic agent hỏi "cái gì đang sai mà không raise flag?").
-
----
-
-## 7. Thay đổi `sync.sh`
-
-`sync.sh check <CONSUMER>` đã so version. Thêm **exit code rõ** để control-plane (§6.1) dùng:
-```bash
-# trong nhánh check: nếu pinned != current
-echo "DRIFT <PRODUCER> pinned=<a> current=<b>"; exit 3   # 0=ok, 3=drift, 2=missing
-```
-`_check_version_pins` gọi `sync.sh check` qua subprocess, đọc exit code + stdout.
-
----
-
-## 8. Bootstrap (sinh `overview.md` lần đầu cho agent cũ)
-
-Script 1 lần (chạy ngoài turn). Pseudo:
-```python
-for agent in all_agents(root):
-    ver = read_manifest_version(agent/"outputs/manifest.md")
-    latest = read_latest_artifact(agent/"outputs/manifest.md")
-    write(agent/"overview.md", HEADER(status="yellow", manifest_version=ver, body_incomplete=True)
-          + BODY_PLACEHOLDER(f"*(chờ agent tự tổng hợp; artifact mới nhất: {latest})*")
-          + FOOTER(last_artifact=latest))
-```
-→ Sau bootstrap mọi overview có header thật + body placeholder + `body_incomplete=true`.
-Turn kế của mỗi agent (Phase 4) ghi đè body thật → cờ tự gỡ.
-
----
-
-## 9. WORKED TRACE — end-to-end (AEC: BOSS → CRAFTER → escalate DATA → CURATOR)
-
-Kịch bản: user yêu cầu "đưa raw records vào manuscript". CRAFTER cần raw 42 entries của CURATOR.
-
-**T0 — user → BOSS** (`/api/.../BOSS/chat`, message="merge raw records vào manuscript")
-- `_check_version_pins(BOSS)` → ok. [NEW §6.5]
-- `_session_preamble(BOSS)` [AUGMENT §6.2]: BOSS là orchestrator → `_write_children_rollups` ghi
-  `BOSS/state/children_status.json` (augmented):
-  ```json
-  {"children":[{"id":"CRAFTER","status_color":"yellow","manifest_version":"0.7.14",
-   "overview_path":"../CRAFTER/overview.md","body_incomplete":false,
-   "memory_headline":"manuscript v0.4, chờ raw_records 42","open_escalation":null}]}
-  ```
-- Preamble = `BOSS/overview.md` + children_status. BOSS đọc → thấy CRAFTER yellow, headline nói "chờ raw".
-
-**T1 — BOSS Phase 3 ANALYZE+DECIDE**
-- BOSS không đọc full manifest CRAFTER. Quyết: `CONTINUE_CHAIN → CRAFTER`, Key Pointers=`CURATOR records_42`.
-- BOSS dispatch CRAFTER (message + pointer).
-
-**T2 — CRAFTER turn** (`cwd=CRAFTER/`)
-- `_check_version_pins(CRAFTER)`: `inputs/CURATOR.md` pinned 0.5.2 == `CURATOR/outputs/manifest.md` 0.5.2 → ok.
-- `_session_preamble(CRAFTER)`: inject `CRAFTER/overview.md` (slim, không full manifest).
-- Phase 1: CRAFTER thấy thiếu raw 42 → emit:
-  ```
-  [ESCALATE]
-  type: DATA
-  target: CURATOR
-  payload: records_42
-  reason: cần merge vào manuscript
-  priority: high
-  [/ESCALATE]
-  ```
-
-**T3 — post-turn hook `_handle_escalate` (type=DATA, auto, KHÔNG cần BOSS)**
-- `ver = _read_manifest_version(CURATOR)` → `0.5.2`.
-- `_pull_section(CURATOR, records_42)` → raw json.
-- `_append_progress(CRAFTER, "consumed CURATOR@0.5.2 records_42")`  ← **vá an toàn version (spec §7)**.
-- raw + tag `CURATOR@0.5.2` append vào message CRAFTER → **resume** cùng session.
-
-**T4 — CRAFTER tiếp Phase 3-4**
-- Merge raw → `outputs/crafter_draft_v0.5.md`, bump manifest 0.7.14→0.7.15.
-- Phase 4: ghi đè BODY `CRAFTER/overview.md`:
-  ```
-  ## Bức tranh tổng thể
-  - draft@ver: manuscript v0.5 (coverage 72%)
-  - merged_from: CURATOR records_42 @0.5.2, SYNTHESIZER taxonomy
-  - needs: none
-  ```
-  emit:
-  ```
-  [RESULT]
-  summary: merged raw 42 records → manuscript v0.5
-  artifacts: outputs/crafter_draft_v0.5.md
-  new_pointers: draft → outputs/crafter_draft_v0.5.md
-  status: green
-  ready_for: back_to_boss
-  [/RESULT]
-  ```
-- post-turn: `_append_progress(CRAFTER, result)`; `_stamp_overview_header(CRAFTER)` → ghi
-  `manifest_version: 0.7.15`, `last_updated`, kiểm dimension SYNTH đủ → `body_incomplete=false`.
-- Ledger (§6.6): ghi `dispatch_results(BOSS-session, from=CRAFTER, result=...status green)`.
-
-**T5 — BOSS turn kế**
-- `_session_preamble(BOSS)`: children_status mới (CRAFTER giờ `status_color:green, manifest_version:0.7.15`)
-  + `<dispatch_result from="CRAFTER">...green...</dispatch_result>` (ledger).
-- BOSS Phase 3: thấy CRAFTER green, draft v0.5 ready → `FINALIZE` → trả user + ghi đè `BOSS/overview.md`.
-
-> Lưu ý suốt trace: **không lần nào** BOSS nạp full manifest CRAFTER/CURATOR. Routing chỉ dùng
-> children_status + overview. Manifest chỉ bị đọc bởi `_check_version_pins` (so version, không nạp body)
-> và `_pull_section` (cắt đúng section cần). Đây là chỗ token được tiết kiệm.
-
----
-
-## 10. Acceptance tests
-
-| # | Test | Pass khi |
+| Block | Check parser hiện tại | Xử lý sau turn |
 |---|---|---|
-| A1 | Agent chưa có overview | preamble fallback đọc head manifest, không crash |
-| A2 | overview header thiếu field | retry 1 lần; vẫn fail → flag + fallback |
-| A3 | manifest_version trong overview ≠ outputs/manifest.md | `_stamp_overview_header` ghi đè đúng version thật |
-| A4 | BODY > 200 từ | cảnh báo, không block |
-| A5 | BODY thiếu dimension role | `body_incomplete=true` |
-| A6 | version drift (inputs pin ≠ producer) | `_check_version_pins` block turn, message yêu cầu sync |
-| A7 | `[ESCALATE] type:DATA` | auto pull + dòng `consumed <PROD>@<ver>` xuất hiện trong progress |
-| A8 | producer bump version SAU khi child consume | turn kế của child: A6 bắt drift |
-| A9 | `[RESULT]` malformed | retry đúng 1 lần (không vòng vô hạn) |
-| A10 | BOSS routing | KHÔNG đọc full manifest child nào (verify qua log đọc file) |
+| `[RESULT]` | Key/value, balanced canonical tags | Watermark/resolution fields; overview stamp |
+| `[ESCALATE]` | Type ∈ DATA/BOSS_DECISION/HUMAN/SUBTASK/TOOL/BLOCKED | Tạo DB row + route parent đầu tiên |
+| `[HALT]` | Evidence không rỗng | `halt_log` + ledger; không tự resume |
+| `[DISSENT]` | Evidence và against không rỗng | `dissent_flags` + ledger + every-parent-turn warning |
+| `[DISSENT_RESOLVE]` | Verdict ratify/overrule | Resolve theo project và against |
 
----
+Dùng tag uppercase canonical. Regex body không phân biệt case nhưng bộ đếm tag
+balance hiện dùng chuỗi uppercase. Evidence không rỗng chưa đồng nghĩa evidence
+định lượng/chính xác. `_HALT_REASONS` được khai báo nhưng parser chưa enforce enum đó.
 
-## 11. Thứ tự build (khớp checklist spec §12)
+Malformed ở lần đầu → một corrective turn (`retry_count=1`). Lần thứ hai vẫn có thể
+đi qua structured finalization; không có hard rejection riêng. Không mô tả cơ chế
+này là bảo đảm mọi block cuối cùng đều hợp lệ.
 
-1. **P0** AUGMENT `_session_preamble` đọc overview + **fallback** (A1) → lưới an toàn, hệ vẫn chạy.
-2. **P1** schema overview + AUGMENT `_write_children_rollups` (+3 field) + bootstrap (§8).
-3. **P2** paste khối Phase 0-4 vào `AGENT.md` (§5) + `BOSS/overview.md`.
-4. **P3** `_check_version_pins` + sync.sh exit code (§7) + post-turn parse/stamp/retry (§6.4).
-5. **P4** `_handle_escalate` (reuse ledger §6.1) + chạy acceptance §10.
-6. **P5** goal contract: dispatch `goal` block (§4.4) + acceptance gate/stopping rule (§6.8) + Summary/Exception (§6.9).
-   Agency: Propose&Commit (field `proposal`) trước; `[CONTINUE_SELF]` capped sau; Micro-orchestrator (field `parents`) chọn lọc cho AEC synth-trio.
-7. **P6** Evaluative Self-Halt (§4.5 / spec §15.1) — ✅ **DONE 2026-06-27**: `_HALT_RE` + parse trong `_parse_structured` (evidence-required → malformed/retry) + `_handle_halt` (ledger route, KHÔNG auto-resume) + `halt_log` table. Soft-trigger: protocol §6 (3 hệ). Smoke PASS.
-8. **P7** Forced-acknowledge Dissent (§4.6 / spec §15.2) — ✅ **DONE 2026-06-27**: `_DISSENT_RE`/`_DISSENT_RESOLVE_RE` + parse (evidence+against required) + `dissent_flags` table + `_handle_dissent` (open flag) + **`_open_dissent_warning` gate trong `_run_agent` cho orchestrator** (forcing — re-surface mỗi turn tới khi resolve) + `_handle_dissent_resolve` (ratify/overrule). Smoke PASS (flag lifecycle open→resolve).
-9. **P8** Incremental Verification & Delta-Processing (spec §16) — ✅ **DONE 2026-06-27** (hard skip + soft protocol). **Nguyên lý KIẾN TRÚC CHUNG** (§16.0). Implement:
-   (a) **Artifact chunking** — ✅ behavioral (protocol §7 "surgical Edit, đừng re-generate"); ⬜ structural reorg (per-project, chưa);
-   (b) **Verified-watermark** — ✅ **HARD**: `verify_watermark` table + `_verify_delta` (so producer semver, `==`→SKIP, đọc version thật) + `_verify_delta_hint` inject đầu turn auditor + store khi auditor emit `verified: PROD@ver` trong [RESULT]. Smoke PASS trên AEC thật (DISCOVERER unchanged→SKIP, CURATOR đổi→RE-VERIFY);
-   (c) monotone findings (`closed_at`) — ✅ **soft** (auditor protocol: reopen chỉ khi version vượt);
-   (d) tiered (cơ học mỗi pass · judgment/web chỉ DELTA+publish-gate) — ✅ **soft** (auditor protocol — model-choice là config, không hard-enforce được);
-   (e) batch-at-gate — ✅ **soft** (auditor protocol). Soft-trigger: §INCREMENTAL VERIFICATION trong VERIFIER/INTEGRITY/AUDIT AGENT.md (3 hệ).
-   **Số chống lưng**: findings 173KB/86 re-work mention, F-2026 47× F-066 22×, log không có verified-at-version; cascade +2 bench ≈1.8M ctx-tok.
+`[CONTINUE_SELF]` chưa có parser/resume path. `[HALT]` không tạo run-status mới:
+lượt model sạch vẫn có thể mang status `ok` với halt record riêng.
 
-> Mỗi bước có đường lui (fallback §6.2). Không big-bang. **Ledger + children_status generator + cold-start
-> preamble ĐÃ chạy sẵn** trên bản 2508 (cả AEC lẫn VLM) — ta chỉ augment, không build từ đầu.
-> (Khác hẳn handbook bản nháp trước vốn theo nhầm bản Hoang 783 dòng.)
+## 5. Quy trình tác giả agent
+
+- Boot đọc shared rules, own overview và input pins; không đọc toàn bộ progress.
+  Parent nhận current child overviews every turn; rollup nằm trong cold-start khi có.
+- Khi có drift, sync producer cần dùng rồi kiểm tra lại trước khi consume artifact.
+- Viết artifact đúng scope; cập nhật manifest/version khi contract thay đổi.
+- Thêm dated progress entry và cập nhật overview bằng trạng thái tổng thể, không
+  lấy nguyên delta cuối làm overview. `[RESULT]` không tự append progress trong backend.
+- Nếu opt-in memory reconciliation, owner làm internal reconciliation theo §12.
+- Route bằng outcome/pointer đủ rõ; acceptance vẫn thuộc verifier/parent/user theo contract.
+
+## 6. Enforcement và giới hạn
+
+### 6.1 Ledger và continuation
+
+Xem [dispatch lifecycle](docs/agentui-dispatch-spec.md). Root continuation cap là 3,
+không phải cap số worker hay token trong một task. Browser disconnect không cancel.
+
+### 6.2 Drift
+
+`_check_version_pins` nhận dòng `- PRODUCER: version` trong input rollup, so với
+version đọc được từ output manifest. File thiếu/không parse được có thể cho kết quả
+rỗng. Có drift thì `_run_agent` prepend warning và yêu cầu agent tự sync; model vẫn chạy.
+
+### 6.3 Escalation
+
+`[ESCALATE]` tạo state open/resolve trong DB, route vào ledger của parent đầu tiên;
+root chỉ có state/meta. DATA không tự pull, SUBTASK không tự dispatch, TOOL không tự
+execute, HUMAN không tạo workflow approval độc lập. Parent/user quyết bước tiếp theo.
+
+### 6.4 Dissent
+
+Open flags được đưa vào prompt của các orchestrator trong project, tới khi resolve.
+Không có kiểm tra semantic target để hard-reject dispatch, không auto-loop verifier
+cho integrity-grade dissent, và chưa có quyền resolve riêng được enforce chỉ cho parent.
+
+### 6.5 Verification watermark
+
+`verified: PROD@ver` được lưu từ claim của agent. `_verify_delta` so version thực
+với watermark đã có, tạo skip/reverify sets; đây là deterministic comparison rồi
+prompt hint. Nó không cưỡng chế tool skip, không hash artifact, và không tự discover
+producer chưa có watermark. `_verify_delta_hint` chỉ emit khi skip set không rỗng.
+Monotone findings, tiered verification và structural chunking vẫn phụ thuộc project.
+
+### 6.6 Goal acceptance
+
+`_parse_goal` đọc type/predicate/baseline_value/metric_pinned/acceptance_by.
+`_dispatched_run` thêm lời nhắc claim ≠ acceptance vào ledger. Chưa có `_check_acceptance`,
+metric reader, plateau detector hoặc parser/enforcement cho budget turns/tokens.
+Không tự dispatch verifier chỉ vì có `acceptance_by: VERIFIER`.
+Manifest publication check dùng mtime, không bảo đảm semantic version đã tăng.
+
+## 7. Sync và progress
+
+`projects.generate_sync_sh` render script từ `templates/sync.sh.tmpl`; backend không gọi
+script tự động. Agent/user gọi script khi cần. Script dùng mapping sinh lúc scaffold,
+không tự refresh mapping khi chỉnh topology về sau. Script `check` in version/pin
+rồi exit 0 ngay cả khi lệch; không có drift exit code 3. Template shell đọc `## Version`,
+trong khi Python version reader còn hỗ trợ `version:`. Không coi hai parser là tương đương.
+
+Progress reader ưu tiên `state/progress.json`; nếu không tồn tại mới parse Markdown.
+Cold start lấy hai ngày **có entry** gần nhất, sort theo ngày/giờ và cap excerpt.
+Rotator global mặc định off; khi bật, tick theo giờ và chạy một pass ngay lúc bật.
+Markdown rotation giữ hot Markdown, merge phần cũ vào archive JSON; explicit migration
+API mới chuyển sang hot JSON. Đừng ghi riêng hai hot log vì reader sẽ ưu tiên JSON.
+
+## 8. Bootstrap và migration
+
+New-project/new-agent UI render sáu file cùng shared templates và project config.
+Project mới có `paper_collection/README.md`/`CATALOG.md`. Có API explicit migrate progress;
+chưa có bulk migration tổng quát để viết overview có nội dung thật cho mọi project cũ.
+Memory reconciliation phải được opt-in rõ ràng, không suy ra từ việc file overview tồn tại.
+
+## 9. Worked flow phù hợp implementation
+
+Ví dụ minh họa: BOSS dispatch CRAFTER cần dữ liệu CURATOR.
+CRAFTER emit `[ESCALATE] type: DATA`, target CURATOR và evidence/pointer cần thiết.
+Backend ghi escalation và ledger cho BOSS; **không tự pull raw data**.
+Root continuation nhận kết quả, rồi quyết định dispatch CURATOR nếu là direct child
+hoặc đưa yêu cầu về parent phù hợp. CRAFTER được giao tiếp khi input đã sẵn sàng.
+Worker cập nhật artifact/manifest/progress; ledger phản hồi lại BOSS. Đây là flow
+minh họa, không phải claim đã chạy live trên một corpus cụ thể.
+
+## 10. Kiểm tra
+
+Existing tests gồm `test_memory_receipt.py`, `test_escalation_state.py`, adapter,
+capability inventory, terminal và các suite Notion/evaluation. Chạy test trong DB/
+registry tạm; import `main.py` khởi tạo DB và có startup bookkeeping ngay lập tức.
+[audit](docs/documentation-audit.md) ghi chính xác các kiểm tra đã chạy trong đợt này;
+không coi kết quả pilot lịch sử là kết quả regression mới.
+
+## 11. Phần còn thiếu
+
+Hard reject sau corrective retry thứ hai; generic metric/budget/plateau enforcement;
+typed escalation auto-resolution; direction-level dissent veto/role enforcement;
+`CONTINUE_SELF`; global worker lock; bulk project migrations và structural chunking.
+Đây là backlog/giới hạn được ghi nhận, không phải thay đổi code trong đợt cập nhật tài liệu.
+
+## 12. Memory reconciliation có backend enforcement (GelSight pilot, 2026-08-11)
+
+> **Có implementation, opt-in theo project.** Đợt audit 2026-09-07 đối chiếu code,
+> không xác nhận trạng thái service hoặc rollout của từng project. Escalation DB áp dụng
+> cho structured finalization nói chung; projection footer từ DB và receipt publish gate
+> phụ thuộc memory policy. Các mô tả pilot bên dưới là ghi nhận lịch sử.
+
+### 12.1 Ba file, ba audience, một chiều dẫn xuất
+
+Luồng memory bắt buộc là:
+
+```text
+delta của turn → state/progress.md → outputs/manifest.md → overview.md:BODY
+                         history         current truth        parent projection
+```
+
+| File | Chức năng | Audience | Không được biến thành |
+|---|---|---|---|
+| `state/progress.md` | Nhật ký delta có thời gian: đã thử gì, thay đổi gì, evidence, outcome | audit/resume gần | technical report hiện tại |
+| `outputs/manifest.md` | Nguồn sự thật kỹ thuật hiện tại của chính owner; tổ chức theo chủ đề | agent owner | changelog theo turn/ngày |
+| `overview.md:BODY` | Bản tóm tắt gọn được **rút ra từ manifest**, chỉ giữ thông tin làm thay đổi routing/accept/block/stop | parent + human | bản sao manifest hoặc nơi chứa claim mới |
+
+Chiều `manifest → overview` là một chiều. Không dùng overview để tái tạo
+manifest. Mọi claim kỹ thuật trong overview phải truy được tới một section
+hiện có trong manifest hoặc evidence pointer do section đó nêu.
+
+Reconciliation **không tự cắt file memory theo character/word** và không tự viết technical prose.
+Riêng prompt projection có cap BODY (4.000 ký tự cho own overview, 6.000 cho child) nhưng giữ HEADER/FOOTER.
+Ngưỡng overview (GelSight: 240 words) chỉ sinh warning; agent phải rewrite semantic,
+không truncate vì truncate có thể làm mất thông tin.
+
+### 12.2 Ai thực hiện reconciliation
+
+Sau mỗi primary turn thành công có nội dung, control-plane gọi **chính agent owner đó** thêm
+một internal turn hẹp mang tên `MEMORY_RECONCILIATION`:
+
+1. Owner kiểm tra delta ý nghĩa của task và update progress nếu có thay đổi thật.
+2. Owner reconcile manifest in-place nếu current technical truth thay đổi; không append lịch sử.
+3. Owner derive `OVERVIEW:BODY` từ manifest đã finalize.
+4. Backend validate receipt và quyết định có publish overview mới hay không.
+
+Parent không viết memory cho child. Backend chỉ orchestration, hash, validate pointer,
+restore/publish và stamp machine-owned fields. UI emit status `reconciling_memory` trong pha này.
+Pha này không được browse, train, dispatch, tiếp tục primary task hay sửa artifact
+ngoài ba file memory của owner.
+
+### 12.3 Receipt bắt buộc và validation theo hash thật
+
+Control-plane chụp hash baseline **trước primary turn**, không phải chỉ trước pha
+reconciliation. Vì vậy edit mà agent đã làm ngay trong primary task vẫn được
+tính là `updated`.
+
+Owner kết thúc internal turn bằng block:
+
+```text
+[MEMORY_RECONCILED]
+status: ok
+durable_delta: <technical|coordination|none>
+progress: <updated|unchanged>
+progress_ref: <dated heading fragment or none>
+manifest: <updated|unchanged>
+manifest_ref: <manifest section or none>
+overview: <updated|unchanged>
+overview_manifest_refs: <manifest section(s), separated by |, or none>
+overview_reason: <why parent routing changed or remained unchanged>
+resolved_escalations: <explicit esc-ID(s) or none>
+[/MEMORY_RECONCILED]
+```
+
+Backend không tin lời khai `updated/unchanged`; nó so với hash cuối whole-turn:
+
+- `progress` và `manifest` hash toàn file; riêng `overview` chỉ hash BODY (HEADER/FOOTER do máy sở hữu).
+- File khai `updated` phải thật sự đổi hash và pointer phải match text/heading có thật.
+- File khai `unchanged` nhưng hash đổi là receipt invalid.
+- `durable_delta: none` mà bất kỳ memory hash nào đổi là mâu thuẫn.
+- Technical/coordination delta nhưng manifest không đổi phải chỉ tới section đã
+  chứa sự thật đó; như vậy một synthesis từ knowledge cũ vẫn audit được.
+- Primary response dài hơn 800 character nhưng khai no-op phải có `manifest_ref`
+  thật; quy tắc này bắt case agent trả lời kỹ thuật dài nhưng không lưu/
+  không chỉ ra durable knowledge.
+- Overview BODY đổi phải khai `overview_manifest_refs`; từng ref phải tồn tại
+  trong manifest. `overview_reason` luôn bắt buộc.
+- `resolved_escalations` chỉ hợp lệ với ID đang open và thuộc owner đó.
+
+Semantic lint hiện cảnh báo overview vượt advisory word budget, paragraph manifest
+bị lặp, và nhiều dated top-level section trong manifest. Warning không tự động
+xóa/cắt content.
+
+### 12.4 Publish gate: `verified` và `needs_review`
+
+Receipt hợp lệ:
+
+- Stamp `memory_status: verified`.
+- Stamp `source_manifest_sha256` bằng hash manifest hiện tại.
+- Stamp `derived_at`, `manifest_version`, `last_updated` và `body_incomplete`.
+- Parent được phép dùng overview làm routing projection.
+
+Receipt thiếu/sai, adapter error, pointer không tồn tại, hoặc receipt mâu thuẫn hash:
+
+- **Giữ** progress và manifest edits để audit/review; backend không xóa technical work.
+- Restore overview pre-turn nếu snapshot đó không rỗng. Nếu trước turn chưa có overview, nhánh hiện tại không xóa file mới; nó vẫn bị đánh dấu `needs_review`.
+- Stamp `memory_status: needs_review`.
+- Không stamp manifest SHA/version mới, do overview chưa được chứng minh là projection
+  của manifest mới.
+
+Với project opt-in, pre-flight coi overview là stale khi `memory_status != verified`,
+thiếu `source_manifest_sha256`, hoặc SHA không khớp manifest. Agent vẫn phải làm
+primary task trước; internal reconciliation sẽ sửa memory sau, tránh biến task của
+user thành một memory-only turn.
+
+Machine-owned footer chuẩn hiện tại:
+
+```text
+open_escalation: <none | esc-ID TYPE→target: reason [| ...]>
+open_escalation_ids: <none | esc-id,...>
+memory_status: <verified|needs_review>
+source_manifest_sha256: <sha256 của manifest đã verify>
+derived_at: <ISO8601>
+last_updated: <YYYY-MM-DD>
+```
+
+### 12.5 Escalation là state machine, không còn là footer text dính vĩnh viễn
+
+Mỗi `[ESCALATE]` hợp lệ tạo một row trong SQLite table `escalations`; backend gán
+ID `esc-<12 hex>`. Hai escalation open giống hệt nhau của cùng owner được
+deduplicate. Row lưu owner, type, target, reason/evidence, opened session, status, và
+resolution provenance.
+
+Lifecycle:
+
+```text
+[ESCALATE] → open(esc-ID) → route ledger/meta → explicit resolve(ID) → resolved
+```
+
+Agent không tự bịa ID. Resolve bằng một trong hai cách:
+
+```text
+[RESULT]
+outcome: <blocker đã được gỡ thế nào>
+resolves: esc-0123456789ab, esc-fedcba987654
+[/RESULT]
+```
+
+hoặc field `resolved_escalations` trong receipt. Backend ghi `resolved_by`,
+`resolved_session`, `resolution_reason`, `resolved_at`; ID không tồn tại/đã đóng
+bị reject và emit meta warning.
+
+`open_escalation` và `open_escalation_ids` trong overview chỉ là **projection từ DB**.
+Mỗi stamp luôn ghi lại projection; nếu không còn row open thì bắt buộc ghi
+`none`. Vì vậy blocker cũ không thể bị kẹt chỉ vì footer từ turn trước.
+Top-level BOSS vẫn có DB state dù không có parent để route.
+
+### 12.6 Progress hot window: hai ngày **có nội dung** gần nhất
+
+Khi bật rotator (global `progress_rotate_enabled`, mặc định off), `state/progress.md`
+không tăng vô hạn. Rotator giữ hai date mới nhất
+thực sự có entry, không phải hai ngày calendar gần hôm nay. Agent dù idle lâu
+vẫn giữ được hai ngày hoạt động cuối.
+
+Markdown vẫn giữ định dạng Markdown; `progress.json` chỉ dùng khi đã migrate rõ ràng.
+Reader ưu tiên JSON nếu tồn tại, nên không duy trì hai hot log độc lập. Phần cũ được merge/de-duplicate vào:
+
+```text
+state/archive/<AGENT>_progress.json
+```
+
+Lần rotate Markdown đầu tiên còn tạo backup phục hồi một lần:
+
+```text
+state/archive/<AGENT>_progress_backup.md
+```
+
+Thứ tự an toàn là backup → merge archive atomically → rewrite hot file atomically.
+Crash giữa chừng có thể tạo duplicate tạm thời nhưng không làm mất dữ liệu;
+lần rotate sau de-duplicate.
+
+### 12.7 Bật policy cho một project
+
+Project chỉ dùng pipeline mới khi `.agentui/project.yaml` khai báo:
+
+```yaml
+memory:
+  reconciliation:
+    enabled: true
+    protocol_file: shared/memory_protocol.md
+    overview_advisory_words: 240
+```
+
+Project phải có `shared/memory_protocol.md` nêu semantic contract và
+`shared/overview_protocol.md` nêu `[RESULT]`, `[ESCALATE]`, `resolves` cùng machine-owned
+footer. Bật config mà thiếu provenance/footer field sẽ làm pre-flight báo stale cho
+đến khi một reconciliation hợp lệ migrate agent đó.
+
+Chi phí cố ý: mỗi successful primary turn có thêm một model call ngắn của
+chính owner. Đổi lại, parent chỉ đọc overview đã có provenance thay vì nạp
+full child manifest, và control-plane có audit trail cho failure/false no-op.
+
+### 12.8 Acceptance tests bắt buộc cho memory policy
+
+| ID | Case | Pass khi |
+|---|---|---|
+| M1 | Agent khai `unchanged` nhưng file đổi | receipt fail với hash mismatch |
+| M2 | `updated` nhưng pointer không tồn tại | receipt fail; overview `needs_review` |
+| M3 | Overview đổi nhưng không có manifest refs | receipt fail; không stamp SHA mới |
+| M4 | Long no-op synthesis không có `manifest_ref` | receipt fail |
+| M5 | Receipt hợp lệ, refs có thật | `memory_status=verified`; SHA khớp manifest |
+| M6 | Reconciliation fail sau khi overview bị edit | restore overview pre-turn; progress/manifest vẫn còn |
+| M7 | Open escalation trùng nhau | chỉ một open ID |
+| M8 | Resolve ID hợp lệ | DB row resolved; footer lần stamp sau thành `none` nếu hết blocker |
+| M9 | Resolve ID lạ/đã đóng | reject + meta warning; không đổi row khác |
+| M10 | Progress có ba ngày hoạt động | hot file giữ hai ngày mới nhất; ngày cũ vào archive |
+
+Regression tests hiện tại:
+
+```bash
+rtk proxy app/.venv/bin/python -m unittest \
+  app.backend.test_memory_receipt \
+  app.backend.test_escalation_state -v
+```
+
+Ghi nhận rollout GelSight trước đợt audit này: cả hai nhánh runtime: validator từng reject
+`long unchanged synthesis requires an existing manifest_ref`, sau đó BOSS/MODEL
+reconcile lại thành công và overview trở về `verified`. Đó là behavior mong muốn:
+fail closed ở projection cho parent, nhưng không làm mất technical work của owner.
+
+## 13. Notion reporting thống nhất ở cấp project
+
+Notion là project resource, không phải connector cài riêng cho từng agent. Contract
+chuẩn là:
+
+```text
+một AgentUI server token
+        ↓
+một AgentUI System Hub được bind + live-verify đúng một lần
+        ↓
+project mới tự tạo/reuse một direct child: <name> [<slug>]
+        ↓
+destination project được persist dưới canonical root agent
+        ↓
+mọi agent trong project chỉ kế thừa đúng project subtree
+        ↓
+agent inventory/read/sync report trong subtree đó
+```
+
+### 13.1 Identity do control plane sở hữu
+
+Model không được nhập hoặc suy luận `project_slug`/`agent_id`. Backend truyền canonical
+identity qua argv của MCP process; tool schema cố ý không expose hai field này. Nhờ đó
+tên thư mục như `OpenConstruction-research` không thể bị dùng nhầm thay cho registry
+slug `openconstruction-meta`.
+
+MCP không có scope từ control plane phải fail closed. Global/raw Notion MCP vẫn bị tắt
+trong AgentUI turn để agent không bypass destination lock.
+
+### 13.2 System Hub, auto-provision và inheritance
+
+- Dashboard có nút **Notion System Hub**. User bind một parent đúng **một lần**;
+  backend live-verify workspace/page trước khi lưu.
+- Project đã có binding riêng tiếp tục dùng binding đó, không bị di chuyển tự động.
+- Project chưa bind sẽ tạo hoặc reuse đúng một direct child tên
+  `<project name> [<registry slug>]` dưới Hub, rồi persist một destination bình thường
+  do canonical root agent sở hữu.
+- Provisioning dùng inter-process file lock và re-check destination bên trong lock để
+  hai first-turn chạy đồng thời không tạo page trùng.
+- Destination registry chỉ lưu URL/page/workspace và **tên** biến token, không lưu secret.
+- Worker không được rebind nhưng `DestinationStore.resolve(project, worker)` tự kế thừa
+  binding duy nhất của project.
+- Nếu chưa có System Hub: báo đúng một system-level setup action; không yêu cầu cài
+  plugin, không yêu cầu token/binding riêng cho từng agent hoặc project.
+- Nếu project có nhiều binding và worker không có exact binding: fail vì ambiguous,
+  không tự chọn.
+
+Dashboard trả `configured`, `destination_owner_agent_id` và `inherited` cho cả worker,
+thay vì placeholder rỗng. Một token `NOTION_REPORT_TOKEN` có thể phục vụ mọi project
+trong cùng workspace; token riêng theo project vẫn được hỗ trợ qua `token_env`.
+
+### 13.3 Read/audit semantics
+
+Trong AgentUI turn, “đọc toàn bộ Notion” luôn có nghĩa là **toàn bộ bound project
+subtree**, không phải toàn personal workspace:
+
+- `list_notion_project_tree`: BFS có cap depth/page, chỉ đi qua `child_page` dưới root.
+- `read_notion_project_page`: chỉ đọc sau khi page ID được chứng minh thuộc inventory;
+  block traversal có cap và trả `content_sha256` để audit staleness.
+- Page nằm ngoài subtree bị reject, kể cả token thật sự có quyền truy cập page đó.
+
+Raw/global Notion MCP bị disable trong AgentUI subprocess. System prompt do control plane
+inject cấm agent đề xuất “install/connect Notion plugin”; connector nội bộ là đường duy nhất.
+
+### 13.4 Publish semantics
+
+Ba operation ghi chuẩn:
+
+- `create_notion_report`: tạo report mới dưới parent đã bind.
+- `append_notion_child_page`: match exact direct-child title, append rồi read-back.
+  `create_if_missing=false` là mặc định; chỉ bật khi user đã cho phép tạo page con.
+- `sync_notion_managed_report`: dry-run mặc định, chỉ replace vùng nằm giữa marker
+  `AGENTUI_REPORT_START/END`; manual blocks ngoài vùng managed không bị sửa.
+
+Multiple exact-title match luôn fail. Retry cùng payload đã nằm ở page tail trả
+`action: unchanged`, không ghi duplicate. Thành công chỉ được công bố khi
+`read_back_verified: true`; page creation hoặc append không có read-back là chưa hoàn tất.
+
+### 13.5 Acceptance tests
+
+| ID | Case | Pass khi |
+|---|---|---|
+| N1 | Worker cùng project gọi status | kế thừa root parent; `inherited=true` |
+| N2 | Model cố gửi project/agent identity | schema không có field đó |
+| N3 | MCP launch không có control-plane scope | tool fail closed |
+| N4 | Project chưa bind, Hub đã bind | tạo/reuse một project child rồi persist root-owned destination |
+| N5 | Project có nhiều destination | worker nhận ambiguous error |
+| N6 | Authorized create | page con tạo dưới bound parent và read-back pass |
+| N7 | Retry cùng nội dung | `action=unchanged`, không tạo/append duplicate |
+| N8 | Codex resume làm rơi env allow-list | argv scope + scoped local-token fallback vẫn verify |
+| N9 | “All Notion” | chỉ inventory project subtree, không quét workspace |
+| N10 | Read page ngoài subtree | reject trước khi đọc block |
+| N11 | Managed sync dry-run | không create/archive/append |
+| N12 | Managed replace | chỉ archive marker range; manual content còn nguyên; read-back pass |
+| N13 | Hai first-turn đồng thời | provision lock + re-check không tạo duplicate project child |
+
+Ghi nhận pilot lịch sử (không chạy lại trong audit) GelSight ngày 2026-08-16: inventory thấy 7 page, `truncated=false`;
+page `propose` đọc được 7 block, `truncated=false`, và trả content SHA-256. Pilot chỉ đọc,
+không sửa Notion.
+
+Regression suite:
+
+```bash
+rtk proxy app/.venv/bin/python -m unittest \
+  app.backend.test_adapters_notion \
+  notion_report.tests.test_run_mcp \
+  notion_report.tests.test_config \
+  notion_report.tests.test_client \
+  notion_report.tests.test_tool \
+  notion_report.tests.test_mcp_protocol \
+  notion_report.tests.test_mcp_smoke \
+  notion_report.tests.test_dashboard_settings
 ```

@@ -9,6 +9,10 @@
 APP_DIR="/users/PGS0407/binben14/VietHuy/agent_code_IDLE/app"
 LOG="/tmp/agentui.log"
 
+# A deploy can intentionally pause AgentUI without fighting the per-minute
+# watchdog. Remove this file only after validation is complete.
+[ -f "$APP_DIR/.maintenance" ] && exit 0
+
 code=$(curl -s -o /dev/null -w "%{http_code}" --max-time 5 http://127.0.0.1:5174/ 2>/dev/null)
 if [ "$code" = "200" ]; then
     exit 0

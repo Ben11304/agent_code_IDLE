@@ -5,6 +5,16 @@
 > nhưng **không** đánh đổi tính an toàn (version/drift) của hệ thống manifest hiện có.
 > Áp dụng cho 2 hệ thực tế: `ConstructionVLM-Eval-AGENT` (VLM) và `AECPlayGround-AGENT` (AEC).
 
+> **Đối chiếu 2026-09-07:** đây là rationale/thiết kế mục tiêu, không phải inventory
+> tính năng đã triển khai. Nguồn implementation hiện tại là [BUILD_HANDBOOK.md](BUILD_HANDBOOK.md)
+> và [checklist](BUILD_HANDBOOK_checklist.md). Các ví dụ/số đo dự án trong tài liệu
+> là ghi nhận lịch sử hoặc minh họa; audit này không chạy lại thí nghiệm đó.
+>
+> Khác biệt chính: parent nhận mọi child overview mỗi turn; version drift là warning;
+> typed escalation không auto-resolve; HALT/DISSENT và watermark đã có persistence
+> nhưng dissent/skip là prompt guidance; generic goal/budget/plateau enforcement chưa có.
+> Memory reconciliation opt-in và progress archival được mô tả trong handbook §12.
+
 ---
 
 ## 0. Vấn đề xuất phát
@@ -46,7 +56,7 @@ Mỗi tầng trả lời một câu hỏi khác nhau → nạp đúng tầng, kh
 | Tầng | File | Trả lời câu gì cho parent | Khi nào nạp | Ai ghi |
 |---|---|---|---|---|
 | **Tĩnh** | `team_role.md` | "Ai **có thể** làm gì" → chọn ứng viên | mỗi pass (nhỏ, ít đổi) | người/BOSS |
-| **Động mỏng** | `overview.md` | "Ứng viên **đang ở trạng thái nào**" → quyết định dispatch | mỗi pass, chỉ agent liên quan | **agent (body) + control-plane (header)** |
+| **Động mỏng** | `overview.md` | "Ứng viên **đang ở trạng thái nào**" → quyết định dispatch | code hiện tại inject mọi direct child mỗi parent turn | **agent (body) + control-plane (header)** |
 | **Đầy đủ** | `manifest.md` | "Contract/version/path **chính xác**" | **chỉ khi bàn giao 1 artifact** | producer agent |
 
 **Điểm mấu chốt:** Parent **KHÔNG đọc manifest để routing**. Parent đọc overview để *quyết định*,
@@ -90,7 +100,11 @@ của VLM, được hình thức hóa: overview = lớp routing, manifest = lớ
 
 > Những thứ KHÔNG đổi routing — schema đầy đủ, chi tiết preprocess, lịch sử — **không** nhét vào overview.
 
-### 3.4 Template chung
+### 3.4 Phác thảo hiển thị (không phải format parser)
+
+Format file thật dùng marker `<!-- OVERVIEW:HEADER -->`, `BODY`, `FOOTER`;
+xem `TEMPLATE_AGENT/overview.md` và handbook §2. Không copy phác thảo bên dưới
+thay cho marker format nếu cần control-plane stamp.
 
 ```markdown
 # OVERVIEW • <AGENT_NAME> • <YYYY-MM-DD HH:mm>
@@ -153,13 +167,14 @@ Body **tự do về câu chữ** nhưng **bắt buộc về trục**, để BOSS
 (tránh tình trạng CRAFTER viết narrative, DATASET viết bullet, VLM viết table → khó parse).
 
 Quy ước cứng:
-- **Độ dài**: ≤ ~150–200 từ (giữ "brief"; vượt → control-plane cảnh báo).
+- **Độ dài guideline**: ~150–200 từ. Generic stamp chưa cảnh báo số từ;
+  opt-in reconciliation có advisory budget riêng của project.
 - **Hình thức**: **bullet `- `**, không narrative dài. Mỗi dòng 1 dimension.
 - **Thứ tự logic**: (1) cái đang có/version → (2) cái đang làm → (3) cái thiếu/chặn.
 - **Từ khóa BOSS dễ parse**: bắt đầu dòng bằng nhãn cố định + dấu hai chấm
   (`Version:`, `Pending:`, `Blocker:`, `Needs:`), để control-plane/BOSS quét nhanh.
 
-**Dimension BẮT BUỘC theo role** (thiếu = control-plane flag "incomplete overview"):
+**Dimension khuyến nghị theo role** (guideline tác giả; code hiện tại không validate label role):
 
 | Role | Dimension bắt buộc trong body |
 |---|---|
@@ -171,7 +186,7 @@ Quy ước cứng:
 > Nhãn còn lại tự do. Mục tiêu: BOSS đọc 4 overview của 4 role khác nhau vẫn so sánh được
 > "ai sẵn sàng / ai chặn / ở version nào" mà không phải diễn giải style riêng từng agent.
 
-### 3.7 Overview của BOSS (cấp dự án) — hướng C: ANCHOR + ROLLUP (📋 chốt mitigate sau)
+### 3.7 Overview của BOSS — thiết kế nội dung ANCHOR + ROLLUP (project-specific)
 
 BOSS overview là **ca đặc biệt**: KHÔNG có parent đọc nó để route → **không bị nhân N** → chi phí chặn ở
 **1 file/pass**; người đọc = **chính BOSS** (tự-định-vị đầu mỗi pass) **+ con người** (liếc nắm dự án).
@@ -226,8 +241,8 @@ team status chi tiết → state/children_status.json | open escalation → <…
 
 | Artifact | Bản chất | Ghi kiểu gì | Ai đọc |
 |---|---|---|---|
-| **`[RESULT]` block** | *Delta của riêng turn này* | emit 1 lần/turn | → progress, → ledger của parent |
-| **`progress.md`** | *Nhật ký* các delta | **append-only** | hầu như không ai đọc full (chỉ excerpt khi cần) |
+| **`[RESULT]` block** | *Delta của riêng turn này* | emit cuối turn theo contract | → ledger; agent vẫn phải ghi progress |
+| **`progress.md`** | *Nhật ký* các delta | thêm entry mới; archival chỉ khi bật | hầu như không ai đọc full (chỉ excerpt khi cần) |
 | **`overview.md`** | *Toàn cảnh đang đứng ở đâu* | **ghi đè** mỗi turn, holistic | parent đọc để dispatch |
 
 > Sai lầm cần tránh: lấy `[RESULT]` block đè thẳng vào overview → overview thoái hóa thành
@@ -237,7 +252,7 @@ team status chi tiết → state/children_status.json | open escalation → <…
 
 ## 5. Mức enforcement: "Thin Waist" (KHÔNG over-engineer)
 
-### 5.1 Nguyên tắc: hard-code plumbing, soft-prompt judgment
+### 5.1 Nguyên tắc thiết kế mục tiêu: hard-code plumbing, soft-prompt judgment
 
 - **Plumbing (cơ học, luôn-phải-xảy-ra):** sync, version-pin check, stamp header overview,
   append progress. → **control-plane lo.** Đây không phải reasoning; bắt model "nhớ" qua prompt
@@ -260,15 +275,18 @@ team status chi tiết → state/children_status.json | open escalation → <…
 > "bạn phải làm phase 0→4" khỏi system prompt — khối đó hiện nạp lại **mỗi turn × mỗi agent**.
 > Prompt-based enforcement mới là thứ âm thầm đốt token.
 
-### 5.4 Control-plane chỉ ôm 4 guarantee cơ học (dừng ở đây)
+### 5.4 Guarantee cơ học: mục tiêu và mức đã có
 
-1. `sync` + **version-pin check trước mỗi turn** (fail → block, không vào model).
-2. Parse `[RESULT]`/`[ESCALATE]` block; **thiếu/sai shape → retry đúng 1 lần** (không FSM).
-3. **Stamp + validate HEADER overview** (status + version echo từ manifest) + enforce overview
-   được refresh cuối turn + enforce **độ dài "brief"** (vượt ngưỡng → cảnh báo).
-4. **Append `progress.md`** từ `[RESULT]` block.
+| Mục tiêu thiết kế | Implementation hiện tại |
+|---|---|
+| Sync + version pins, fail trước model | Python best-effort drift check + warning; model tự sync; không hard block |
+| Parse/retry structured output | Optional blocks, một corrective retry; lần hai chưa có hard rejection |
+| Stamp/validate overview | Stamp version/date và placeholder heuristic; role labels không validate |
+| Append progress từ RESULT | Chưa có append tự động từ RESULT; owner ghi log/reconcile |
 
-Mọi reasoning (route/đánh giá/escalate) → **prompt + judgment của model.**
+Reconciliation opt-in có receipt/hash/pointer validation và overview provenance
+publish gate riêng (handbook §12). Dissent và goal acceptance hiện được nhắc trong
+prompt; không mô tả chúng là sự cưỡng chế của tool/runtime.
 
 ---
 
@@ -313,7 +331,7 @@ Phase 3 — EXECUTE
 
 Phase 4 — REFLECT & SNAPSHOT (cuối turn, nhẹ)
   - Tự viết BODY overview.md (toàn cảnh, ghi đè — KHÔNG append lịch sử vào đây)
-  - Output [RESULT] block (delta turn) → control-plane append vào progress.md + stamp header overview
+  - Owner ghi progress; output [RESULT] block (delta turn) → ledger + machine stamp overview
 ```
 
 ---
@@ -331,25 +349,16 @@ reason: "..."
 priority: high | medium | low
 ```
 
-| type | Control-plane làm gì | BOSS can thiệp? |
+| type | Implementation hiện tại | Quyết định tiếp theo |
 |---|---|---|
-| **DATA** | Auto `request_full_view` section cần → append cho child → resume | Không |
-| **BOSS_DECISION** | Append vào ledger BOSS, pause child | Có |
-| **HUMAN** | Pause run + notify, chờ human | Có |
-| **SUBTASK** | Tự dispatch agent chỉ định, chờ result rồi append | Không (trừ target=BOSS) |
-| **TOOL** | Thực thi tool → append kết quả | Không |
-| **BLOCKED** | Pause + append full context lên BOSS + notify | Có |
+| DATA / SUBTASK / TOOL | Tạo escalation DB row; route ledger tới parent đầu tiên | Parent quyết pull/dispatch/tool; không chạy tự động |
+| BOSS_DECISION / HUMAN / BLOCKED | Cùng DB/ledger path; root được surface qua meta | Parent/user xử lý; không tạo hard pause/approval workflow riêng |
 
-**Làm rõ SUBTASK vs TOOL vs BLOCKED:**
-- `SUBTASK`: target là **một agent trong hệ** (có manifest/overview) → control-plane dispatch agent đó,
-  chờ `[RESULT]`, append về child. Nếu target=BOSS → BOSS phải can thiệp.
-- `TOOL`: target là **công cụ external** (không phải agent, không có manifest — vd web search, script,
-  API). Control-plane thực thi trực tiếp → append output thô. **Không** đi qua boundary manifest.
-  → Quy tắc phân biệt: "có manifest/overview không?" Có → SUBTASK. Không → TOOL.
-- `BLOCKED`: child **không tự đi tiếp được** vì lý do ngoài data/action cụ thể (mâu thuẫn contract,
-  scope không rõ, deadlock chờ 2 producer) → pause + đẩy full context lên BOSS để arbitrate.
+`SUBTASK` là yêu cầu một agent khác; `TOOL` là công cụ ngoài agent graph.
+Phân biệt này hữu ích cho routing, nhưng backend hiện chưa execute theo type.
+Ví dụ block phải đóng bằng `[/ESCALATE]` (xem handbook §4).
 
-### ⚠️ Vá an toàn cho `type: DATA` (quan trọng)
+### Ràng buộc cho auto-resolve DATA trong tương lai (chưa triển khai)
 
 Auto-resolve DATA-escalate **bypass BOSS** rất tiện nhưng nếu kéo thẳng raw của producer mà
 **không pin version** → tái tạo bug "downstream vá quanh stale manifest".
@@ -368,7 +377,7 @@ Nếu producer bump **sau** đó, sai lệch được phát hiện ở **PRE-FLI
 
 ---
 
-## 8. Tái dùng cái đã có (đừng phát minh lại)
+## 8. Kế hoạch tái dùng ở thời điểm thiết kế (đã được mở rộng trong code)
 
 - **`children_status.json`**: VLM **đã có** (control-plane sinh: `context_pct`, `message_count`,
   `last_activity`, `memory_headline`). → **Mở rộng** thêm `manifest_version` + `overview_path` +
@@ -379,7 +388,7 @@ Nếu producer bump **sau** đó, sai lệch được phát hiện ở **PRE-FLI
 
 ---
 
-## 9. Bảng "giữ / sửa / bỏ" so với hiện trạng
+## 9. Quyết định "giữ / sửa / bỏ" của bản thiết kế gốc
 
 | Hạng mục | Quyết định | Ghi chú |
 |---|---|---|
@@ -396,7 +405,7 @@ Nếu producer bump **sau** đó, sai lệch được phát hiện ở **PRE-FLI
 
 ---
 
-## 10. Migration & Backward Compatibility (hệ đang chạy)
+## 10. Chiến lược migration và fallback (không phải rollout status)
 
 Không big-bang. Chuyển từ "BOSS đọc full manifest" sang "BOSS đọc overview" theo 4 bước, **không phá vỡ**:
 
@@ -409,7 +418,7 @@ Không big-bang. Chuyển từ "BOSS đọc full manifest" sang "BOSS đọc ove
 manifest hiện có** (control-plane đọc header version + artifact mới nhất → đổ vào header + footer;
 **body để placeholder** `*(chờ agent tự tổng hợp ở turn kế)*`). Đây là tác vụ 1 lần, không cần agent chạy.
 
-**Bước 2 — Agent tự làm giàu body:** turn kế tiếp của mỗi agent, Phase 4 ghi đè body bằng bức tranh
+**Bước 2 — Agent tự làm giàu body:** turn kế tiếp của mỗi agent, Owner cập nhật body bằng bức tranh
 thật theo §3.6. Sau 1 vòng, mọi overview đã có body thật → fallback Bước 0 gần như không còn kích hoạt.
 
 **Bước 3 — Chuyển BOSS sang overview-first:** đổi PRE-FLIGHT của BOSS: đọc `children_status.json`
@@ -428,7 +437,8 @@ Cờ tự gỡ khi agent ghi đè body thật ở Phase 4.
 
 **Áp dụng cụ thể:**
 - **VLM** đã có `children_status.json` → chỉ cần thêm overview + mở rộng field (§8). Migration nhẹ.
-- **AEC** chưa có rollup → làm `children_status.json` trước (từ `team_map.md`), rồi theo 4 bước trên.
+- **AEC/VLM hiện dùng chung generator** `_write_children_rollups` từ graph và stats.
+  Không tạo rollup tay từ `team_map.md`; migration nội dung agent vẫn theo từng project.
 
 ---
 
@@ -468,7 +478,7 @@ Plumbing (xám) = control-plane; ANALYZE&DECIDE (judgment) = model, KHÔNG ép F
 ## 11. Ghi chú phạm vi — cái gì KHÔNG nằm trong tài liệu này
 
 Đây là **design doc** (kiến trúc + hợp đồng + template), **không** phải implementation spec.
-Các thứ sau thuộc **artifact kế tiếp** (`control_plane_spec.md`), cố tình **không** đưa vào đây để
+Các thứ sau thuộc **artifact kế tiếp** (`BUILD_HANDBOOK.md`), cố tình **không** đưa vào đây để
 tránh lẫn tầng:
 - Tên hàm cụ thể (`stamp_header_overview()`, `handle_escalate()`...) nằm trong `_run_agent` hay script riêng.
 - Retry logic chi tiết: số lần, timeout, backoff.
@@ -480,42 +490,22 @@ tránh lẫn tầng:
 
 ---
 
-## 12. Implementation Checklist (bắt đầu từ đâu)
+## 12. Trạng thái triển khai
 
-Thứ tự ưu tiên để triển khai mà **không phá hệ đang chạy** (mỗi bước có đường lui):
+Checklist hiện hành nằm ở [BUILD_HANDBOOK_checklist.md](BUILD_HANDBOOK_checklist.md).
+Không dùng danh sách checkbox của bản thiết kế tháng 6 để kết luận code hiện tại.
 
-**P0 — Lưới an toàn (làm trước mọi thứ):**
-- [ ] Control-plane: thêm rule fallback "overview thiếu/rỗng/`body_incomplete` → đọc head manifest" (§10 Bước 0).
-
-**P1 — Slim view + rollup:**
-- [ ] Định nghĩa schema `overview.md` (header/body/footer) — file template/spec.
-- [ ] AEC: tạo `children_status.json` từ `team_map.md` (VLM đã có).
-- [ ] Mở rộng `children_status.json`: + `manifest_version`, `overview_path`, `status_color`, `body_incomplete`.
-- [ ] Bootstrap: script sinh `overview.md` lần đầu cho mọi agent (header từ manifest, body placeholder).
-
-**P2 — Agent tự làm giàu:**
-- [ ] Thêm Phase 4 (REFLECT & SNAPSHOT) vào `AGENT.md` của mọi child + guideline §3.6.
-- [ ] Thêm BODY-dimension bắt buộc theo role (§3.6) vào `AGENT.md` tương ứng.
-- [ ] Tạo `BOSS/overview.md` cấp dự án (§3.7).
-
-**P3 — Chuyển BOSS sang overview-first:**
-- [ ] Sửa PRE-FLIGHT của BOSS: đọc `children_status.json` + overview team liên quan; manifest chỉ khi consume.
-- [ ] Thêm pipeline 4-phase BOSS + `[ESCALATE]` có type vào `BOSS/AGENT.md`.
-
-**P4 — Enforce (thin waist) + đo:**
-- [ ] Control-plane: 4 guarantee cơ học (§5.4) + retry 1 lần.
-- [ ] Viết `control_plane_spec.md` (tầng code — §11).
-- [ ] Đo baseline trước/sau (§13).
-
-> Files sẽ tạo/sửa: `overview.md` (mỗi agent), `BOSS/overview.md`, `children_status.json` (AEC mới),
-> `*/AGENT.md` (Phase 4 + dimensions), `BOSS/AGENT.md` (PRE-FLIGHT + pipeline), `control_plane_spec.md`.
-
----
+- Có: overview preamble/fallback, derived rollup, every-parent-turn child snapshots,
+  parse/stamp/corrective retry, drift warning, escalation/HALT/dissent DB, verify watermark.
+- Có điều kiện: memory reconciliation (project opt-in), progress rotation (global opt-in),
+  runtime/Notion/Telegram/capabilities theo cấu hình host và agent.
+- Chưa có: generic metric/budget/plateau enforcement, auto-resolution theo escalation
+  type, `CONTINUE_SELF`, hard direction veto, bulk migration cho mọi project cũ.
 
 ## 13. Đo lường lợi ích (mục tiêu cần VALIDATE — chưa phải số đã đo)
 
-> ⚠️ **Chưa có con số thực nào** vì chưa triển khai. Phần này định nghĩa **đo CÁI GÌ + đo THẾ NÀO**,
-> KHÔNG dán số bịa. Sau khi có P4 baseline mới điền số thật.
+> Đây là kế hoạch đo trước/sau. Code đo context/token đã tồn tại, nhưng audit tài liệu
+> không chạy benchmark mới và không xác nhận một mức tiết kiệm cụ thể từ code alone.
 
 **Metric cần đo (trước vs sau migration):**
 - **Token/pass của BOSS**: đếm input token mỗi orchestration pass (full manifest vs overview). Đây là
@@ -563,7 +553,10 @@ drill xuống manifest (đắt, phá tối ưu §2) hoặc **đoán** từ snaps
 > **Phản trực giác:** goal càng MỀM, limit càng KHÔNG thể thiếu. Threshold tự dừng khi vượt T;
 > "cải thiện" không có trần → **không cap = lặp vô hạn đảm bảo**. Với directional, budget+plateau **là** vạch đích.
 
-### 14.4 Stopping rule 3-nhánh (control-plane enforce, KHÔNG để child tự quyết)
+### 14.4 Stopping rule mục tiêu (chưa có generic enforcement)
+
+Hiện `_dispatched_run` chỉ nhắc external acceptance trong ledger. Không có metric
+reader/plateau/budget checker cho bảng dưới; continuation cap không thay thế chúng.
 
 | Tình huống | Ai phán | Hành động |
 |---|---|---|
@@ -604,7 +597,11 @@ autonomy tác động ở đâu: intra-agent = an toàn · external-tool = an to
 > Lưu ý: "agency" và "bottleneck" là **hai vấn đề khác nhau**. Propose&Commit tăng agency nhưng KHÔNG
 > giảm số hop BOSS; muốn giảm bottleneck phải dùng Summary/Self-advance/Micro-orchestrator.
 
-### 15.1 Evaluative Self-Halt — worker được "nói đã bão hoà" (Mức 2, 📋 chốt mitigate sau)
+### 15.1 Evaluative Self-Halt — đã có parse/log/ledger
+
+`_handle_halt` và `halt_log` đã có. Parser chỉ đòi evidence không rỗng, chưa xác minh
+định lượng/chất lượng, chưa enforce reason enum hoặc tự flag halt-rate. Các guardrail
+mạnh hơn bên dưới là mục tiêu, không phải guarantee hiện tại.
 
 **Vì sao cần (hệ quả của directional goal §14.3):** với goal mở/khám phá ("mở rộng corpus"),
 tri thức *"vô ích rồi"* **sinh ra TRONG lúc worker làm** — BOSS không thể biết trước (chưa search
@@ -637,7 +634,12 @@ thay vì cắm đầu chạy hết task rồi trả kết quả ROI thấp. (Ca 
 > Bản chất: biến worker của directional-goal từ executor mù → **người-suy-nghĩ một cấp dưới routing**
 > (đúng triết lý "giao task + goal, không giao detail" của §14).
 
-### 15.2 Forced-acknowledge Dissent — worker được "chặn hướng sai" (📋 chốt mitigate sau)
+### 15.2 Forced-acknowledge Dissent — đã có state và prompt feedback
+
+`dissent_flags` và resolve lifecycle đã có. `_open_dissent_warning` inject mọi open
+flag vào parent prompt; không có hard dispatch/tool veto theo direction, role gate
+cho resolver, hoặc automatic VERIFIER/human escalation. Các từ “blocking” bên dưới
+mô tả contract với model, không phải một hard execution lock.
 
 **Phân biệt với Self-Halt:** `[HALT]` = "dừng **effort của TÔI**" (về task của worker). `[DISSENT]` =
 "chặn **một HƯỚNG/quyết định**" — kể cả khi đó không phải task của worker, và buộc BOSS phải đối mặt.
@@ -696,7 +698,7 @@ KHÔNG ∝ kích-thước-delta.** Hai mặt: **writer re-GENERATE** (cost ở o
 | **Document/synthesis** (AEC, DFU EVAL manuscript, Hoang paper) | 🔴 nặng | artifact = 1 blob → sửa tí = re-generate/re-read cả khối |
 | **AEC** | 🔴🔴 worst-case | monolith + PRISMA cascade chặt + thêm-candidate thường xuyên |
 
-**Inherent vs Fixable:** *inherent* — reload một phần state + history phình (đã có **auto-compact 80%** chặn phần history);
+**Inherent vs Fixable:** *inherent* — reload một phần state + history phình (đã có auto-compact; code hiện tại dùng **70% Claude/Codex, 40% Grok/DeepSeek/GLM**);
 *fixable* — **artifact chunking** (16.6) + **surgical edit thay vì re-generate** + **delta-watermark** (16.1).
 Granularity là trục MagAI **có sẵn nhờ filesystem** mà hệ paper/synthesis chưa.
 
@@ -709,7 +711,12 @@ Granularity là trục MagAI **có sẵn nhờ filesystem** mà hệ paper/synth
 **Nguyên lý (cùng "delta-not-full" của §2/§7):** đừng re-process/re-verify thứ **chưa đổi version**.
 "Verified @version" = "consumed @version" = "overview thay full-manifest". **Áp cho MỌI hệ, không riêng AEC.**
 
-### 16.1 Verified-watermark (delta-verify) — fix chính
+### 16.1 Verified-watermark — đã có version comparison và hint
+
+Code lưu `verified: PROD@ver` do auditor khai, so producer version thật ở lượt sau,
+rồi inject skip/reverify hint khi có skip set. Không hard-skip tool, không tự discover
+producer chưa có watermark, không xác minh nội dung verdict. Bảng record-level
+`verified_at` dưới đây là thiết kế per-project, khác watermark cấp producer trong DB.
 - `verification_log` thêm cột `verified_at: <producer>@<semver>` per benchmark/claim.
 - Pass VERIFIER: drift-check → mỗi record, nếu `source-version == verified_at` → **SKIP** (tin verdict cũ);
   chỉ re-verify record **đổi** + **mới**. **O(N mỗi đổi) → O(Δ).**
@@ -735,7 +742,7 @@ Token data cho thấy CRAFTER/SYNTHESIZER cũng full-re-process. Nguyên lý áp
 (chèn 2 dòng, không re-write 163k-char), **incremental synthesis** (cập nhật ô đổi). Verify là ca làm trước;
 producer là mở rộng.
 
-### 16.6 Artifact chunking — trục đòn-bẩy cross-system (cái MagAI có sẵn, hệ paper chưa)
+### 16.6 Artifact chunking — thiết kế per-project, không tự restructure bởi backend
 **Gốc rễ severity nằm ở granularity (16.0):** code-system nhẹ vì **filesystem đã chunk** artifact thành nhiều file
 → sửa = đụng 1 file, surgical by default. Hệ document/synthesis nặng vì artifact là **1 blob** (manuscript 163k,
 benchmarks.json 297KB) → sửa tí = re-load/re-generate cả khối. **Đây là đòn bẩy gốc, đứng trên cả delta-watermark.**
@@ -752,7 +759,9 @@ Cách áp (mọi hệ paper/synthesis):
 > findings (16.2)** cắt phần còn lại (skip chunk chưa đổi). Hai cái cộng hưởng: chunk nhỏ + skip-unchanged = O(Δ) thật.
 
 > ⚠️ **KHÔNG cắt integrity core:** chỉ bỏ **re-check thứ chưa đổi** + **dùng đúng model cho đúng loại check**.
-> Độ phủ integrity y nguyên — đây là *delta-aware*, KHÔNG phải *buông*. SPEC ONLY, chốt mitigate sau.
+> Mục tiêu là giữ độ phủ integrity khi xử lý delta. Watermark comparison/hint đã có;
+> record-level skip, structural chunking và các policy per-project chưa được bảo đảm
+> bởi control plane. Độ phủ thực tế cần được kiểm tra theo từng workflow.
 
 ---
 

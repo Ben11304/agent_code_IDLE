@@ -1,11 +1,11 @@
 # <AGENT_ID> code map
 
 <!-- Local, agent-owned reference: what this agent owns + what it reads read-only.
-     Keep it small — it is read at boot. Not a machine-stamped file. -->
+     Keep it small — it is opened on demand for ownership questions. Not a machine-stamped file. -->
 
 ## Owns (writes under <AGENT_ID>/)
 - outputs/<...>            — <what>
-- state/progress.md        — append-only log
+- state/progress.md        — newest-first dated log, optional archival
 
 ## Reads (read-only)
 - ../shared/*.md           — project rules (integrity, scope, handoff, glossary)

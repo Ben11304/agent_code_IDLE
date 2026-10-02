@@ -1,0 +1,57 @@
+{
+  "schema_version": 1,
+  "id": "openaiDeveloperDocs",
+  "name": "openaiDeveloperDocs",
+  "description": "",
+  "auth_status": "unsupported",
+  "baseline_enabled": true,
+  "controllable": true,
+  "runtime_managed": false,
+  "tool_inventory_complete": true,
+  "resource_count": 0,
+  "tools": [
+    {
+      "id": "fetch_openai_doc",
+      "name": "fetch_openai_doc",
+      "title": "Fetch OpenAI Doc",
+      "description": "Fetch the markdown for a specific doc page from `developers.openai.com`, `platform.openai.com`, or `learn.chatgpt.com` so you can quote or summarize exact, up-to-date guidance (schemas, examples, limits, and edge cases). Prefer to **`search_openai_docs` first** (or `list_openai_docs` if you’re browsing) to find the best URL, then `fetch_openai_doc` to pull…",
+      "baseline_enabled": true,
+      "read_only": true
+    },
+    {
+      "id": "get_openapi_spec",
+      "name": "get_openapi_spec",
+      "title": "Get OpenAPI Spec",
+      "description": "Return the OpenAPI spec for a specific API endpoint URL. Optionally filter code samples by language, or return only code samples.",
+      "baseline_enabled": true,
+      "read_only": true
+    },
+    {
+      "id": "list_api_endpoints",
+      "name": "list_api_endpoints",
+      "title": "List API Endpoints",
+      "description": "List all OpenAI API endpoint URLs available in the OpenAPI spec.",
+      "baseline_enabled": true,
+      "read_only": true
+    },
+    {
+      "id": "list_openai_docs",
+      "name": "list_openai_docs",
+      "title": "List OpenAI Docs",
+      "description": "List or browse pages from `platform.openai.com`, `developers.openai.com`, and `learn.chatgpt.com` that this server crawls (useful when you don’t know the right query yet or you’re paging through results). Use this whenever you are working with the OpenAI API (including the Responses API), OpenAI API SDKs, plugins, ChatGPT, or Codex. Results include URLs—**a…",
+      "baseline_enabled": true,
+      "read_only": true
+    },
+    {
+      "id": "search_openai_docs",
+      "name": "search_openai_docs",
+      "title": "Search OpenAI Docs",
+      "description": "Search across `platform.openai.com`, `developers.openai.com`, and `learn.chatgpt.com` docs. Use this whenever you are working with the OpenAI API (including the Responses API), OpenAI API SDKs, plugins, ChatGPT, or Codex. Results include URLs—**after `search`, use `fetch_openai_doc`** to read/quote the exact markdown.",
+      "baseline_enabled": true,
+      "read_only": true
+    }
+  ],
+  "launch": {
+    "url": "https://developers.openai.com/mcp"
+  }
+}

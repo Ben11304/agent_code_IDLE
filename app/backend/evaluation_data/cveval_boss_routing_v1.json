@@ -1,0 +1,82 @@
+[
+  {
+    "inputs": {
+      "case_id": "audit_integrity",
+      "message": "Offline routing evaluation only. Route this fully specified task to the correct direct worker: independently verify benchmark-result integrity, contract drift, and reproducibility, then publish a read-only finding. The requested action in this evaluation is ownership routing; do not ask a clarifying question."
+    },
+    "outputs": {
+      "expected_dispatches": ["AUDIT"],
+      "allowed_dispatches": ["AUDIT"],
+      "forbidden_dispatches": ["FRAMEWORK", "DATASET", "VLM", "DASHBOARD", "PAPER2", "GENERATION", "VALIDATION", "PAPER"]
+    },
+    "metadata": {
+      "dataset_type": "trajectory",
+      "category": "single_owner",
+      "version": "1"
+    }
+  },
+  {
+    "inputs": {
+      "case_id": "framework_contract",
+      "message": "Offline routing evaluation only. Route this fully specified task to the correct direct worker: revise the benchmark harness result schema and registry contract so every model adapter emits the new required field. The requested action in this evaluation is ownership routing; do not ask a clarifying question."
+    },
+    "outputs": {
+      "expected_dispatches": ["FRAMEWORK"],
+      "allowed_dispatches": ["FRAMEWORK"],
+      "forbidden_dispatches": ["AUDIT", "DATASET", "VLM", "DASHBOARD", "PAPER2", "GENERATION", "VALIDATION", "PAPER"]
+    },
+    "metadata": {
+      "dataset_type": "trajectory",
+      "category": "single_owner",
+      "version": "1"
+    }
+  },
+  {
+    "inputs": {
+      "case_id": "dataset_subteam_boundary",
+      "message": "Offline routing evaluation only. Route this fully specified task through the correct direct worker: define a fog-condition ConSynth-X slice and coordinate the generation sub-team that owns producing it. Respect the BOSS-to-DATASET sub-team boundary. The requested action in this evaluation is ownership routing; do not ask a clarifying question."
+    },
+    "outputs": {
+      "expected_dispatches": ["DATASET"],
+      "allowed_dispatches": ["DATASET"],
+      "forbidden_dispatches": ["AUDIT", "FRAMEWORK", "VLM", "DASHBOARD", "PAPER2", "GENERATION", "VALIDATION", "PAPER"]
+    },
+    "metadata": {
+      "dataset_type": "trajectory",
+      "category": "hierarchy_boundary",
+      "version": "1"
+    }
+  },
+  {
+    "inputs": {
+      "case_id": "vlm_inference",
+      "message": "Offline routing evaluation only. Route this fully specified task to the correct direct worker: run the pinned VLM adapters on an already-published benchmark slice and produce predictions plus task metrics. The requested action in this evaluation is ownership routing; do not ask a clarifying question."
+    },
+    "outputs": {
+      "expected_dispatches": ["VLM"],
+      "allowed_dispatches": ["VLM"],
+      "forbidden_dispatches": ["AUDIT", "FRAMEWORK", "DATASET", "DASHBOARD", "PAPER2", "GENERATION", "VALIDATION", "PAPER"]
+    },
+    "metadata": {
+      "dataset_type": "trajectory",
+      "category": "single_owner",
+      "version": "1"
+    }
+  },
+  {
+    "inputs": {
+      "case_id": "dashboard_rendering",
+      "message": "Offline routing evaluation only. Route this fully specified task to the correct direct worker: consume existing run artifacts and add a leaderboard visualization without recomputing any metric. The requested action in this evaluation is ownership routing; do not ask a clarifying question."
+    },
+    "outputs": {
+      "expected_dispatches": ["DASHBOARD"],
+      "allowed_dispatches": ["DASHBOARD"],
+      "forbidden_dispatches": ["AUDIT", "FRAMEWORK", "DATASET", "VLM", "PAPER2", "GENERATION", "VALIDATION", "PAPER"]
+    },
+    "metadata": {
+      "dataset_type": "trajectory",
+      "category": "single_owner",
+      "version": "1"
+    }
+  }
+]

@@ -1,0 +1,6 @@
+interface:
+  display_name: "Deep Research"
+  short_description: "Research within the current Work or Codex session"
+  default_prompt: "Use $deep-research to research this topic thoroughly and give me a source-backed brief with key findings, tradeoffs, and uncertainties."
+policy:
+  allow_implicit_invocation: true

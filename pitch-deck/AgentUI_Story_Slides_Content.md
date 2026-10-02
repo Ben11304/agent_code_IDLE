@@ -1,5 +1,10 @@
 # AgentUI - Nội dung Slide (Phiên bản sẵn sàng đưa vào PowerPoint)
 
+> Nội dung thuyết trình được đối chiếu 2026-09-07. Đây là narrative, không thay thế
+> tài liệu vận hành. Các PPTX/PDF có sẵn là snapshot trình bày cũ và không tự cập nhật
+> từ Markdown này; xem [README](README.md) trước khi tái sử dụng.
+
+
 **Hướng dẫn sử dụng:**
 - Mỗi phần là một slide.
 - **Tiêu đề** dùng làm title slide.
@@ -78,7 +83,7 @@ Giai đoạn 1: "Wow, cái này làm được!"
 ## Slide 4: Giai đoạn 2 – Vấn đề ký ức
 
 **Tiêu đề:**
-Giai đoạn 2: Mỗi lần gọi AI là một người mới
+Giai đoạn 2: Phiên mới có thể thiếu ký ức dự án
 
 **Nội dung:**
 - AI không nhớ những gì đã làm trước đó
@@ -89,7 +94,7 @@ Giai đoạn 2: Mỗi lần gọi AI là một người mới
 **Figure 2** (story.pdf trang 2) – So sánh: Trái thành công, Phải quên sạch ("who are you?")
 
 **Lời dẫn:**
-"Bạn nhận ra vấn đề lớn: AI không có trí nhớ liên tục. Mỗi lần gọi là như bắt đầu lại từ con số 0."
+"Bạn nhận ra vấn đề lớn: AI không có trí nhớ liên tục. Phiên mới cần được nạp lại bối cảnh; AgentUI dùng resume và file memory để hỗ trợ điều đó."
 
 ---
 
@@ -181,7 +186,7 @@ Làm sao agent cha biết việc nào nên giao cho ai?
 - Mỗi agent con có `AGENT.md` + manifests + code_map rõ ràng
 - Khi làm việc, hệ thống tự động cung cấp cho agent cha:
   - Danh sách agent con trực tiếp
-  - Vai trò và phạm vi của từng người
+  - Current overview của mọi direct child; chi tiết scope vẫn theo tài liệu project
 - Agent cha chỉ được dispatch đúng theo cấu trúc đã định nghĩa
 
 **Hình minh họa:**  
@@ -258,13 +263,13 @@ AgentUI – Hệ thống để xây dựng và lãnh đạo đội AI hiệu qu�
 - Cung cấp khung template và công cụ kiểm soát để tạo agent chuyên biệt có cấu trúc rõ ràng (AGENT.md, inputs/outputs manifests, code_map, shared/)
 - Giúp bạn định nghĩa vai trò, phạm vi công việc và cách giao việc một cách chuyên nghiệp
 - Đồng thời là lớp điều khiển trực quan (graph, dispatch tracking, ledger) để bạn thấy thực tế và chỉ đạo cả đội
-- Hoạt động trực tiếp với Claude CLI và Grok (không cần API key riêng)
+- Hỗ trợ Claude, Codex SDK, Grok, DeepSeek và GLM; hai adapter cuối cần provider key
 
 **Hình minh họa:**  
 Screenshot AgentUI (graph + floating windows) + hình minh họa cấu trúc folder agent
 
 **Lời dẫn:**
-"AgentUI không chỉ giải quyết vấn đề điều phối. Nó còn mang theo khung template và cơ chế kiểm soát mà mình đã dành thời gian xây dựng để mỗi agent trong đội có vai trò rõ ràng và chất lượng được đảm bảo."
+"AgentUI không chỉ giải quyết vấn đề điều phối. Nó còn mang theo khung template và cơ chế kiểm soát mà mình đã dành thời gian xây dựng để mỗi agent trong đội có vai trò rõ ràng và chất lượng có thể được kiểm tra qua evidence và verifier."
 
 ---
 
@@ -282,7 +287,7 @@ Các tính năng chính của AgentUI
   Thấy rõ orchestrator có thực sự giao việc không
 
 - **Dispatch Ledger**  
-  Lưu kết quả thực tế từ agent con → đưa lại cho leader (không bịa)
+  Lưu kết quả thực tế từ agent con → đưa lại cho leader (có provenance từ worker; không tự bảo đảm nội dung đúng)
 
 - **Floating chat windows**  
   Nhiều agent làm việc đồng thời như một đội thật
@@ -326,4 +331,4 @@ Figure 6 (phiên bản có AgentUI) hoặc logo + tagline
 - Ở các slide kỹ thuật (8, 9, 14), giải thích đơn giản, dùng ví dụ "như quản lý đội nhân viên".
 - Nếu cần, có thể gộp một số slide thành 10-12 slide tổng cộng.
 
-Bạn duyệt nội dung này rồi cho mình biết chỉnh phần nào, mình sẽ cập nhật file và sau đó tạo PowerPoint.
+Generator `generate-deck.js` có text riêng, không đọc Markdown này. Khi dựng deck mới, chuyển nội dung đã cập nhật vào generator và kiểm tra slide xuất ra.

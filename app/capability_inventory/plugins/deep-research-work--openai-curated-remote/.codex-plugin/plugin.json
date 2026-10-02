@@ -1,0 +1,49 @@
+{
+  "apps": "./.app.json",
+  "author": {
+    "email": "support@openai.com",
+    "name": "OpenAI",
+    "url": "https://openai.com/"
+  },
+  "description": "Conduct cited, multi-pass research inside the current Work or Codex session.",
+  "homepage": "https://openai.com/",
+  "interface": {
+    "brandColor": "#4F46E5",
+    "brandColorDark": "#4F46E5",
+    "capabilities": [
+      "Interactive",
+      "Read",
+      "Write"
+    ],
+    "category": "Education & Research",
+    "composerIcon": "./assets/composer-icon.svg",
+    "defaultPrompt": [
+      "Create an investment memo analyzing a company’s diversification beyond its core business. Research the evidence for each bet.",
+      "What does the evidence actually say about a popular health or wellness claim? Help me separate credible findings from hype.",
+      "Help me understand a major historical turning point. Why did it happen, and where do historians disagree?"
+    ],
+    "developerName": "OpenAI",
+    "displayName": "Deep Research",
+    "logo": "./assets/logo.svg",
+    "logoDark": "./assets/logo-dark.svg",
+    "longDescription": "Investigate complex questions through broad discovery, targeted follow-up, source reconciliation, and evidence-backed synthesis within your current Work or Codex conversation, tools, workspace, and permissions.",
+    "privacyPolicyURL": "https://openai.com/policies/privacy-policy/",
+    "screenshots": [],
+    "shortDescription": "Deep research",
+    "termsOfServiceURL": "https://openai.com/policies/terms-of-use/",
+    "websiteURL": "https://openai.com/"
+  },
+  "keywords": [
+    "research",
+    "deep research",
+    "web research",
+    "evidence synthesis",
+    "citations",
+    "report"
+  ],
+  "license": "Proprietary",
+  "name": "deep-research-work",
+  "repository": "https://github.com/openai/openai/tree/master/chatgpt/oai-maintained-plugins/plugins/deep-research-work",
+  "skills": "./skills/",
+  "version": "0.1.14"
+}

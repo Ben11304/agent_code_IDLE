@@ -9,13 +9,13 @@
 > - bullet 3: open question / follow-up
 > ```
 >
-> The timestamp MUST include the time (HH:MM) — the control-plane reads this line
-> for freshness. The control-plane rotates this file into `progress.json` (HOT =
-> newest ~2 days, COLD = archive) and auto-injects the recent slice into your
-> cold-start preamble — you do NOT read this full file at boot, you only APPEND.
+> Include HH:MM for ordering/freshness. Cold starts read the newest two activity
+> dates from JSON if present, otherwise Markdown. Optional rotation keeps hot
+> Markdown as Markdown and archives older entries; JSON migration is explicit.
+> Do not read the whole log at boot or write a second independent hot log.
 > Trivial turns (ping, single fact) may be skipped.
 
 ## {{date}} 00:00 — Bootstrapped via AgentUI
 - Parents in graph: {{parents_csv}}.
-- Required reads loaded on the first turn (per AGENT.md).
+- Required reads are to be loaded on the first turn (per AGENT.md).
 - Waiting for the first real dispatch/task from parent or user.
